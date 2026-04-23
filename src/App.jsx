@@ -16,6 +16,10 @@ const ROLE_CONFIG = {
     focus: "Elec 설비 가동률, 예방보전, 고장 원인, MTBF/MTTR 관리" },
   Elec_TE: { label: "기술 엔지니어", line: "Elec", color: "#34d399", bg: "rgba(52,211,153,0.12)", icon: "🟩",
     focus: "Elec 공정 기술, 품질 원인 분석, 조건 최적화, 재발 방지" },
+  Logistics: { label: "물류 엔지니어", line: "Common", color: "#f59e0b", bg: "rgba(245,158,11,0.12)", icon: "🟡",
+    focus: "공정 간 제품 운송 관리, 운반 일정, 재공품(WIP) 흐름, 병목 구간 파악" },
+  Vision: { label: "비전 엔지니어", line: "Common", color: "#ec4899", bg: "rgba(236,72,153,0.12)", icon: "🩷",
+    focus: "외관 검사 시스템, 불량 이미지 분석, 비전 알고리즘, 검사 기준 관리" },
 };
 
 // URL 파라미터에서 role 읽기
@@ -302,6 +306,18 @@ const RULE_FIELDS = {
     { key:"판단기준", label:"불량 원인 분석 방법", placeholder:"예: 4M 분석(Man/Machine/Material/Method), 재현 테스트, 데이터 분석" },
     { key:"판단기준", label:"재발 방지 기준", placeholder:"예: 동일 불량 2회 이상 시 근본 원인 분석서 작성, 개선 검증 기간 설정" },
   ],
+  Logistics: [
+    { key:"판단기준", label:"공정 간 운송 기준 및 우선순위", placeholder:"예: 병목 공정 우선 공급, 재공품 적체 기준, 긴급 운반 판단 기준" },
+    { key:"협업방식", label:"PE·ME·TE팀과 협업 방식", placeholder:"예: 생산 계획 변경 시 PE에게 즉시 공유, 설비 이동 시 ME와 협의" },
+    { key:"판단기준", label:"WIP(재공품) 관리 기준", placeholder:"예: 공정별 WIP 적정 수량, 초과 시 조치 기준, 보관 위치 규칙" },
+    { key:"판단기준", label:"운반 이슈 대응 기준", placeholder:"예: 운반 지연 시 보고 기준, 제품 손상 발생 시 대응 절차" },
+  ],
+  Vision: [
+    { key:"판단기준", label:"외관 검사 기준 및 불량 분류", placeholder:"예: 불량 등급 기준(Critical/Major/Minor), 자동 검출 기준, 수동 검사 트리거" },
+    { key:"협업방식", label:"PE·TE팀과 협업 방식", placeholder:"예: 새 불량 유형 발생 시 TE와 즉시 협의, 알고리즘 변경 시 PE 승인" },
+    { key:"판단기준", label:"비전 시스템 이상 대응", placeholder:"예: 검출율 급감 시 조치 기준, 카메라·조명 점검 주기, 재교정 기준" },
+    { key:"판단기준", label:"불량 이미지 분석 방법", placeholder:"예: 이미지 패턴 분류 기준, 오검출·미검출 구분, 데이터 축적 및 개선 방법" },
+  ],
 };
 
 function TabRules({ role, roleInfo }) {
@@ -404,6 +420,16 @@ function TabCorrection({ role, roleInfo, knowledge }) {
       "Elec 불량률이 갑자기 상승. 공정 조건은 변경 없음.",
       "신규 전극 원자재 로트 투입 후 불량 발생. 기존 로트와 혼용 중.",
       "PE에서 Elec 생산 속도 증가 요청. 현재 공정 조건에서 품질 리스크 있음.",
+    ],
+    Logistics: [
+      "STK 공정 앞에 재공품이 과도하게 쌓여있다. 운반 일정 조정이 필요한 상황.",
+      "CUT 공정 완료품을 STK로 이송 중 제품 일부가 손상되었다.",
+      "생산 계획이 갑자기 변경되어 공정 간 운반 순서를 재조정해야 한다.",
+    ],
+    Vision: [
+      "비전 검사기에서 불량 검출율이 갑자기 50% 이하로 떨어졌다.",
+      "새로운 불량 유형이 발생했는데 현재 알고리즘이 검출하지 못하고 있다.",
+      "조명 노후화로 의심되는 오검출이 증가하고 있다. 생산에 영향을 주고 있음.",
     ],
   };
 
@@ -654,11 +680,11 @@ export default function App() {
           <div style={{ fontSize:13, color:"#64748b", marginBottom:32 }}>
             역할을 선택해서 접속하세요
           </div>
-          {["Cell","Elec"].map(line => (
+          {["Cell","Elec","Common"].map(line => (
             <div key={line} style={{ marginBottom:24 }}>
               <div style={{ fontSize:12, color:"#64748b", fontWeight:800,
                 letterSpacing:2, marginBottom:12, textAlign:"center" }}>
-                {line} 라인
+                {line === "Common" ? "공통" : `${line} 라인`}
               </div>
               <div style={{ display:"flex", gap:10, justifyContent:"center" }}>
                 {Object.entries(ROLE_CONFIG)
