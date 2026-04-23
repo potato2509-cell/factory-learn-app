@@ -20,9 +20,13 @@ const ROLE_CONFIG = {
 
 // URL 파라미터에서 role 읽기
 function getRole() {
-  const params = new URLSearchParams(window.location.search);
+  // search 방식과 hash 방식 모두 지원
+  const search = window.location.search || window.location.hash.replace(/^#/, "");
+  const params = new URLSearchParams(search);
   const r = params.get("role")?.toUpperCase();
-  return ROLE_CONFIG[r] ? r : null;
+  // Cell_PE 형식 처리 (대소문자 혼용)
+  const roleKey = Object.keys(ROLE_CONFIG).find(k => k.toUpperCase() === r);
+  return roleKey || null;
 }
 
 // ─── API ──────────────────────────────────────────────────────────────────────
@@ -660,7 +664,7 @@ export default function App() {
                 {Object.entries(ROLE_CONFIG)
                   .filter(([_, info]) => info.line === line)
                   .map(([r, info]) => (
-                    <a key={r} href={`?role=${r}`} style={{
+                    <a key={r} href={`?role=${r}`} onClick={(e)=>{e.preventDefault();window.location.href=`?role=${r}`;}} style={{
                       display:"block", padding:"14px 18px",
                       background:info.bg, border:`1.5px solid ${info.color}40`,
                       borderRadius:12, color:info.color,
