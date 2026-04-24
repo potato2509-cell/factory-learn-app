@@ -46,6 +46,39 @@ async function callClaude(system, userMsg) {
   return (data.content || []).map(i => i.text || "").join("").trim();
 }
 
+// Vision API 호출
+async function callClaudeVision(system, userMsg, imageBase64, mediaType) {
+  const res = await fetch("/.netlify/functions/claude-vision", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ system, userMsg, imageBase64, mediaType }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return (data.content || []).map(i => i.text || "").join("").trim();
+}
+
+// 파일을 Base64로 변환
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+// PDF 텍스트 추출 (간단 방식)
+async function extractTextFromFile(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(e.target.result);
+    reader.onerror = () => resolve("");
+    reader.readAsText(file, "utf-8");
+  });
+}
+
 async function saveToSheet(role, category, content) {
   try {
     await fetch(APPS_SCRIPT_URL, {
@@ -564,7 +597,222 @@ ${knowledgeText || "기본 역할 정의만 있음"}
   );
 }
 
-// ─── STEP 4: 학습 현황 ────────────────────────────────────────────────────────
+// ─── STEP 4: 문서·사진 학습 ──────────────────────────────────────────────────
+function TabDocument({ role, roleInfo }) {
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState("");
+  const [analyzed, setAnalyzed] = useState("");
+  const [category, setCategory] = useState("판단기준");
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState("");
+  const fileRef = useRef();
+
+  const CATEGORIES = ["공장정보", "업무역할", "판단기준", "협업방식", "교정사례"];
+  const isImage = file && file.type.startsWith("image/");
+  const isPDF = file && file.type === "application/pdf";
+  const isDoc = file && (file.name.endsWith(".docx") || file.name.endsWith(".doc"));
+  const isExcel = file && (file.name.endsWith(".xlsx") || file.name.endsWith(".xls"));
+
+  const handleFile = async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    setFile(f);
+    setAnalyzed("");
+    setError("");
+    // 이미지 미리보기
+    if (f.type.startsWith("image/")) {
+      const url = URL.createObjectURL(f);
+      setPreview(url);
+    } else {
+      setPreview("");
+    }
+  };
+
+  const analyze = async () => {
+    if (!file) return;
+    setLoading(true);
+    setError("");
+    setAnalyzed("");
+    try {
+      const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
+업로드된 파일 내용에서 ${role} 업무와 관련된 핵심 정보를 추출하세요.
+카테고리: ${category}
+한국어로 핵심 내용만 간결하게 정리하세요. 200자 이내로.`;
+
+      let result = "";
+
+      if (isImage) {
+        // 이미지 처리 - Claude Vision
+        const base64 = await fileToBase64(file);
+        result = await callClaudeVision(
+          sys,
+          `이 이미지에서 ${role} 업무 관련 핵심 내용을 추출해주세요.`,
+          base64,
+          file.type
+        );
+      } else {
+        // 텍스트 파일 처리
+        let text = await extractTextFromFile(file);
+        if (!text || text.length < 10) {
+          // 텍스트 추출 실패 시 파일명으로 분석
+          text = `파일명: ${file.name}`;
+        }
+        // 너무 길면 잘라서 전달
+        const truncated = text.slice(0, 2000);
+        result = await callClaude(sys, `다음 내용에서 핵심을 추출하세요:
+${truncated}`);
+      }
+
+      setAnalyzed(result);
+    } catch(e) {
+      setError(`분석 실패: ${e.message}`);
+    } finally { setLoading(false); }
+  };
+
+  const save = async () => {
+    if (!analyzed) return;
+    setSaving(true);
+    try {
+      const contentToSave = `[파일: ${file.name}] ${analyzed}`;
+      await saveToSheet(role, category, contentToSave);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 3000);
+    } catch { setError("저장 실패"); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <div>
+      <div style={{ marginBottom:16 }}>
+        <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📄 문서·사진 학습</div>
+        <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
+          PDF, Word, Excel, 사진 파일을 업로드하면 AI가 핵심 내용을 추출해요
+        </div>
+      </div>
+
+      {/* 지원 형식 */}
+      <div style={{ display:"flex", gap:6, marginBottom:14, flexWrap:"wrap" }}>
+        {[
+          { label:"PDF", color:"#ef4444" },
+          { label:"Word", color:"#3b82f6" },
+          { label:"Excel", color:"#22c55e" },
+          { label:"JPG/PNG", color:"#f97316" },
+        ].map(t => (
+          <span key={t.label} style={{
+            background:`${t.color}15`, border:`1px solid ${t.color}30`,
+            color:t.color, borderRadius:5, padding:"2px 10px",
+            fontSize:10, fontWeight:800,
+          }}>{t.label}</span>
+        ))}
+      </div>
+
+      {/* 파일 업로드 */}
+      <div onClick={() => fileRef.current?.click()} style={{
+        border:`2px dashed ${file ? roleInfo.color : "rgba(71,85,105,0.6)"}`,
+        borderRadius:12, padding:"28px 20px", textAlign:"center",
+        cursor:"pointer", marginBottom:14,
+        background: file ? `${roleInfo.color}05` : "rgba(15,23,42,0.4)",
+        transition:"all 0.2s",
+      }}>
+        <input ref={fileRef} type="file"
+          accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png"
+          onChange={handleFile} style={{ display:"none" }}/>
+        {preview ? (
+          <img src={preview} alt="미리보기"
+            style={{ maxHeight:150, maxWidth:"100%", borderRadius:8, marginBottom:8 }}/>
+        ) : (
+          <div style={{ fontSize:36, marginBottom:8 }}>{file ? "📄" : "📂"}</div>
+        )}
+        {file ? (
+          <>
+            <div style={{ fontSize:13, color:roleInfo.color, fontWeight:700 }}>{file.name}</div>
+            <div style={{ fontSize:10, color:"#475569", marginTop:2 }}>
+              {(file.size/1024).toFixed(1)}KB · 클릭하여 변경
+            </div>
+          </>
+        ) : (
+          <>
+            <div style={{ fontSize:13, color:"#94a3b8" }}>클릭하여 파일 선택</div>
+            <div style={{ fontSize:10, color:"#475569", marginTop:2 }}>PDF, Word, Excel, 사진</div>
+          </>
+        )}
+      </div>
+
+      {/* 카테고리 선택 */}
+      <div style={{ marginBottom:14 }}>
+        <div style={{ fontSize:10, color:"#475569", fontWeight:800, letterSpacing:1.2, marginBottom:6 }}>
+          저장 카테고리
+        </div>
+        <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+          {CATEGORIES.map(cat => (
+            <button key={cat} onClick={() => setCategory(cat)} style={{
+              padding:"5px 12px",
+              background: category===cat ? `${roleInfo.color}20` : "rgba(30,41,59,0.6)",
+              border:`1px solid ${category===cat ? roleInfo.color : "rgba(51,65,85,0.5)"}`,
+              borderRadius:6, color: category===cat ? roleInfo.color : "#64748b",
+              fontSize:11, fontWeight:700, cursor:"pointer",
+            }}>{cat}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* 분석 버튼 */}
+      <button onClick={analyze} disabled={!file || loading} style={{
+        padding:"10px 18px", marginBottom:14,
+        background: file&&!loading ? `linear-gradient(135deg,${roleInfo.color},${roleInfo.color}99)` : "rgba(51,65,85,0.3)",
+        border:"none", borderRadius:8,
+        color: file&&!loading ? "#fff" : "#374151",
+        fontSize:13, fontWeight:700,
+        cursor: file&&!loading ? "pointer" : "not-allowed",
+        display:"inline-flex", alignItems:"center", gap:8,
+      }}>
+        {loading ? <><Spinner/>분석 중...</> : "🔍 AI 분석"}
+      </button>
+
+      {error && (
+        <div style={{
+          padding:"9px 13px", background:"rgba(239,68,68,0.08)",
+          border:"1px solid rgba(239,68,68,0.25)", borderRadius:8,
+          fontSize:11, color:"#fca5a5", marginBottom:12,
+        }}>{error}</div>
+      )}
+
+      {/* 분석 결과 */}
+      {analyzed && (
+        <div style={{ marginBottom:14 }}>
+          <div style={{
+            background:`${roleInfo.color}06`, border:`1px solid ${roleInfo.color}25`,
+            borderRadius:10, padding:"13px 15px", marginBottom:10,
+          }}>
+            <div style={{ fontSize:10, color:roleInfo.color, fontWeight:800, marginBottom:7 }}>
+              🤖 AI 분석 결과 ({category})
+            </div>
+            <textarea
+              value={analyzed}
+              onChange={e => setAnalyzed(e.target.value)}
+              rows={4}
+              style={{
+                width:"100%", background:"transparent",
+                border:"none", color:"#dde4f0",
+                fontSize:12.5, lineHeight:1.75, outline:"none",
+                resize:"vertical", fontFamily:"inherit",
+                boxSizing:"border-box",
+              }}
+            />
+            <div style={{ fontSize:9, color:"#374151", marginTop:4 }}>
+              내용을 직접 수정할 수 있어요
+            </div>
+          </div>
+          <SaveBtn onClick={save} saving={saving} saved={saved}/>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── STEP 5: 학습 현황 ────────────────────────────────────────────────────────
 function TabStatus({ role, roleInfo, knowledge, onReload, loading }) {
   const progress = calcProgress(knowledge);
 
@@ -641,7 +889,8 @@ const TABS = [
   { id:0, icon:"💬", label:"채팅 학습" },
   { id:1, icon:"📋", label:"업무 규칙" },
   { id:2, icon:"🎯", label:"상황 교정" },
-  { id:3, icon:"🧠", label:"학습 현황" },
+  { id:3, icon:"📄", label:"문서·사진" },
+  { id:4, icon:"🧠", label:"학습 현황" },
 ];
 
 export default function App() {
@@ -715,6 +964,7 @@ export default function App() {
     <TabChat role={role} roleInfo={roleInfo}/>,
     <TabRules role={role} roleInfo={roleInfo}/>,
     <TabCorrection role={role} roleInfo={roleInfo} knowledge={knowledge}/>,
+    <TabDocument role={role} roleInfo={roleInfo}/>,
     <TabStatus role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}/>,
   ];
 
