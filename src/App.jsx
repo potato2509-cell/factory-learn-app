@@ -202,6 +202,37 @@ async function deleteKnowledge(role, category, content) {
   } catch { return false; }
 }
 
+// 불량 사진 누적 카운트 + 패턴 존재 여부
+async function loadDefectImageCount(role) {
+  try {
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=count_defect_images&role=${role}`);
+    const data = await res.json();
+    return data.success ? data.data : { count: 0, hasPattern: false };
+  } catch { return { count: 0, hasPattern: false }; }
+}
+
+// 불량 사진 학습 데이터 모두 로드 (패턴 추출 시 사용)
+async function loadDefectImageData(role) {
+  try {
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_defect_image_data&role=${role}`);
+    const data = await res.json();
+    return data.success ? data.data : [];
+  } catch { return []; }
+}
+
+// 불량 패턴 저장 (category="_불량패턴", 항상 1건만 유지)
+async function saveDefectPattern(role, pattern) {
+  try {
+    await fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ action: "save_defect_pattern", role, pattern }),
+    });
+    return true;
+  } catch { return false; }
+}
+
 // 신규 항목 vs 기존 카테고리 항목들 AI 충돌 검사
 // 반환: null (충돌 없음) | { conflictWith: {category, content}, type: "duplicate"|"conflict", reason: string }
 async function checkConflict(role, category, newContent) {
@@ -1216,17 +1247,32 @@ function TabDocument({ role, roleInfo }) {
   const [preview, setPreview] = useState("");
   const [analyzed, setAnalyzed] = useState("");
   const [category, setCategory] = useState("판단기준");
+  const [imageType, setImageType] = useState(""); // 이미지 유형 (검사기준서/다이어그램/불량/설비/기타)
+  const [recommendedCategory, setRecommendedCategory] = useState(""); // AI가 추천한 카테고리
   const [loading, setLoading] = useState(false);
+  const [analyzeStep, setAnalyzeStep] = useState(""); // 분석 진행 단계 표시
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
+  const [defectInfo, setDefectInfo] = useState({ count: 0, hasPattern: false }); // 불량 사진 누적 정보
   const fileRef = useRef();
 
   const CATEGORIES = ["공장정보", "업무역할", "판단기준", "협업방식", "교정사례"];
+  const IMAGE_TYPES = ["검사 기준서", "공정 다이어그램", "불량 사진", "설비 사진", "기타"];
+  const DEFECT_PATTERN_THRESHOLD = 10; // 불량 사진 N장 이상 누적 시 패턴 추출
+
   const isImage = file && file.type.startsWith("image/");
   const isPDF = file && file.type === "application/pdf";
   const isDoc = file && (file.name.endsWith(".docx") || file.name.endsWith(".doc"));
   const isExcel = file && (file.name.endsWith(".xlsx") || file.name.endsWith(".xls"));
+
+  // 시작 시 불량 사진 누적 카운트 로드
+  useEffect(() => {
+    (async () => {
+      const info = await loadDefectImageCount(role);
+      setDefectInfo(info);
+    })();
+  }, [role]);
 
   const handleFile = async (e) => {
     const f = e.target.files[0];
@@ -1234,7 +1280,8 @@ function TabDocument({ role, roleInfo }) {
     setFile(f);
     setAnalyzed("");
     setError("");
-    // 이미지 미리보기
+    setImageType("");
+    setRecommendedCategory("");
     if (f.type.startsWith("image/")) {
       const url = URL.createObjectURL(f);
       setPreview(url);
@@ -1243,45 +1290,115 @@ function TabDocument({ role, roleInfo }) {
     }
   };
 
+  // 이미지 유형별 특화 프롬프트
+  const getTypeSpecificPrompt = (detectedType) => {
+    const baseRole = `당신은 ${roleInfo.label}(${role}) AI입니다.`;
+    switch (detectedType) {
+      case "검사 기준서":
+        return `${baseRole}\n검사 기준서 이미지에서 다음을 정확히 추출하세요:\n- 검사 항목명 (각 항목)\n- 측정 위치 / 측정 방법\n- 규격값 (수치, 허용 오차 포함)\n- CTQ 여부\n표 형태가 있으면 표 구조를 살려서 정리.`;
+      case "공정 다이어그램":
+        return `${baseRole}\n공정 다이어그램에서 다음을 추출하세요:\n- 공정 단계 순서 (좌→우 또는 위→아래)\n- 각 단계의 명칭과 역할\n- 단계 간 연결 관계 / 분기 / 피드백 루프\n- 표시된 주요 변수나 조건`;
+      case "불량 사진":
+        return `${baseRole}\n불량 현상 사진에서 다음을 추출하세요:\n- 불량의 시각적 특징 (색상, 형태, 위치, 크기)\n- 불량 발생 부위 (제품의 어느 부분)\n- 추정 원인 (시각적 단서 기반)\n- 분류 가능한 불량 유형 (예: 스크래치, 변색, 누액, 변형 등)`;
+      case "설비 사진":
+        return `${baseRole}\n설비 사진에서 다음을 추출하세요:\n- 설비 종류 / 명칭 (식별 가능한 경우)\n- 주요 부품 또는 구조\n- 라벨, 표시판, 게이지 표시값\n- 설비 상태 (정상/이상 신호 있는지)`;
+      default:
+        return `${baseRole}\n업로드된 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.\n한국어로 간결하게 정리.`;
+    }
+  };
+
+  // AI에게 이미지 유형 자동 판단 요청
+  const detectImageType = async (base64, mediaType) => {
+    const sys = `당신은 이미지 분류기입니다. 업로드된 이미지가 다음 중 어느 유형인지 판단하세요.
+- 검사 기준서: 표/다이어그램으로 검사 항목과 규격이 정리된 문서
+- 공정 다이어그램: 공정 흐름이나 시스템 구조를 보여주는 도식
+- 불량 사진: 제품의 불량/이상 현상을 찍은 사진
+- 설비 사진: 공장 설비, 기계, 장비를 찍은 사진
+- 기타: 위에 해당하지 않음
+
+또한 이 이미지가 다음 카테고리 중 어디에 가장 잘 맞는지 추천하세요:
+- 공장정보, 업무역할, 판단기준, 협업방식, 교정사례
+
+JSON으로만 답하세요. 다른 설명 없이.
+
+응답 형식:
+{"imageType":"검사 기준서|공정 다이어그램|불량 사진|설비 사진|기타","recommendedCategory":"공장정보|업무역할|판단기준|협업방식|교정사례","reason":"한 줄 사유"}`;
+
+    try {
+      const raw = await callClaudeVision(sys, "이 이미지를 분류하세요.", base64, mediaType);
+      const parsed = safeJSON(raw);
+      return {
+        imageType: parsed.imageType || "기타",
+        recommendedCategory: parsed.recommendedCategory || "판단기준",
+      };
+    } catch {
+      return { imageType: "기타", recommendedCategory: "판단기준" };
+    }
+  };
+
   const analyze = async () => {
     if (!file) return;
     setLoading(true);
     setError("");
     setAnalyzed("");
-    try {
-      const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
-업로드된 파일 내용에서 ${role} 업무와 관련된 핵심 정보를 추출하세요.
-카테고리: ${category}
-한국어로 핵심 내용만 간결하게 정리하세요. 200자 이내로.`;
+    setImageType("");
+    setRecommendedCategory("");
 
+    try {
       let result = "";
+      let detectedType = "";
 
       if (isImage) {
-        // 이미지 처리 - Claude Vision
         const base64 = await fileToBase64(file);
+
+        // 1단계: 이미지 유형 자동 판단
+        setAnalyzeStep("이미지 유형 분석 중...");
+        const detection = await detectImageType(base64, file.type);
+        detectedType = detection.imageType;
+        setImageType(detectedType);
+        setRecommendedCategory(detection.recommendedCategory);
+        setCategory(detection.recommendedCategory); // 카테고리 자동 설정
+
+        // 2단계: 유형별 특화 프롬프트로 분석
+        setAnalyzeStep(`${detectedType} 분석 중...`);
+        const specificPrompt = getTypeSpecificPrompt(detectedType);
+
+        // 시각 메타데이터 + 추출 텍스트를 한꺼번에 요청
+        const analysisPrompt = `${specificPrompt}
+
+다음 형식으로 한국어 답변:
+[추출 텍스트]
+(이미지에서 읽거나 추론한 정보, 핵심만 간결하게)
+
+[시각 설명]
+(이미지의 시각적 특징을 한 줄로: 레이아웃, 색상, 강조 표시 등)`;
+
         result = await callClaudeVision(
-          sys,
-          `이 이미지에서 ${role} 업무 관련 핵심 내용을 추출해주세요.`,
+          analysisPrompt,
+          `이 ${detectedType} 이미지를 분석하세요.`,
           base64,
           file.type
         );
+
+        // 메타데이터 추가
+        result = `[이미지 유형] ${detectedType}\n${result}`;
       } else {
-        // 텍스트 파일 처리
+        // 텍스트 파일 처리 (기존 그대로)
+        setAnalyzeStep("파일 분석 중...");
+        const sys = `${roleInfo.label}(${role}) AI입니다. 카테고리: ${category}.\n한국어로 핵심 내용만 간결하게 정리. 200자 이내.`;
         let text = await extractTextFromFile(file);
-        if (!text || text.length < 10) {
-          // 텍스트 추출 실패 시 파일명으로 분석
-          text = `파일명: ${file.name}`;
-        }
-        // 너무 길면 잘라서 전달
+        if (!text || text.length < 10) text = `파일명: ${file.name}`;
         const truncated = text.slice(0, 2000);
-        result = await callClaude(sys, `다음 내용에서 핵심을 추출하세요:
-${truncated}`);
+        result = await callClaude(sys, `다음 내용에서 핵심을 추출하세요:\n${truncated}`);
       }
 
       setAnalyzed(result);
     } catch(e) {
       setError(`분석 실패: ${e.message}`);
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+      setAnalyzeStep("");
+    }
   };
 
   const [conflictQueue, setConflictQueue] = useState([]);
@@ -1298,6 +1415,40 @@ ${truncated}`);
     setCurrentConflict(null);
   };
 
+  // 불량 사진 패턴 추출 (10장 이상 누적 시 자동 트리거)
+  const extractDefectPattern = async () => {
+    try {
+      const data = await loadDefectImageData(role);
+      if (data.length === 0) return;
+
+      const dataText = data.map((d, i) =>
+        `${i + 1}. ${d.content.replace(/\[파일: [^\]]+\]/g, '').slice(0, 300)}`
+      ).join("\n\n");
+
+      const sys = `당신은 불량 패턴 분석 전문가입니다. 아래 ${data.length}장의 불량 사진 분석 결과들을 보고 공통된 패턴을 일반화해서 추출하세요.
+
+[불량 사진 분석 결과들]
+${dataText.slice(0, 8000)}
+
+다음 형식으로 한국어 요약 작성:
+[자주 발생하는 불량 유형] (Top 3)
+[공통 발생 부위]
+[추정 공통 원인]
+[권장 점검 포인트]
+
+전체 500자 이내로 간결하게.`;
+
+      const pattern = await callClaude(sys, "불량 패턴을 일반화하세요.");
+      await saveDefectPattern(role, pattern);
+
+      // UI 갱신
+      const info = await loadDefectImageCount(role);
+      setDefectInfo(info);
+    } catch (e) {
+      console.error("불량 패턴 추출 실패:", e);
+    }
+  };
+
   const save = async () => {
     if (!analyzed) return;
     setSaving(true);
@@ -1310,6 +1461,15 @@ ${truncated}`);
         setConflictQueue([{ category, content: contentToSave, conflict }]);
       } else {
         await saveToSheet(role, category, contentToSave);
+
+        // 불량 사진이고 누적 임계 도달 시 패턴 추출 (백그라운드)
+        if (imageType === "불량 사진") {
+          const newCount = (defectInfo.count || 0) + 1;
+          if (newCount >= DEFECT_PATTERN_THRESHOLD && newCount % DEFECT_PATTERN_THRESHOLD === 0) {
+            extractDefectPattern(); // await 안 함
+          }
+          setDefectInfo({ ...defectInfo, count: newCount });
+        }
       }
 
       setSaved(true);
@@ -1375,10 +1535,50 @@ ${truncated}`);
         )}
       </div>
 
+      {/* 불량 사진 누적 정보 */}
+      {defectInfo.count > 0 && (
+        <div style={{
+          background: defectInfo.hasPattern ? "rgba(52,211,153,0.06)" : "rgba(245,158,11,0.06)",
+          border: `1px solid ${defectInfo.hasPattern ? "rgba(52,211,153,0.25)" : "rgba(245,158,11,0.25)"}`,
+          borderRadius:8, padding:"9px 13px", marginBottom:12,
+          fontSize:11, color:"#94a3b8", lineHeight:1.6,
+        }}>
+          <span style={{ color: defectInfo.hasPattern ? "#34d399" : "#fbbf24", fontWeight:700 }}>
+            {defectInfo.hasPattern ? "✅ 불량 패턴 학습됨" : `📸 불량 사진 ${defectInfo.count}장 누적`}
+          </span>
+          {!defectInfo.hasPattern && defectInfo.count < DEFECT_PATTERN_THRESHOLD && (
+            <span> · {DEFECT_PATTERN_THRESHOLD - defectInfo.count}장 더 모이면 자동 패턴 추출</span>
+          )}
+        </div>
+      )}
+
+      {/* 이미지 유형 자동 판단 결과 표시 */}
+      {imageType && (
+        <div style={{
+          background:`${roleInfo.color}06`, border:`1px solid ${roleInfo.color}25`,
+          borderRadius:8, padding:"10px 13px", marginBottom:12,
+        }}>
+          <div style={{ fontSize:10, color:roleInfo.color, fontWeight:800, marginBottom:4 }}>
+            🎯 AI 자동 판단
+          </div>
+          <div style={{ fontSize:12, color:"#cbd5e1" }}>
+            <strong>이미지 유형:</strong> {imageType}
+            {recommendedCategory && (
+              <> · <strong>추천 카테고리:</strong> {recommendedCategory}</>
+            )}
+          </div>
+          {recommendedCategory && recommendedCategory !== category && (
+            <div style={{ fontSize:10, color:"#fbbf24", marginTop:4 }}>
+              ⚠️ 카테고리를 변경하셨습니다 (자동 추천: {recommendedCategory})
+            </div>
+          )}
+        </div>
+      )}
+
       {/* 카테고리 선택 */}
       <div style={{ marginBottom:14 }}>
         <div style={{ fontSize:10, color:"#475569", fontWeight:800, letterSpacing:1.2, marginBottom:6 }}>
-          저장 카테고리
+          저장 카테고리 {recommendedCategory && <span style={{ color:roleInfo.color, marginLeft:4 }}>(AI 추천: {recommendedCategory})</span>}
         </div>
         <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
           {CATEGORIES.map(cat => (
@@ -1403,7 +1603,7 @@ ${truncated}`);
         cursor: file&&!loading ? "pointer" : "not-allowed",
         display:"inline-flex", alignItems:"center", gap:8,
       }}>
-        {loading ? <><Spinner/>분석 중...</> : "🔍 AI 분석"}
+        {loading ? <><Spinner/>{analyzeStep || "분석 중..."}</> : "🔍 AI 분석"}
       </button>
 
       {error && (
