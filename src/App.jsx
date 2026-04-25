@@ -167,6 +167,87 @@ async function loadSummaryCount(role) {
   } catch { return { count: 0, hasSummary: false }; }
 }
 
+// 특정 카테고리의 항목들만 로드 (자동 충돌 검사용)
+async function loadCategoryItems(role, category) {
+  try {
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_category_items&role=${role}&category=${encodeURIComponent(category)}`);
+    const data = await res.json();
+    return data.success ? data.data : [];
+  } catch { return []; }
+}
+
+// 기존 row 교체 (신규로 교체 옵션)
+async function replaceKnowledge(role, category, oldContent, newContent) {
+  try {
+    await fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ action: "replace_knowledge", role, category, oldContent, newContent }),
+    });
+    return true;
+  } catch { return false; }
+}
+
+// 특정 row 삭제
+async function deleteKnowledge(role, category, content) {
+  try {
+    await fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ action: "delete_knowledge", role, category, content }),
+    });
+    return true;
+  } catch { return false; }
+}
+
+// 신규 항목 vs 기존 카테고리 항목들 AI 충돌 검사
+// 반환: null (충돌 없음) | { conflictWith: {category, content}, type: "duplicate"|"conflict", reason: string }
+async function checkConflict(role, category, newContent) {
+  // 같은 카테고리 기존 데이터 로드
+  const existing = await loadCategoryItems(role, category);
+  if (existing.length === 0) return null; // 비교 대상 없음
+
+  // 너무 많으면 최근 20건까지만
+  const targets = existing.slice(-20);
+  const targetsText = targets.map((it, i) => `${i + 1}. ${it.content}`).join("\n");
+
+  const sys = `당신은 학습 데이터 검증자입니다. 신규 항목이 기존 데이터와 중복되거나 충돌하는지 판단하세요.
+
+[기존 ${category} 항목들]
+${targetsText}
+
+[신규 항목]
+${newContent}
+
+[판단 기준]
+- duplicate: 기존 항목 중 하나와 같은 의미 (표현만 다름)
+- conflict: 기존 항목 중 하나와 같은 주제이지만 내용이 다름 (수치 다름, 절차 다름 등)
+- none: 충돌 없음 (다른 주제이거나 보완 정보)
+
+JSON으로만 답하세요. 다른 설명 없이.
+
+응답 형식:
+{"type":"duplicate"|"conflict"|"none","matchIndex":1~${targets.length}|null,"reason":"한 줄 사유"}`;
+
+  try {
+    const raw = await callClaude(sys, "판단 결과만 JSON으로 답하세요.");
+    const parsed = safeJSON(raw);
+
+    if (parsed.type === "none") return null;
+    if (!parsed.matchIndex || parsed.matchIndex < 1 || parsed.matchIndex > targets.length) return null;
+
+    return {
+      type: parsed.type,
+      conflictWith: targets[parsed.matchIndex - 1],
+      reason: parsed.reason || "",
+    };
+  } catch {
+    return null; // 검사 실패 시 충돌 없는 것으로 처리 (저장 막지 않음)
+  }
+}
+
 // JSON 파싱
 function safeJSON(raw) {
   const cleaned = raw.replace(/```json|```/gi, "").trim();
@@ -233,6 +314,162 @@ function Spinner() {
   }}/>;
 }
 
+// ─── 중복/충돌 다이얼로그 (Step 3) ─────────────────────────────────────────────
+// 신규 저장 시 기존 데이터와 충돌하는 경우 사용자에게 선택지 제공
+function ConflictDialog({ role, category, newContent, conflict, onResolve, onCancel }) {
+  const [editedContent, setEditedContent] = useState(newContent);
+  const [editing, setEditing] = useState(false);
+  const [processing, setProcessing] = useState(false);
+
+  const handle = async (choice) => {
+    setProcessing(true);
+    try {
+      if (choice === "keep_old") {
+        // 기존 유지: 신규는 저장 안 함
+        await onResolve("keep_old", null);
+      } else if (choice === "replace") {
+        // 신규로 교체: 기존 row를 신규 content로 교체
+        await replaceKnowledge(role, category, conflict.conflictWith.content, newContent);
+        await onResolve("replace", null);
+      } else if (choice === "keep_both") {
+        // 둘 다 저장: 신규를 그대로 추가
+        await saveToSheet(role, category, newContent);
+        await onResolve("keep_both", null);
+      } else if (choice === "edit") {
+        // 수정 후 저장: editedContent로 새로 저장
+        if (!editedContent.trim()) {
+          alert("내용을 입력해주세요");
+          setProcessing(false);
+          return;
+        }
+        await saveToSheet(role, category, editedContent);
+        await onResolve("edit", editedContent);
+      } else if (choice === "skip") {
+        // 건너뛰기: 아무것도 저장 안 함
+        await onResolve("skip", null);
+      }
+    } catch (e) {
+      alert("처리 실패: " + e.message);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const typeLabel = conflict.type === "duplicate" ? "중복" : "충돌";
+  const typeColor = conflict.type === "duplicate" ? "#a78bfa" : "#f59e0b";
+
+  return (
+    <div style={{
+      position:"fixed", top:0, left:0, right:0, bottom:0,
+      background:"rgba(0,0,0,0.7)", backdropFilter:"blur(4px)",
+      display:"flex", alignItems:"center", justifyContent:"center",
+      zIndex:1000, padding:"16px", animation:"fadeUp 0.2s ease both",
+    }}>
+      <div style={{
+        background:"#0f172a", border:`1.5px solid ${typeColor}40`,
+        borderRadius:14, padding:"20px", maxWidth:540, width:"100%",
+        maxHeight:"90vh", overflowY:"auto",
+      }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:14 }}>
+          <span style={{
+            background:`${typeColor}20`, color:typeColor,
+            padding:"3px 10px", borderRadius:5, fontSize:11, fontWeight:800,
+          }}>⚠️ {typeLabel} 감지</span>
+          <span style={{ fontSize:11, color:"#64748b" }}>{category}</span>
+        </div>
+
+        <div style={{ fontSize:12, color:"#94a3b8", marginBottom:14, lineHeight:1.6 }}>
+          {conflict.reason || "기존 학습 내용과 중복되거나 충돌됩니다"}
+        </div>
+
+        {/* 기존 내용 */}
+        <div style={{ marginBottom:10 }}>
+          <div style={{ fontSize:10, color:"#64748b", fontWeight:700, marginBottom:5 }}>📂 기존 내용</div>
+          <div style={{
+            background:"rgba(15,23,42,0.6)", border:"1px solid rgba(51,65,85,0.4)",
+            borderRadius:7, padding:"10px 12px", fontSize:12, color:"#cbd5e1",
+            lineHeight:1.6, whiteSpace:"pre-wrap",
+          }}>{conflict.conflictWith.content}</div>
+        </div>
+
+        {/* 신규 내용 (수정 모드면 textarea, 아니면 표시) */}
+        <div style={{ marginBottom:18 }}>
+          <div style={{ fontSize:10, color:"#64748b", fontWeight:700, marginBottom:5 }}>✨ 신규 내용</div>
+          {editing ? (
+            <textarea value={editedContent} onChange={e => setEditedContent(e.target.value)}
+              rows={4} style={{
+                width:"100%", background:"rgba(15,23,42,0.8)",
+                border:`1.5px solid ${typeColor}50`, borderRadius:7,
+                color:"#dde4f0", padding:"10px 12px", fontSize:12,
+                outline:"none", resize:"vertical", lineHeight:1.6,
+                boxSizing:"border-box", fontFamily:"inherit",
+              }}/>
+          ) : (
+            <div style={{
+              background:`${typeColor}08`, border:`1px solid ${typeColor}30`,
+              borderRadius:7, padding:"10px 12px", fontSize:12, color:"#dde4f0",
+              lineHeight:1.6, whiteSpace:"pre-wrap",
+            }}>{editedContent}</div>
+          )}
+        </div>
+
+        {/* 처리 버튼 5개 */}
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:6, marginBottom:6 }}>
+          <button onClick={() => handle("keep_old")} disabled={processing} style={btnStyle("#94a3b8")}>
+            📂 기존 유지
+          </button>
+          <button onClick={() => handle("replace")} disabled={processing} style={btnStyle("#34d399")}>
+            ✨ 신규로 교체
+          </button>
+          <button onClick={() => handle("keep_both")} disabled={processing} style={btnStyle("#a78bfa")}>
+            ➕ 둘 다 저장
+          </button>
+          {!editing ? (
+            <button onClick={() => setEditing(true)} disabled={processing} style={btnStyle("#fbbf24")}>
+              ✏️ 수정하기
+            </button>
+          ) : (
+            <button onClick={() => handle("edit")} disabled={processing} style={btnStyle("#fbbf24")}>
+              💾 수정 저장
+            </button>
+          )}
+        </div>
+        <button onClick={() => handle("skip")} disabled={processing} style={{
+          ...btnStyle("#64748b"), width:"100%",
+        }}>
+          ⏭ 건너뛰기 (저장 안 함)
+        </button>
+
+        {processing && (
+          <div style={{ marginTop:10, textAlign:"center", color:"#94a3b8", fontSize:11 }}>
+            <Spinner/> 처리 중...
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function btnStyle(color) {
+  return {
+    padding:"9px 12px",
+    background:`${color}15`,
+    border:`1px solid ${color}40`,
+    borderRadius:7, color: color,
+    fontSize:12, fontWeight:700, cursor:"pointer",
+  };
+}
+
+function smallBtnStyle(color) {
+  return {
+    padding:"6px 8px",
+    background:`${color}15`,
+    border:`1px solid ${color}40`,
+    borderRadius:5, color: color,
+    fontSize:11, fontWeight:700, cursor:"pointer",
+  };
+}
+
 function ProgressBar({ label, value, color }) {
   return (
     <div style={{ marginBottom:10 }}>
@@ -279,8 +516,21 @@ function TabChat({ role, roleInfo }) {
   const [saved, setSaved] = useState(false);
   const [summary, setSummary] = useState(null);  // 시트에서 로드한 요약본
   const [initialized, setInitialized] = useState(false);
+  const [conflictQueue, setConflictQueue] = useState([]);
+  const [currentConflict, setCurrentConflict] = useState(null);
   const bottomRef = useRef();
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:"smooth" }); }, [msgs]);
+
+  useEffect(() => {
+    if (!currentConflict && conflictQueue.length > 0) {
+      setCurrentConflict(conflictQueue[0]);
+      setConflictQueue(q => q.slice(1));
+    }
+  }, [conflictQueue, currentConflict]);
+
+  const handleConflictResolve = async () => {
+    setCurrentConflict(null);
+  };
 
   // 시작 시 요약본 로드 + 첫 메시지 동적 생성
   useEffect(() => {
@@ -363,6 +613,43 @@ ${summaryData.content}
     setMsgs(newMsgs);
     setLoading(true);
     try {
+      // ─── 디테일 모드 감지 ───
+      // 사용자가 구체적/디테일한 정보를 원하는지 키워드로 판단
+      const detailKeywords = ["상세", "자세히", "정확", "구체적", "수치", "값", "기준", "정확한", "어떤", "뭐였", "무엇", "얼마"];
+      const categoryKeywords = {
+        "공장정보": ["공장", "제품", "공정", "라인"],
+        "업무역할": ["역할", "업무", "담당", "책임"],
+        "판단기준": ["판단", "기준", "결정", "우선순위", "보고", "에스컬레이션"],
+        "협업방식": ["협업", "협조", "소통", "보고", "회의"],
+        "교정사례": ["사례", "케이스", "예시", "이전", "지난번"],
+      };
+
+      const isDetailMode = detailKeywords.some(kw => msg.includes(kw));
+      const matchedCategories = Object.entries(categoryKeywords)
+        .filter(([_, kws]) => kws.some(kw => msg.includes(kw)))
+        .map(([cat]) => cat);
+
+      // 디테일 모드면 원본 데이터 로드
+      let detailContext = "";
+      if (isDetailMode || matchedCategories.length > 0) {
+        const allKnowledge = await loadFromSheet(role);
+        // _요약은 제외
+        const filtered = allKnowledge.filter(k => k.category !== "_요약");
+
+        // 매칭 카테고리가 있으면 해당 카테고리만, 없으면 모든 원본
+        let targetData = filtered;
+        if (matchedCategories.length > 0) {
+          targetData = filtered.filter(k => matchedCategories.includes(k.category));
+        }
+
+        if (targetData.length > 0) {
+          // 너무 많으면 최신 30건까지만
+          const limited = targetData.slice(-30);
+          const dataText = limited.map(k => `[${k.category}] ${k.content}`).join("\n");
+          detailContext = `\n\n[참고 - 원본 학습 데이터 ${matchedCategories.length > 0 ? `(${matchedCategories.join(", ")} 카테고리)` : "(전체)"}]\n${dataText.slice(0, 6000)}\n\n위 원본 데이터에서 정확한 정보를 찾아 답변하세요.`;
+        }
+      }
+
       const summaryContext = summary
         ? `\n\n[기존 학습 요약]\n${summary}\n\n위 내용을 이미 알고 있다는 전제로 답변하세요. 같은 질문을 반복하지 마세요.`
         : "";
@@ -370,7 +657,7 @@ ${summaryData.content}
 사용자가 공장 상황과 ${role} 업무를 알려주면 자연스럽게 대화하며 더 깊이 파악하세요.
 모르는 부분은 추가 질문하고, 중요한 내용은 확인하세요.
 수율/KPI 수치보다 실제 업무 흐름, 협업 방식, 현장 문제에 집중하세요.
-150자 이내로 간결하게 한국어로 답하세요.${summaryContext}`;
+150자 이내로 간결하게 한국어로 답하세요.${summaryContext}${detailContext}`;
       const reply = await callClaude(system, msg);
       setMsgs(m => [...m, { role:"assistant", content:reply }]);
     } catch {
@@ -419,9 +706,24 @@ ${dataText.slice(0, 8000)}
 {"공장정보":"공장/제품/공정 요약","업무역할":"${role} 담당 업무","협업방식":"타 엔지니어 소통 방식"}`;
       const raw = await callClaude(system, conv);
       const parsed = safeJSON(raw);
+
+      // 각 카테고리별로 충돌 검사 후 처리
+      const conflicts = [];
       for (const [cat, content] of Object.entries(parsed)) {
-        if (content) await saveToSheet(role, cat, content);
+        if (!content) continue;
+        const conflict = await checkConflict(role, cat, content);
+        if (conflict) {
+          conflicts.push({ category: cat, content, conflict });
+        } else {
+          await saveToSheet(role, cat, content);
+        }
       }
+
+      // 충돌 항목들을 큐에 쌓아 사용자가 차례로 처리
+      if (conflicts.length > 0) {
+        setConflictQueue(conflicts);
+      }
+
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
 
@@ -518,6 +820,17 @@ ${dataText.slice(0, 8000)}
       </div>
 
       <SaveBtn onClick={saveChat} saving={saving} saved={saved}/>
+
+      {currentConflict && (
+        <ConflictDialog
+          role={role}
+          category={currentConflict.category}
+          newContent={currentConflict.content}
+          conflict={currentConflict.conflict}
+          onResolve={handleConflictResolve}
+          onCancel={handleConflictResolve}
+        />
+      )}
     </div>
   );
 }
@@ -579,20 +892,56 @@ function TabRules({ role, roleInfo }) {
   const [values, setValues] = useState(Object.fromEntries(fields.map((_,i) => [i, ""])));
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [conflictQueue, setConflictQueue] = useState([]); // 충돌 대기 큐
+  const [currentConflict, setCurrentConflict] = useState(null); // 현재 처리 중인 충돌
+
+  // 큐에서 다음 충돌 꺼내기
+  useEffect(() => {
+    if (!currentConflict && conflictQueue.length > 0) {
+      const next = conflictQueue[0];
+      setCurrentConflict(next);
+      setConflictQueue(q => q.slice(1));
+    }
+  }, [conflictQueue, currentConflict]);
 
   const save = async () => {
     setSaving(true);
     try {
+      const conflicts = [];
+      const safeItems = []; // 충돌 없는 항목
+
+      // 1단계: 각 입력 항목별로 충돌 검사
       for (const [idx, content] of Object.entries(values)) {
-        if (content.trim()) {
-          const field = fields[parseInt(idx)];
-          await saveToSheet(role, field.key, `[${field.label}] ${content}`);
+        if (!content.trim()) continue;
+        const field = fields[parseInt(idx)];
+        const fullContent = `[${field.label}] ${content}`;
+        const conflict = await checkConflict(role, field.key, fullContent);
+        if (conflict) {
+          conflicts.push({ category: field.key, content: fullContent, conflict });
+        } else {
+          safeItems.push({ category: field.key, content: fullContent });
         }
       }
+
+      // 2단계: 충돌 없는 항목은 즉시 저장
+      for (const item of safeItems) {
+        await saveToSheet(role, item.category, item.content);
+      }
+
+      // 3단계: 충돌 항목들을 큐에 쌓아서 사용자에게 차례로 표시
+      if (conflicts.length > 0) {
+        setConflictQueue(conflicts);
+      }
+
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
     } catch { alert("저장 실패"); }
     finally { setSaving(false); }
+  };
+
+  const handleConflictResolve = async () => {
+    setCurrentConflict(null);
+    // useEffect가 다음 큐 항목을 자동으로 처리
   };
 
   return (
@@ -630,6 +979,17 @@ function TabRules({ role, roleInfo }) {
       ))}
 
       <SaveBtn onClick={save} saving={saving} saved={saved}/>
+
+      {currentConflict && (
+        <ConflictDialog
+          role={role}
+          category={currentConflict.category}
+          newContent={currentConflict.content}
+          conflict={currentConflict.conflict}
+          onResolve={handleConflictResolve}
+          onCancel={handleConflictResolve}
+        />
+      )}
     </div>
   );
 }
@@ -643,6 +1003,19 @@ function TabCorrection({ role, roleInfo, knowledge }) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [cases, setCases] = useState([]);
+  const [conflictQueue, setConflictQueue] = useState([]);
+  const [currentConflict, setCurrentConflict] = useState(null);
+
+  useEffect(() => {
+    if (!currentConflict && conflictQueue.length > 0) {
+      setCurrentConflict(conflictQueue[0]);
+      setConflictQueue(q => q.slice(1));
+    }
+  }, [conflictQueue, currentConflict]);
+
+  const handleConflictResolve = async () => {
+    setCurrentConflict(null);
+  };
 
   const SAMPLES = {
     Cell_PE: [
@@ -706,7 +1079,15 @@ ${knowledgeText || "기본 역할 정의만 있음"}
     setSaving(true);
     try {
       const content = `상황: ${situation} | AI판단: ${aiAnswer} | 교정: ${correction || "정확함"}`;
-      await saveToSheet(role, "교정사례", content);
+
+      // 충돌 검사
+      const conflict = await checkConflict(role, "교정사례", content);
+      if (conflict) {
+        setConflictQueue([{ category: "교정사례", content, conflict }]);
+      } else {
+        await saveToSheet(role, "교정사례", content);
+      }
+
       setCases(c => [...c, { situation, aiAnswer, correction, date: new Date().toLocaleDateString("ko-KR") }]);
       setSituation(""); setAiAnswer(""); setCorrection("");
       setSaved(true);
@@ -814,6 +1195,17 @@ ${knowledgeText || "기본 역할 정의만 있음"}
           ))}
         </div>
       )}
+
+      {currentConflict && (
+        <ConflictDialog
+          role={role}
+          category={currentConflict.category}
+          newContent={currentConflict.content}
+          conflict={currentConflict.conflict}
+          onResolve={handleConflictResolve}
+          onCancel={handleConflictResolve}
+        />
+      )}
     </div>
   );
 }
@@ -892,12 +1284,34 @@ ${truncated}`);
     } finally { setLoading(false); }
   };
 
+  const [conflictQueue, setConflictQueue] = useState([]);
+  const [currentConflict, setCurrentConflict] = useState(null);
+
+  useEffect(() => {
+    if (!currentConflict && conflictQueue.length > 0) {
+      setCurrentConflict(conflictQueue[0]);
+      setConflictQueue(q => q.slice(1));
+    }
+  }, [conflictQueue, currentConflict]);
+
+  const handleConflictResolve = async () => {
+    setCurrentConflict(null);
+  };
+
   const save = async () => {
     if (!analyzed) return;
     setSaving(true);
     try {
       const contentToSave = `[파일: ${file.name}] ${analyzed}`;
-      await saveToSheet(role, category, contentToSave);
+
+      // 충돌 검사
+      const conflict = await checkConflict(role, category, contentToSave);
+      if (conflict) {
+        setConflictQueue([{ category, content: contentToSave, conflict }]);
+      } else {
+        await saveToSheet(role, category, contentToSave);
+      }
+
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
     } catch { setError("저장 실패"); }
@@ -1029,6 +1443,17 @@ ${truncated}`);
           <SaveBtn onClick={save} saving={saving} saved={saved}/>
         </div>
       )}
+
+      {currentConflict && (
+        <ConflictDialog
+          role={role}
+          category={currentConflict.category}
+          newContent={currentConflict.content}
+          conflict={currentConflict.conflict}
+          onResolve={handleConflictResolve}
+          onCancel={handleConflictResolve}
+        />
+      )}
     </div>
   );
 }
@@ -1036,6 +1461,104 @@ ${truncated}`);
 // ─── STEP 5: 학습 현황 ────────────────────────────────────────────────────────
 function TabStatus({ role, roleInfo, knowledge, onReload, loading }) {
   const progress = calcProgress(knowledge);
+  const [scanning, setScanning] = useState(false);
+  const [scanResults, setScanResults] = useState(null); // { conflicts: [...], scannedAt: timestamp }
+  const [resolving, setResolving] = useState(null); // 현재 처리 중인 충돌 인덱스
+
+  const CATEGORIES_TO_SCAN = ["공장정보", "업무역할", "판단기준", "협업방식", "교정사례"];
+
+  // 카테고리별 풀 검사 (Step 3 수동 검사)
+  const startFullScan = async () => {
+    setScanning(true);
+    setScanResults(null);
+    try {
+      const allConflicts = [];
+
+      for (const category of CATEGORIES_TO_SCAN) {
+        const items = knowledge.filter(k => k.category === category);
+        if (items.length < 2) continue; // 비교할 데이터 부족
+
+        // 너무 많으면 최근 30건까지만
+        const targets = items.slice(-30);
+        const targetsText = targets.map((it, i) => `${i + 1}. ${it.content}`).join("\n");
+
+        const sys = `당신은 학습 데이터 검증자입니다. 아래 ${category} 카테고리 항목들 중 서로 중복(같은 의미)이거나 충돌(같은 주제이지만 내용 다름)하는 쌍을 찾아주세요.
+
+[항목들]
+${targetsText}
+
+[판단 기준]
+- duplicate: 같은 의미를 다른 표현으로 작성
+- conflict: 같은 주제인데 수치/절차/기준이 다름
+
+JSON으로만 답하세요. 충돌 없으면 빈 배열.
+
+응답 형식:
+{"pairs":[{"a":1,"b":3,"type":"duplicate|conflict","reason":"한 줄 사유"}]}`;
+
+        try {
+          const raw = await callClaude(sys, "검사 결과를 JSON으로 답하세요.");
+          const parsed = safeJSON(raw);
+
+          if (parsed.pairs && Array.isArray(parsed.pairs)) {
+            for (const pair of parsed.pairs) {
+              if (pair.a >= 1 && pair.a <= targets.length &&
+                  pair.b >= 1 && pair.b <= targets.length && pair.a !== pair.b) {
+                allConflicts.push({
+                  category,
+                  itemA: targets[pair.a - 1],
+                  itemB: targets[pair.b - 1],
+                  type: pair.type || "conflict",
+                  reason: pair.reason || "",
+                  resolved: false,
+                });
+              }
+            }
+          }
+        } catch {
+          // 카테고리별 검사 실패해도 다음 진행
+          continue;
+        }
+      }
+
+      setScanResults({
+        conflicts: allConflicts,
+        scannedAt: new Date().toLocaleTimeString("ko-KR"),
+      });
+    } catch (e) {
+      alert("검사 실패: " + e.message);
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  // 충돌 해결 처리 (A 유지 / B 유지 / 둘 다 / 건너뛰기)
+  const resolveConflict = async (idx, choice) => {
+    setResolving(idx);
+    try {
+      const c = scanResults.conflicts[idx];
+      if (choice === "keep_a") {
+        // A 유지 → B 삭제
+        await deleteKnowledge(role, c.category, c.itemB.content);
+      } else if (choice === "keep_b") {
+        // B 유지 → A 삭제
+        await deleteKnowledge(role, c.category, c.itemA.content);
+      }
+      // keep_both / skip은 둘 다 유지 (아무것도 안 함)
+
+      // 해당 항목 처리됨 표시
+      setScanResults(r => ({
+        ...r,
+        conflicts: r.conflicts.map((cf, i) =>
+          i === idx ? { ...cf, resolved: true, resolvedAs: choice } : cf
+        ),
+      }));
+    } catch (e) {
+      alert("처리 실패: " + e.message);
+    } finally {
+      setResolving(null);
+    }
+  };
 
   return (
     <div>
@@ -1070,6 +1593,117 @@ function TabStatus({ role, roleInfo, knowledge, onReload, loading }) {
       }}>
         {loading ? <><Spinner/>로딩 중...</> : "🔄 최신 데이터 불러오기"}
       </button>
+
+      {/* 데이터 정리 (풀 검사) */}
+      <div style={{
+        marginTop:18, padding:"14px 16px",
+        background:"rgba(167,139,250,0.05)",
+        border:"1px solid rgba(167,139,250,0.2)",
+        borderRadius:10,
+      }}>
+        <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1", marginBottom:4 }}>
+          🔍 학습 데이터 정리
+        </div>
+        <div style={{ fontSize:10.5, color:"#64748b", marginBottom:10, lineHeight:1.6 }}>
+          카테고리별 중복/충돌을 한꺼번에 검토합니다. (약 30초~1분 소요)
+        </div>
+        <button onClick={startFullScan} disabled={scanning || knowledge.length < 2} style={{
+          width:"100%", padding:"10px",
+          background: scanning || knowledge.length < 2 ? "rgba(51,65,85,0.3)" : "linear-gradient(135deg,#a78bfa,#7c3aed)",
+          border:"none", borderRadius:8,
+          color: scanning || knowledge.length < 2 ? "#475569" : "#fff",
+          fontSize:12, fontWeight:700,
+          cursor: scanning || knowledge.length < 2 ? "not-allowed" : "pointer",
+          display:"flex", alignItems:"center", justifyContent:"center", gap:8,
+        }}>
+          {scanning ? <><Spinner/>검사 중...</> : "🔎 전체 검사 시작"}
+        </button>
+
+        {/* 검사 결과 표시 */}
+        {scanResults && (
+          <div style={{ marginTop:14 }}>
+            <div style={{ fontSize:11, color:"#94a3b8", marginBottom:10 }}>
+              {scanResults.conflicts.length === 0
+                ? `✅ 검사 완료 (${scanResults.scannedAt}) — 정리할 항목 없음`
+                : `⚠️ ${scanResults.conflicts.length}쌍의 중복/충돌 발견 (${scanResults.scannedAt})`
+              }
+            </div>
+
+            {scanResults.conflicts.map((c, idx) => (
+              <div key={idx} style={{
+                background:"rgba(15,23,42,0.6)",
+                border:`1px solid ${c.resolved ? "rgba(52,211,153,0.4)" : "rgba(245,158,11,0.3)"}`,
+                borderRadius:8, padding:"12px 14px", marginBottom:10,
+                opacity: c.resolved ? 0.6 : 1,
+              }}>
+                <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+                  <span style={{
+                    background: c.type === "duplicate" ? "rgba(167,139,250,0.2)" : "rgba(245,158,11,0.2)",
+                    color: c.type === "duplicate" ? "#a78bfa" : "#fbbf24",
+                    padding:"2px 7px", borderRadius:4, fontSize:9, fontWeight:800,
+                  }}>{c.type === "duplicate" ? "중복" : "충돌"}</span>
+                  <span style={{ fontSize:10, color:"#64748b" }}>{c.category}</span>
+                  {c.resolved && (
+                    <span style={{ marginLeft:"auto", fontSize:10, color:"#34d399", fontWeight:700 }}>
+                      ✓ 처리됨 ({c.resolvedAs === "keep_a" ? "A 유지" :
+                                c.resolvedAs === "keep_b" ? "B 유지" :
+                                c.resolvedAs === "keep_both" ? "둘 다" : "건너뜀"})
+                    </span>
+                  )}
+                </div>
+
+                {c.reason && (
+                  <div style={{ fontSize:10.5, color:"#94a3b8", marginBottom:8, fontStyle:"italic" }}>
+                    {c.reason}
+                  </div>
+                )}
+
+                <div style={{ marginBottom:6 }}>
+                  <div style={{ fontSize:9.5, color:"#64748b", fontWeight:700, marginBottom:3 }}>A</div>
+                  <div style={{
+                    background:"rgba(8,14,26,0.6)", padding:"7px 10px",
+                    borderRadius:5, fontSize:11, color:"#cbd5e1", lineHeight:1.5,
+                  }}>{c.itemA.content}</div>
+                </div>
+                <div style={{ marginBottom: c.resolved ? 0 : 10 }}>
+                  <div style={{ fontSize:9.5, color:"#64748b", fontWeight:700, marginBottom:3 }}>B</div>
+                  <div style={{
+                    background:"rgba(8,14,26,0.6)", padding:"7px 10px",
+                    borderRadius:5, fontSize:11, color:"#cbd5e1", lineHeight:1.5,
+                  }}>{c.itemB.content}</div>
+                </div>
+
+                {!c.resolved && (
+                  <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:5 }}>
+                    <button onClick={() => resolveConflict(idx, "keep_a")}
+                      disabled={resolving === idx} style={smallBtnStyle("#34d399")}>
+                      A 유지
+                    </button>
+                    <button onClick={() => resolveConflict(idx, "keep_b")}
+                      disabled={resolving === idx} style={smallBtnStyle("#3b82f6")}>
+                      B 유지
+                    </button>
+                    <button onClick={() => resolveConflict(idx, "keep_both")}
+                      disabled={resolving === idx} style={smallBtnStyle("#a78bfa")}>
+                      둘 다 유지
+                    </button>
+                    <button onClick={() => resolveConflict(idx, "skip")}
+                      disabled={resolving === idx} style={smallBtnStyle("#64748b")}>
+                      건너뛰기
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
+
+            {scanResults.conflicts.length > 0 && (
+              <div style={{ fontSize:10, color:"#64748b", marginTop:6, textAlign:"center" }}>
+                💡 처리 후 "최신 데이터 불러오기"로 새로고침하세요
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* 저장된 내용 */}
       {knowledge.length > 0 && (
