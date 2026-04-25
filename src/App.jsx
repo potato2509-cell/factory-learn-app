@@ -16,9 +16,9 @@ const ROLE_CONFIG = {
     focus: "Elec 설비 가동률, 예방보전, 고장 원인, MTBF/MTTR 관리" },
   Elec_TE: { label: "기술 엔지니어", line: "Elec", color: "#34d399", bg: "rgba(52,211,153,0.12)", icon: "🟩",
     focus: "Elec 공정 기술, 품질 원인 분석, 조건 최적화, 재발 방지" },
-  Logistics: { label: "물류 엔지니어", line: "Common", color: "#f59e0b", bg: "rgba(245,158,11,0.12)", icon: "🟡",
-    focus: "공정 간 제품 운송 관리, 운반 일정, 재공품(WIP) 흐름, 병목 구간 파악" },
-  Vision: { label: "비전 엔지니어", line: "Common", color: "#ec4899", bg: "rgba(236,72,153,0.12)", icon: "🩷",
+  FA: { label: "FA 엔지니어", line: "공통", color: "#f59e0b", bg: "rgba(245,158,11,0.12)", icon: "🟡",
+    focus: "공정 간 자동 반송 시스템 (C/V, Stocker, OHT, AGV) 운영·정비, WIP 흐름 관리" },
+  Vision: { label: "비전 엔지니어", line: "공통", color: "#ec4899", bg: "rgba(236,72,153,0.12)", icon: "🩷",
     focus: "외관 검사 시스템, 불량 이미지 분석, 비전 알고리즘, 검사 기준 관리" },
 };
 
@@ -407,11 +407,11 @@ const RULE_FIELDS = {
     { key:"판단기준", label:"불량 원인 분석 방법", placeholder:"예: 4M 분석(Man/Machine/Material/Method), 재현 테스트, 데이터 분석" },
     { key:"판단기준", label:"재발 방지 기준", placeholder:"예: 동일 불량 2회 이상 시 근본 원인 분석서 작성, 개선 검증 기간 설정" },
   ],
-  Logistics: [
-    { key:"판단기준", label:"공정 간 운송 기준 및 우선순위", placeholder:"예: 병목 공정 우선 공급, 재공품 적체 기준, 긴급 운반 판단 기준" },
-    { key:"협업방식", label:"PE·ME·TE팀과 협업 방식", placeholder:"예: 생산 계획 변경 시 PE에게 즉시 공유, 설비 이동 시 ME와 협의" },
-    { key:"판단기준", label:"WIP(재공품) 관리 기준", placeholder:"예: 공정별 WIP 적정 수량, 초과 시 조치 기준, 보관 위치 규칙" },
-    { key:"판단기준", label:"운반 이슈 대응 기준", placeholder:"예: 운반 지연 시 보고 기준, 제품 손상 발생 시 대응 절차" },
+  FA: [
+    { key:"판단기준", label:"반송 설비(C/V·Stocker·OHT·AGV) 이상 시 대응 순서", placeholder:"예: 알람 확인 → 영향 라인 파악 → 우회 경로 확보 → 정비 → 재가동" },
+    { key:"협업방식", label:"PE·ME·TE팀과 협업 방식", placeholder:"예: 라인 정지 영향 시 PE 즉시 공유, 본 라인 설비와 정비 일정은 ME와 협의, 반송 중 품질 영향 시 TE와 협업" },
+    { key:"판단기준", label:"WIP(공정 중 재공) 관리 기준", placeholder:"예: Stocker 처리 한계, 공정별 WIP 적정 수준, 누적 시 라인 속도 조정 기준" },
+    { key:"판단기준", label:"반송 이슈 vs 공정 이슈 구분 기준", placeholder:"예: 잼/충돌/통신두절은 반송 측, 대기시간 영향은 공정 변수 함께 검토" },
   ],
   Vision: [
     { key:"판단기준", label:"외관 검사 기준 및 불량 분류", placeholder:"예: 불량 등급 기준(Critical/Major/Minor), 자동 검출 기준, 수동 검사 트리거" },
@@ -522,10 +522,10 @@ function TabCorrection({ role, roleInfo, knowledge }) {
       "신규 전극 원자재 로트 투입 후 불량 발생. 기존 로트와 혼용 중.",
       "PE에서 Elec 생산 속도 증가 요청. 현재 공정 조건에서 품질 리스크 있음.",
     ],
-    Logistics: [
-      "STK 공정 앞에 재공품이 과도하게 쌓여있다. 운반 일정 조정이 필요한 상황.",
-      "CUT 공정 완료품을 STK로 이송 중 제품 일부가 손상되었다.",
-      "생산 계획이 갑자기 변경되어 공정 간 운반 순서를 재조정해야 한다.",
+    FA: [
+      "OHT 호기 충돌로 Cell 라인 반송 지연 발생. 라인 대기 시간 30분 누적 중.",
+      "Stocker 처리 한계 도달로 공정 앞단 WIP 급증. 라인 속도 조정 검토 필요.",
+      "AGV 통신 두절 빈발. MES 연동 문제인지 통신망 문제인지 구분 필요.",
     ],
     Vision: [
       "비전 검사기에서 불량 검출율이 갑자기 50% 이하로 떨어졌다.",
@@ -1239,11 +1239,11 @@ export default function App() {
           </div>
 
           {/* 에이전트 선택 카드 */}
-          {["Cell","Elec","Common"].map(line => (
+          {["Cell","Elec","공통"].map(line => (
             <div key={line} style={{ marginBottom:24 }}>
               <div style={{ fontSize:12, color:"#64748b", fontWeight:800,
                 letterSpacing:2, marginBottom:12, textAlign:"center" }}>
-                {line === "Common" ? "공통" : `${line} 라인`}
+                {line === "공통" ? "공통" : `${line} 라인`}
               </div>
               <div style={{ display:"flex", gap:10, justifyContent:"center" }}>
                 {Object.entries(ROLE_CONFIG)
@@ -1351,7 +1351,15 @@ export default function App() {
             {role} ENGINEER · TRAINING MODE
           </div>
         </div>
-        <div style={{ marginLeft:"auto" }}>
+        <div style={{ marginLeft:"auto", display:"flex", gap:8, alignItems:"center" }}>
+          <button onClick={() => { window.location.href = window.location.pathname; }} style={{
+            background:"rgba(51,65,85,0.4)", border:"1px solid rgba(71,85,105,0.5)",
+            color:"#94a3b8", borderRadius:6, padding:"5px 11px",
+            fontSize:11, fontWeight:700, cursor:"pointer",
+            display:"inline-flex", alignItems:"center", gap:4,
+          }} title="에이전트 선택 화면으로">
+            🏠 홈
+          </button>
           <span style={{
             background:roleInfo.bg, border:`1px solid ${roleInfo.color}40`,
             color:roleInfo.color, borderRadius:6, padding:"3px 10px",
