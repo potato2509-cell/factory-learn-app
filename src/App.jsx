@@ -282,6 +282,31 @@ async function saveDefectPattern(role, pattern) {
   } catch { return false; }
 }
 
+// 이미지를 드라이브에 업로드 (Netlify Function 중계)
+// 응답: { success, data: { url, fileId, filename } } 또는 null
+async function uploadImageToDrive(role, filename, base64, mimetype) {
+  try {
+    const res = await fetch("/.netlify/functions/drive-upload", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role, filename, base64, mimetype }),
+    });
+    if (!res.ok) {
+      console.error(`드라이브 업로드 HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    if (!data.success) {
+      console.error("드라이브 업로드 실패:", data.error);
+      return null;
+    }
+    return data.data; // { url, fileId, filename }
+  } catch (e) {
+    console.error("드라이브 업로드 에러:", e);
+    return null;
+  }
+}
+
 // 신규 항목 vs 기존 카테고리 항목들 AI 충돌 검사
 // 반환: null (충돌 없음) | { conflictWith: {category, content}, type: "duplicate"|"conflict", reason: string }
 async function checkConflict(role, category, newContent) {
@@ -1298,6 +1323,7 @@ function TabDocument({ role, roleInfo }) {
   const [category, setCategory] = useState("판단기준");
   const [imageType, setImageType] = useState(""); // 이미지 유형 (검사기준서/다이어그램/불량/설비/기타)
   const [recommendedCategory, setRecommendedCategory] = useState(""); // AI가 추천한 카테고리
+  const [uploadedImageUrl, setUploadedImageUrl] = useState(""); // 드라이브 업로드된 이미지 URL
   const [loading, setLoading] = useState(false);
   const [analyzeStep, setAnalyzeStep] = useState(""); // 분석 진행 단계 표시
   const [saving, setSaving] = useState(false);
@@ -1331,6 +1357,7 @@ function TabDocument({ role, roleInfo }) {
     setError("");
     setImageType("");
     setRecommendedCategory("");
+    setUploadedImageUrl("");
     if (f.type.startsWith("image/")) {
       const url = URL.createObjectURL(f);
       setPreview(url);
@@ -1392,6 +1419,7 @@ JSON으로만 답하세요. 다른 설명 없이.
     setAnalyzed("");
     setImageType("");
     setRecommendedCategory("");
+    setUploadedImageUrl("");
 
     try {
       let result = "";
@@ -1435,8 +1463,22 @@ JSON으로만 답하세요. 다른 설명 없이.
           mediaType
         );
 
-        // 메타데이터 추가
-        result = `[이미지 유형] ${detectedType}\n${result}`;
+        // 3단계: 드라이브에 이미지 업로드 (백그라운드 진행, 실패해도 분석은 유지)
+        setAnalyzeStep("드라이브 저장 중...");
+        let imageUrl = "";
+        try {
+          const uploadResult = await uploadImageToDrive(role, file.name, base64, mediaType);
+          if (uploadResult && uploadResult.url) {
+            imageUrl = uploadResult.url;
+            setUploadedImageUrl(imageUrl);
+          }
+        } catch (e) {
+          console.error("드라이브 업로드 실패 (분석은 계속 진행):", e);
+        }
+
+        // 메타데이터 추가 (URL 있으면 포함)
+        const urlLine = imageUrl ? `[이미지URL] ${imageUrl}\n` : "";
+        result = `${urlLine}[이미지 유형] ${detectedType}\n${result}`;
       } else {
         // 텍스트 파일 처리 (기존 그대로)
         setAnalyzeStep("파일 분석 중...");
@@ -1695,6 +1737,35 @@ ${dataText.slice(0, 8000)}
               내용을 직접 수정할 수 있어요
             </div>
           </div>
+
+          {/* 드라이브 업로드 상태 (이미지인 경우만) */}
+          {isImage && (
+            <div style={{
+              background: uploadedImageUrl ? "rgba(52,211,153,0.06)" : "rgba(239,68,68,0.06)",
+              border: `1px solid ${uploadedImageUrl ? "rgba(52,211,153,0.3)" : "rgba(239,68,68,0.25)"}`,
+              borderRadius:8, padding:"9px 13px", marginBottom:10,
+              fontSize:11, lineHeight:1.6,
+            }}>
+              {uploadedImageUrl ? (
+                <>
+                  <span style={{ color:"#34d399", fontWeight:700 }}>✅ 드라이브에 저장됨</span>
+                  <a href={uploadedImageUrl} target="_blank" rel="noopener noreferrer" style={{
+                    color:"#93c5fd", marginLeft:8, fontSize:10.5, textDecoration:"underline",
+                  }}>
+                    🔗 원본 이미지 보기
+                  </a>
+                </>
+              ) : (
+                <>
+                  <span style={{ color:"#fca5a5", fontWeight:700 }}>⚠️ 드라이브 업로드 실패</span>
+                  <span style={{ color:"#94a3b8", marginLeft:6, fontSize:10.5 }}>
+                    (분석 결과는 그대로 저장되며, URL만 누락됨)
+                  </span>
+                </>
+              )}
+            </div>
+          )}
+
           <SaveBtn onClick={save} saving={saving} saved={saved}/>
         </div>
       )}
@@ -1966,20 +2037,44 @@ JSON으로만 답하세요. 충돌 없으면 빈 배열.
           <div style={{ fontSize:10, color:"#374151", fontWeight:700, letterSpacing:1, marginBottom:10 }}>
             📋 저장된 학습 내용 ({knowledge.length}건)
           </div>
-          {knowledge.map((k,i) => (
-            <div key={i} style={{
-              background:"rgba(8,14,26,0.7)", border:"1px solid rgba(51,65,85,0.3)",
-              borderRadius:8, padding:"10px 13px", marginBottom:7,
-            }}>
-              <div style={{ fontSize:10, color:roleInfo.color, fontWeight:700, marginBottom:4 }}>
-                {k.category}
+          {knowledge.map((k,i) => {
+            // [이미지URL] https://... 패턴 추출
+            const urlMatch = k.content && k.content.match(/\[이미지URL\]\s*(https?:\/\/[^\s\n]+)/);
+            const imageUrl = urlMatch ? urlMatch[1] : null;
+            // URL 라인을 제외한 나머지 텍스트 (가독성을 위해)
+            const contentWithoutUrl = imageUrl
+              ? k.content.replace(/\[이미지URL\]\s*https?:\/\/[^\s\n]+\n?/, "")
+              : k.content;
+
+            return (
+              <div key={i} style={{
+                background:"rgba(8,14,26,0.7)", border:"1px solid rgba(51,65,85,0.3)",
+                borderRadius:8, padding:"10px 13px", marginBottom:7,
+              }}>
+                <div style={{
+                  display:"flex", alignItems:"center", gap:8, marginBottom:4,
+                }}>
+                  <div style={{ fontSize:10, color:roleInfo.color, fontWeight:700 }}>
+                    {k.category}
+                  </div>
+                  {imageUrl && (
+                    <a href={imageUrl} target="_blank" rel="noopener noreferrer" style={{
+                      fontSize:10, color:"#93c5fd", textDecoration:"none",
+                      background:"rgba(59,130,246,0.12)", padding:"2px 7px",
+                      borderRadius:4, border:"1px solid rgba(59,130,246,0.25)",
+                    }}>
+                      🖼️ 이미지 보기
+                    </a>
+                  )}
+                </div>
+                <div style={{ fontSize:11.5, color:"#94a3b8", lineHeight:1.6,
+                  whiteSpace:"pre-wrap" }}>
+                  {contentWithoutUrl}
+                </div>
+                <div style={{ fontSize:9.5, color:"#374151", marginTop:4 }}>{k.updated_at}</div>
               </div>
-              <div style={{ fontSize:11.5, color:"#94a3b8", lineHeight:1.6 }}>
-                {k.content}
-              </div>
-              <div style={{ fontSize:9.5, color:"#374151", marginTop:4 }}>{k.updated_at}</div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
