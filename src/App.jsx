@@ -40,6 +40,16 @@ const LINE_COLORS = {
   공통: "#10b981",
 };
 
+// 학습 수준 평가 - 절대평가 목표값 (보수적 기준, 2달 학습 가정)
+// 각 지표별로 이 목표값에 도달하면 100점
+const TARGET_VALUES = {
+  itemCount: 300,        // 학습 항목 수 (row)
+  contentLength: 80000,  // 학습 내용 총 글자수
+  categoryCount: 5,      // 카테고리 다양성 (전체 5종 모두 사용)
+  correctionCount: 60,   // 교정 사례 수
+  recentRate: 70,        // 최신성 (최근 7일 내 업데이트 비율 70%)
+};
+
 // URL 파라미터에서 role 읽기
 function getRole() {
   // search 방식과 hash 방식 모두 지원
@@ -151,17 +161,17 @@ function calcProgress(knowledge) {
   return result;
 }
 
-// 대시보드 - 5개 지표를 0-100 점수로 정규화
-function calcDashboardScore(agent, allAgents) {
-  const safeMax = (key) => {
-    const max = Math.max(...allAgents.map(a => a[key] || 0));
-    return max > 0 ? max : 1;
-  };
-  const itemScore = Math.round((agent.itemCount / safeMax("itemCount")) * 100);
-  const contentScore = Math.round((agent.contentLength / safeMax("contentLength")) * 100);
-  const categoryScore = Math.round((agent.categoryCount / safeMax("categoryCount")) * 100);
-  const correctionScore = Math.round((agent.correctionCount / safeMax("correctionCount")) * 100);
-  const freshnessScore = agent.recentRate || 0;
+// 대시보드 - 5개 지표를 0-100 점수로 정규화 (절대평가)
+// 각 지표별 목표값(TARGET_VALUES) 대비 현재값의 비율, 100점 상한
+function calcDashboardScore(agent) {
+  const cap = (val, target) => Math.min(100, Math.round((val / target) * 100));
+
+  const itemScore = cap(agent.itemCount || 0, TARGET_VALUES.itemCount);
+  const contentScore = cap(agent.contentLength || 0, TARGET_VALUES.contentLength);
+  const categoryScore = cap(agent.categoryCount || 0, TARGET_VALUES.categoryCount);
+  const correctionScore = cap(agent.correctionCount || 0, TARGET_VALUES.correctionCount);
+  const freshnessScore = cap(agent.recentRate || 0, TARGET_VALUES.recentRate);
+
   const totalScore = Math.round(
     (itemScore + contentScore + categoryScore + correctionScore + freshnessScore) / 5
   );
@@ -976,7 +986,7 @@ function HomeDashboard() {
   useEffect(() => { fetchData(); }, []);
 
   const enriched = data.length > 0
-    ? data.map(a => ({ ...a, ...calcDashboardScore(a, data) }))
+    ? data.map(a => ({ ...a, ...calcDashboardScore(a) }))
         .sort((a, b) => b.totalScore - a.totalScore)
     : [];
 
@@ -1057,7 +1067,7 @@ function HomeDashboard() {
             <ProgressBar label={`내용 총량 (${sel.contentLength.toLocaleString()}자)`} value={sel.contentScore} color={sel.agentColor} />
             <ProgressBar label={`카테고리 (${sel.categoryCount}종)`} value={sel.categoryScore} color={sel.agentColor} />
             <ProgressBar label={`교정 사례 (${sel.correctionCount}건)`} value={sel.correctionScore} color={sel.agentColor} />
-            <ProgressBar label={`최신성 (최근 30일 ${sel.recentRate}%)`} value={sel.freshnessScore} color={sel.agentColor} />
+            <ProgressBar label={`최신성 (최근 7일 ${sel.recentRate}%)`} value={sel.freshnessScore} color={sel.agentColor} />
 
             <div style={{
               marginTop:8, paddingTop:8,
@@ -1111,12 +1121,12 @@ function HomeDashboard() {
         borderRadius:8, padding:"10px 12px", fontSize:9.5, color:"#64748b",
         lineHeight:1.7,
       }}>
-        <div style={{ fontWeight:700, color:"#94a3b8", marginBottom:5 }}>📖 평가 지표 (5개 평균)</div>
-        <div>• <b style={{ color:"#cbd5e1" }}>학습 항목</b>: 등록된 row 수</div>
-        <div>• <b style={{ color:"#cbd5e1" }}>내용 총량</b>: content 글자수 합계</div>
-        <div>• <b style={{ color:"#cbd5e1" }}>카테고리</b>: unique category 개수</div>
-        <div>• <b style={{ color:"#cbd5e1" }}>교정 사례</b>: 교정사례 카테고리 row 수</div>
-        <div>• <b style={{ color:"#cbd5e1" }}>최신성</b>: 최근 30일 내 업데이트 비율</div>
+        <div style={{ fontWeight:700, color:"#94a3b8", marginBottom:5 }}>📖 평가 지표 (5개 평균, 절대평가)</div>
+        <div>• <b style={{ color:"#cbd5e1" }}>학습 항목</b>: 등록된 row 수 (목표 300건)</div>
+        <div>• <b style={{ color:"#cbd5e1" }}>내용 총량</b>: content 글자수 합계 (목표 80,000자)</div>
+        <div>• <b style={{ color:"#cbd5e1" }}>카테고리</b>: unique category 개수 (목표 5종)</div>
+        <div>• <b style={{ color:"#cbd5e1" }}>교정 사례</b>: 교정사례 카테고리 row 수 (목표 60건)</div>
+        <div>• <b style={{ color:"#cbd5e1" }}>최신성</b>: 최근 7일 내 업데이트 비율 (목표 70%)</div>
       </div>
     </div>
   );
