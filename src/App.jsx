@@ -87,14 +87,63 @@ async function callClaudeVision(system, userMsg, imageBase64, mediaType) {
   return (data.content || []).map(i => i.text || "").join("").trim();
 }
 
-// 파일을 Base64로 변환
+// 파일을 Base64로 변환 (이미지인 경우 자동 압축)
+// 긴 변이 1600px 넘으면 비율 유지하며 축소, JPEG 90% 품질로 재인코딩
 function fileToBase64(file) {
+  // 이미지가 아니면 원본 그대로 base64 변환
+  if (!file.type.startsWith("image/")) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.split(",")[1]);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // 이미지 압축 처리
   return new Promise((resolve, reject) => {
+    const MAX_DIMENSION = 1600;
+    const QUALITY = 0.9;
+
     const reader = new FileReader();
-    reader.onload = () => resolve(reader.result.split(",")[1]);
-    reader.onerror = reject;
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          let { width, height } = img;
+          const longSide = Math.max(width, height);
+
+          // 긴 변이 MAX 초과 시 축소
+          if (longSide > MAX_DIMENSION) {
+            const scale = MAX_DIMENSION / longSide;
+            width = Math.round(width * scale);
+            height = Math.round(height * scale);
+          }
+
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, width, height);
+
+          // JPEG로 재인코딩 (PNG도 JPEG로 변환되어 용량 줄어듦)
+          const dataUrl = canvas.toDataURL("image/jpeg", QUALITY);
+          resolve(dataUrl.split(",")[1]);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      img.onerror = () => reject(new Error("이미지 로드 실패"));
+      img.src = e.target.result;
+    };
+    reader.onerror = () => reject(new Error("파일 읽기 실패"));
     reader.readAsDataURL(file);
   });
+}
+
+// 압축 후 base64 데이터 크기를 KB로 추정 (UI 표시용)
+function estimateBase64Size(base64) {
+  return Math.round((base64.length * 3 / 4) / 1024);
 }
 
 // PDF 텍스트 추출 (간단 방식)
@@ -1350,10 +1399,16 @@ JSON으로만 답하세요. 다른 설명 없이.
 
       if (isImage) {
         const base64 = await fileToBase64(file);
+        // 압축된 이미지는 항상 JPEG로 재인코딩됨
+        const mediaType = "image/jpeg";
+
+        // 압축 후 크기 표시 (디버깅 + 사용자 안내용)
+        const compressedKB = estimateBase64Size(base64);
+        console.log(`이미지 압축 완료: ${compressedKB}KB`);
 
         // 1단계: 이미지 유형 자동 판단
         setAnalyzeStep("이미지 유형 분석 중...");
-        const detection = await detectImageType(base64, file.type);
+        const detection = await detectImageType(base64, mediaType);
         detectedType = detection.imageType;
         setImageType(detectedType);
         setRecommendedCategory(detection.recommendedCategory);
@@ -1377,7 +1432,7 @@ JSON으로만 답하세요. 다른 설명 없이.
           analysisPrompt,
           `이 ${detectedType} 이미지를 분석하세요.`,
           base64,
-          file.type
+          mediaType
         );
 
         // 메타데이터 추가
