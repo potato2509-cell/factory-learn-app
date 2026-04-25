@@ -136,6 +136,37 @@ async function loadAllProgress() {
   } catch { return []; }
 }
 
+// 요약본 로드 (없으면 null)
+async function loadSummary(role) {
+  try {
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_summary&role=${role}`);
+    const data = await res.json();
+    return data.success ? data.data : null;
+  } catch { return null; }
+}
+
+// 요약본 저장 (기존 _요약 행 삭제 후 새로 1건 저장)
+async function saveSummaryToSheet(role, summary) {
+  try {
+    await fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ action: "save_summary", role, summary }),
+    });
+    return true;
+  } catch { return false; }
+}
+
+// 마지막 요약 이후 추가된 row 수 (요약 갱신 트리거 판단용)
+async function loadSummaryCount(role) {
+  try {
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=count_since_summary&role=${role}`);
+    const data = await res.json();
+    return data.success ? data.data : { count: 0, hasSummary: false };
+  } catch { return { count: 0, hasSummary: false }; }
+}
+
 // JSON 파싱
 function safeJSON(raw) {
   const cleaned = raw.replace(/```json|```/gi, "").trim();
@@ -240,34 +271,144 @@ function SaveBtn({ onClick, saving, saved }) {
 function TabChat({ role, roleInfo }) {
   const [msgs, setMsgs] = useState([{
     role:"assistant",
-    content:`안녕하세요! 저는 ${roleInfo.label}(${role}) AI입니다.\n\n지금부터 공장 상황과 업무 방식을 배워갈게요. 편하게 알려주세요.\n\n예를 들어:\n• 어떤 공장인지, 어떤 제품을 만드는지\n• 주요 공정 흐름\n• 평소 신경 쓰는 부분`,
+    content:`안녕하세요! 저는 ${roleInfo.label}(${role}) AI입니다.\n\n학습 데이터를 불러오는 중...`,
   }]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [summary, setSummary] = useState(null);  // 시트에서 로드한 요약본
+  const [initialized, setInitialized] = useState(false);
   const bottomRef = useRef();
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:"smooth" }); }, [msgs]);
+
+  // 시작 시 요약본 로드 + 첫 메시지 동적 생성
+  useEffect(() => {
+    if (initialized) return;
+    (async () => {
+      try {
+        const summaryData = await loadSummary(role);
+
+        if (summaryData && summaryData.content) {
+          // 요약본 있음 → AI에게 부족 부분 질문 동적 생성 요청
+          setSummary(summaryData.content);
+
+          const sys = `당신은 ${roleInfo.label}(${role}) AI입니다. 아래는 지금까지 학습된 요약본입니다.
+
+[학습 요약]
+${summaryData.content}
+
+이 학습 내용을 보고, 아직 부족하거나 추가 학습이 필요한 영역 1~2가지를 골라서
+사용자에게 자연스럽게 질문하는 첫 인사말을 작성하세요.
+
+규칙:
+- "안녕하세요"로 시작
+- "지난 학습을 이어가겠습니다" 같은 표현으로 친근감 표시
+- 부족한 영역을 구체적으로 언급 (예: "아직 교정사례 학습이 적은데, 최근 사례가 있으면 알려주세요")
+- 마지막에 안내문 추가: "(전체 학습 내용을 보고 싶으면 '요약'이라고 입력해 주세요)"
+- 200자 이내, 한국어`;
+
+          try {
+            const reply = await callClaude(sys, "첫 인사말을 만들어주세요.");
+            setMsgs([{ role:"assistant", content: reply }]);
+          } catch {
+            // AI 호출 실패 시 기본 메시지
+            setMsgs([{
+              role:"assistant",
+              content:`안녕하세요! ${roleInfo.label}(${role}) AI입니다. 지난 학습을 이어가겠습니다.\n\n오늘은 어떤 부분을 더 알려주시겠어요?\n\n(전체 학습 내용을 보고 싶으면 '요약'이라고 입력해 주세요)`
+            }]);
+          }
+        } else {
+          // 요약본 없음 → 첫 학습 인사
+          setMsgs([{
+            role:"assistant",
+            content:`안녕하세요! 저는 ${roleInfo.label}(${role}) AI입니다.\n\n지금부터 공장 상황과 업무 방식을 배워갈게요. 편하게 알려주세요.\n\n예를 들어:\n• 어떤 공장인지, 어떤 제품을 만드는지\n• 주요 공정 흐름\n• 평소 신경 쓰는 부분`
+          }]);
+        }
+      } catch (e) {
+        // 로드 실패 시 기본 메시지
+        setMsgs([{
+          role:"assistant",
+          content:`안녕하세요! 저는 ${roleInfo.label}(${role}) AI입니다.\n\n지금부터 공장 상황과 업무 방식을 배워갈게요.`
+        }]);
+      } finally {
+        setInitialized(true);
+      }
+    })();
+  }, [role, roleInfo, initialized]);
 
   const send = async () => {
     if (!input.trim() || loading) return;
     const msg = input.trim();
     setInput("");
+
+    // "요약" 입력 시 요약본 표시 (AI 호출 없음)
+    if (msg === "요약" || msg === "요약보여줘" || msg === "요약 보여줘") {
+      const newMsgs = [...msgs, { role:"user", content:msg }];
+      if (summary) {
+        setMsgs([...newMsgs, {
+          role:"assistant",
+          content:`📋 지금까지 학습된 내용입니다:\n\n${summary}\n\n추가로 알려주실 내용이 있으면 말씀해 주세요.`
+        }]);
+      } else {
+        setMsgs([...newMsgs, {
+          role:"assistant",
+          content:"아직 저장된 요약이 없습니다. 학습 데이터가 5건 이상 누적되면 자동으로 요약이 생성됩니다."
+        }]);
+      }
+      return;
+    }
+
     const newMsgs = [...msgs, { role:"user", content:msg }];
     setMsgs(newMsgs);
     setLoading(true);
     try {
-      const history = newMsgs.slice(0,-1).map(m => ({ role:m.role, content:m.content }));
+      const summaryContext = summary
+        ? `\n\n[기존 학습 요약]\n${summary}\n\n위 내용을 이미 알고 있다는 전제로 답변하세요. 같은 질문을 반복하지 마세요.`
+        : "";
       const system = `당신은 ${roleInfo.label} AI로 훈련 중입니다.
 사용자가 공장 상황과 ${role} 업무를 알려주면 자연스럽게 대화하며 더 깊이 파악하세요.
 모르는 부분은 추가 질문하고, 중요한 내용은 확인하세요.
 수율/KPI 수치보다 실제 업무 흐름, 협업 방식, 현장 문제에 집중하세요.
-150자 이내로 간결하게 한국어로 답하세요.`;
+150자 이내로 간결하게 한국어로 답하세요.${summaryContext}`;
       const reply = await callClaude(system, msg);
       setMsgs(m => [...m, { role:"assistant", content:reply }]);
     } catch {
       setMsgs(m => [...m, { role:"assistant", content:"⚠️ 오류 발생. 다시 시도해주세요." }]);
     } finally { setLoading(false); }
+  };
+
+  // 요약본 재생성 (백그라운드)
+  const regenerateSummary = async () => {
+    try {
+      const knowledge = await loadFromSheet(role);
+      // _요약은 제외하고 일반 학습 데이터만
+      const filtered = knowledge.filter(k => k.category !== "_요약");
+      if (filtered.length === 0) return;
+
+      const dataText = filtered.map(k => `[${k.category}] ${k.content}`).join("\n");
+
+      const sys = `당신은 학습 데이터 정리자입니다. ${roleInfo.label}(${role})의 학습 내용을 카테고리별로 구조화해 요약하세요.
+
+[학습 데이터]
+${dataText.slice(0, 8000)}
+
+다음 형식으로 한국어 요약 작성:
+[공장정보] (한 줄 요약)
+[업무역할] (한 줄 요약)
+[판단기준] (한 줄 요약, 핵심 기준 1~3가지)
+[협업방식] (한 줄 요약)
+[교정사례] (한 줄 요약, 없으면 "없음")
+[미흡 영역] (학습이 부족해 보이는 영역 1~2가지)
+
+각 항목 한 줄씩, 전체 500자 이내.`;
+
+      const summaryText = await callClaude(sys, "요약을 작성하세요.");
+      await saveSummaryToSheet(role, summaryText);
+      setSummary(summaryText); // 로컬 state도 갱신
+    } catch (e) {
+      console.error("요약 재생성 실패:", e);
+    }
   };
 
   const saveChat = async () => {
@@ -283,6 +424,12 @@ function TabChat({ role, roleInfo }) {
       }
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
+
+      // 5건 누적 시 백그라운드에서 요약 재생성
+      const countData = await loadSummaryCount(role);
+      if (countData && countData.count >= 5) {
+        regenerateSummary(); // await 안 함 (백그라운드 실행)
+      }
     } catch { alert("저장 실패. 다시 시도해주세요."); }
     finally { setSaving(false); }
   };
@@ -298,6 +445,12 @@ function TabChat({ role, roleInfo }) {
 
       {/* 가이드 버튼 */}
       <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:10 }}>
+        {summary && (
+          <button onClick={() => setInput("요약")} style={{
+            background:"rgba(167,139,250,0.1)", border:"1px solid rgba(167,139,250,0.3)",
+            borderRadius:14, padding:"4px 11px", color:"#a78bfa", fontSize:11, cursor:"pointer", fontWeight:700,
+          }}>📋 요약 보기</button>
+        )}
         {["어떤 공장인지 알려줄게요", "주요 공정 흐름은요", "하루 일과가 어때요", "자주 생기는 문제는"].map((q,i) => (
           <button key={i} onClick={() => setInput(q)} style={{
             background:"rgba(59,130,246,0.08)", border:"1px solid rgba(59,130,246,0.2)",
