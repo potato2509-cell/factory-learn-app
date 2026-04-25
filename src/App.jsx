@@ -942,13 +942,12 @@ function TabStatus({ role, roleInfo, knowledge, onReload, loading }) {
   );
 }
 
-// ─── STEP 6: 전체 대시보드 ────────────────────────────────────────────────────
-function TabDashboard({ roleInfo }) {
+// ─── 전체 학습 대시보드 (에이전트 선택 화면용) ────────────────────────────────
+function HomeDashboard() {
   const [data, setData] = useState([]);
   const [selected, setSelected] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [lastFetched, setLastFetched] = useState(null);
 
   const fetchData = async () => {
     setLoading(true);
@@ -967,7 +966,6 @@ function TabDashboard({ roleInfo }) {
         agentColor: DASHBOARD_AGENT_META[a.role]?.color || "#94a3b8",
       }));
       setData(merged);
-      setLastFetched(new Date().toLocaleTimeString("ko-KR"));
     } catch (e) {
       setError(`로드 실패: ${e.message}`);
     } finally {
@@ -977,7 +975,6 @@ function TabDashboard({ roleInfo }) {
 
   useEffect(() => { fetchData(); }, []);
 
-  // 점수 계산 + 정렬
   const enriched = data.length > 0
     ? data.map(a => ({ ...a, ...calcDashboardScore(a, data) }))
         .sort((a, b) => b.totalScore - a.totalScore)
@@ -985,22 +982,22 @@ function TabDashboard({ roleInfo }) {
 
   if (loading && enriched.length === 0) {
     return (
-      <div style={{ textAlign:"center", padding:"60px 0", color:"#64748b" }}>
+      <div style={{ textAlign:"center", padding:"40px 0", color:"#64748b" }}>
         <Spinner/>
-        <div style={{ marginTop:12, fontSize:12 }}>전체 학습 데이터 로딩 중...</div>
+        <div style={{ marginTop:10, fontSize:12 }}>학습 데이터 로딩 중...</div>
       </div>
     );
   }
 
   if (error && enriched.length === 0) {
     return (
-      <div style={{ textAlign:"center", padding:"40px 0" }}>
-        <div style={{ fontSize:32, marginBottom:8 }}>⚠️</div>
-        <div style={{ fontSize:13, color:"#ef4444", marginBottom:14 }}>{error}</div>
+      <div style={{ textAlign:"center", padding:"30px 0" }}>
+        <div style={{ fontSize:24, marginBottom:6 }}>⚠️</div>
+        <div style={{ fontSize:12, color:"#ef4444", marginBottom:12 }}>{error}</div>
         <button onClick={fetchData} style={{
-          padding:"8px 18px", background:"rgba(59,130,246,0.15)",
+          padding:"7px 16px", background:"rgba(59,130,246,0.15)",
           border:"1px solid rgba(59,130,246,0.3)", borderRadius:7,
-          color:"#93c5fd", fontSize:12, fontWeight:700, cursor:"pointer",
+          color:"#93c5fd", fontSize:11, fontWeight:700, cursor:"pointer",
         }}>🔄 다시 시도</button>
       </div>
     );
@@ -1021,21 +1018,7 @@ function TabDashboard({ roleInfo }) {
   const maxItem = Math.max(...enriched.map(a => a.itemCount || 0), 1);
 
   return (
-    <div>
-      <div style={{ marginBottom:16, display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
-        <div>
-          <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📊 전체 학습 대시보드</div>
-          <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
-            8개 에이전트 학습 현황 비교 {lastFetched && `· ${lastFetched}`}
-          </div>
-        </div>
-        <button onClick={fetchData} disabled={loading} style={{
-          padding:"6px 12px", background:"rgba(59,130,246,0.1)",
-          border:"1px solid rgba(59,130,246,0.25)", borderRadius:6,
-          color:"#93c5fd", fontSize:11, fontWeight:700, cursor:"pointer",
-        }}>{loading ? "..." : "🔄"}</button>
-      </div>
-
+    <div style={{ textAlign:"left" }}>
       {/* KPI 5개 */}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(5, 1fr)", gap:6, marginBottom:18 }}>
         <KpiCard label="전체" value={avgScore} suffix="점" color="#a78bfa" />
@@ -1046,8 +1029,8 @@ function TabDashboard({ roleInfo }) {
       </div>
 
       {/* 종합 순위 */}
-      <div style={{ marginBottom:20 }}>
-        <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:10, letterSpacing:1 }}>
+      <div style={{ marginBottom:18 }}>
+        <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:8, letterSpacing:1 }}>
           🏆 종합 순위
         </div>
         <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
@@ -1061,12 +1044,10 @@ function TabDashboard({ roleInfo }) {
 
       {/* 선택된 에이전트 상세 */}
       {sel && (
-        <div style={{ marginBottom:20 }}>
-          <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:10, letterSpacing:1 }}>
-            🔍 {sel.role} 상세 분석 · {sel.line} 라인 · {sel.roleType}
+        <div style={{ marginBottom:18 }}>
+          <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:8, letterSpacing:1 }}>
+            🔍 {sel.role} 상세 · {sel.line} · {sel.roleType}
           </div>
-
-          {/* 5개 지표 */}
           <div style={{
             background:"rgba(15,23,42,0.6)",
             border:`1px solid ${sel.agentColor}25`,
@@ -1079,11 +1060,11 @@ function TabDashboard({ roleInfo }) {
             <ProgressBar label={`최신성 (최근 30일 ${sel.recentRate}%)`} value={sel.freshnessScore} color={sel.agentColor} />
 
             <div style={{
-              marginTop:10, paddingTop:10,
+              marginTop:8, paddingTop:8,
               borderTop:"1px solid rgba(51,65,85,0.4)",
-              display:"flex", justifyContent:"space-between", fontSize:11,
+              display:"flex", justifyContent:"space-between", fontSize:10,
             }}>
-              <span style={{ color:"#64748b" }}>💡 마지막 업데이트</span>
+              <span style={{ color:"#64748b" }}>마지막 업데이트</span>
               <span style={{ color:"#cbd5e1", fontWeight:700 }}>
                 {sel.lastUpdate || "데이터 없음"}
               </span>
@@ -1092,27 +1073,26 @@ function TabDashboard({ roleInfo }) {
         </div>
       )}
 
-      {/* 에이전트별 학습 항목 비교 막대 */}
-      <div style={{ marginBottom:18 }}>
-        <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:10, letterSpacing:1 }}>
-          📈 학습 항목 수 비교
+      {/* 학습 항목 비교 */}
+      <div style={{ marginBottom:14 }}>
+        <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:8, letterSpacing:1 }}>
+          📈 학습 항목 수
         </div>
         <div style={{
           background:"rgba(15,23,42,0.5)", border:"1px solid rgba(51,65,85,0.3)",
-          borderRadius:10, padding:14,
+          borderRadius:10, padding:12,
         }}>
           {enriched.map(a => (
-            <div key={a.role} style={{ marginBottom:8 }}>
+            <div key={a.role} style={{ marginBottom:7 }}>
               <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
-                <span style={{ fontSize:11, color:"#cbd5e1", fontWeight:600 }}>
-                  <span style={{ color: a.agentColor, marginRight:6 }}>●</span>
-                  {a.role}
+                <span style={{ fontSize:10.5, color:"#cbd5e1", fontWeight:600 }}>
+                  <span style={{ color: a.agentColor, marginRight:5 }}>●</span>{a.role}
                 </span>
-                <span style={{ fontSize:11, color: a.agentColor, fontWeight:700 }}>
+                <span style={{ fontSize:10.5, color: a.agentColor, fontWeight:700 }}>
                   {a.itemCount}건
                 </span>
               </div>
-              <div style={{ height:6, background:"rgba(51,65,85,0.5)", borderRadius:3 }}>
+              <div style={{ height:5, background:"rgba(51,65,85,0.5)", borderRadius:3 }}>
                 <div style={{
                   height:"100%", borderRadius:3,
                   width:`${(a.itemCount/maxItem)*100}%`,
@@ -1128,10 +1108,10 @@ function TabDashboard({ roleInfo }) {
       {/* 지표 설명 */}
       <div style={{
         background:"rgba(8,14,26,0.6)", border:"1px solid rgba(51,65,85,0.3)",
-        borderRadius:8, padding:"11px 13px", fontSize:10, color:"#64748b",
+        borderRadius:8, padding:"10px 12px", fontSize:9.5, color:"#64748b",
         lineHeight:1.7,
       }}>
-        <div style={{ fontWeight:700, color:"#94a3b8", marginBottom:6 }}>📖 평가 지표 (5개 평균)</div>
+        <div style={{ fontWeight:700, color:"#94a3b8", marginBottom:5 }}>📖 평가 지표 (5개 평균)</div>
         <div>• <b style={{ color:"#cbd5e1" }}>학습 항목</b>: 등록된 row 수</div>
         <div>• <b style={{ color:"#cbd5e1" }}>내용 총량</b>: content 글자수 합계</div>
         <div>• <b style={{ color:"#cbd5e1" }}>카테고리</b>: unique category 개수</div>
@@ -1205,7 +1185,6 @@ const TABS = [
   { id:2, icon:"🎯", label:"상황 교정" },
   { id:3, icon:"📄", label:"문서·사진" },
   { id:4, icon:"🧠", label:"학습 현황" },
-  { id:5, icon:"📊", label:"전체 비교" },
 ];
 
 export default function App() {
@@ -1214,6 +1193,7 @@ export default function App() {
   const [tab, setTab] = useState(0);
   const [knowledge, setKnowledge] = useState([]);
   const [loadingKB, setLoadingKB] = useState(false);
+  const [showDashboard, setShowDashboard] = useState(false);
 
   const loadKB = async () => {
     if (!role) return;
@@ -1227,23 +1207,28 @@ export default function App() {
 
   useEffect(() => { loadKB(); }, [role]);
 
-  // role 없을 때
+  // role 없을 때 - 에이전트 선택 화면
   if (!role) {
     return (
       <div style={{
         minHeight:"100vh",
         background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
         fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif",
-        display:"flex", alignItems:"center", justifyContent:"center",
+        padding:"40px 16px",
       }}>
-        <div style={{ textAlign:"center", padding:40 }}>
-          <div style={{ fontSize:40, marginBottom:16 }}>🏭</div>
-          <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:8 }}>
-            Factory Engineer AI 학습
+        <div style={{ maxWidth:660, margin:"0 auto" }}>
+          {/* 헤더 */}
+          <div style={{ textAlign:"center", marginBottom:32 }}>
+            <div style={{ fontSize:40, marginBottom:14 }}>🏭</div>
+            <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:6 }}>
+              Factory Engineer AI 학습
+            </div>
+            <div style={{ fontSize:13, color:"#64748b" }}>
+              역할을 선택해서 접속하세요
+            </div>
           </div>
-          <div style={{ fontSize:13, color:"#64748b", marginBottom:32 }}>
-            역할을 선택해서 접속하세요
-          </div>
+
+          {/* 에이전트 선택 카드 */}
           {["Cell","Elec","Common"].map(line => (
             <div key={line} style={{ marginBottom:24 }}>
               <div style={{ fontSize:12, color:"#64748b", fontWeight:800,
@@ -1270,7 +1255,53 @@ export default function App() {
               </div>
             </div>
           ))}
+
+          {/* 학습 현황 보기 토글 */}
+          <div style={{ marginTop:32, marginBottom:8 }}>
+            <button onClick={() => setShowDashboard(s => !s)} style={{
+              width:"100%", padding:"14px 20px",
+              background: showDashboard ? "rgba(167,139,250,0.12)" : "rgba(15,23,42,0.7)",
+              border: `1.5px solid ${showDashboard ? "rgba(167,139,250,0.4)" : "rgba(51,65,85,0.5)"}`,
+              borderRadius:12,
+              color: showDashboard ? "#a78bfa" : "#94a3b8",
+              fontSize:13, fontWeight:800, cursor:"pointer",
+              display:"flex", alignItems:"center", justifyContent:"space-between",
+              transition:"all 0.2s",
+            }}>
+              <span>📊 전체 학습 현황 보기</span>
+              <span style={{
+                fontSize:14,
+                transform: showDashboard ? "rotate(180deg)" : "rotate(0deg)",
+                transition:"transform 0.3s",
+              }}>▼</span>
+            </button>
+          </div>
+
+          {/* 토글 펼침 영역 */}
+          {showDashboard && (
+            <div style={{
+              marginTop:14,
+              padding:"18px 16px",
+              background:"rgba(8,14,26,0.6)",
+              border:"1px solid rgba(51,65,85,0.4)",
+              borderRadius:12,
+              animation:"fadeUp 0.3s ease both",
+            }}>
+              <HomeDashboard/>
+            </div>
+          )}
         </div>
+
+        <style>{`
+          @keyframes spin{to{transform:rotate(360deg)}}
+          @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+          @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+          *{box-sizing:border-box}
+          button:hover:not(:disabled){filter:brightness(1.1)}
+          a:hover{filter:brightness(1.1)}
+          ::-webkit-scrollbar{width:3px}
+          ::-webkit-scrollbar-thumb{background:rgba(59,130,246,0.2);border-radius:2px}
+        `}</style>
       </div>
     );
   }
@@ -1281,7 +1312,6 @@ export default function App() {
     <TabCorrection role={role} roleInfo={roleInfo} knowledge={knowledge}/>,
     <TabDocument role={role} roleInfo={roleInfo}/>,
     <TabStatus role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}/>,
-    <TabDashboard roleInfo={roleInfo}/>,
   ];
 
   return (
