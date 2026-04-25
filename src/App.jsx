@@ -22,6 +22,24 @@ const ROLE_CONFIG = {
     focus: "외관 검사 시스템, 불량 이미지 분석, 비전 알고리즘, 검사 기준 관리" },
 };
 
+// 대시보드용 8개 에이전트 메타
+const DASHBOARD_AGENT_META = {
+  Cell_PE: { line: "Cell", role: "생산", color: "#3b82f6" },
+  Cell_ME: { line: "Cell", role: "설비", color: "#f97316" },
+  Cell_TE: { line: "Cell", role: "기술", color: "#22d3ee" },
+  Elec_PE: { line: "Elec", role: "생산", color: "#a78bfa" },
+  Elec_ME: { line: "Elec", role: "설비", color: "#f43f5e" },
+  Elec_TE: { line: "Elec", role: "기술", color: "#34d399" },
+  FA: { line: "공통", role: "FA", color: "#f59e0b" },
+  Vision: { line: "공통", role: "비전", color: "#ec4899" },
+};
+
+const LINE_COLORS = {
+  Cell: "#0ea5e9",
+  Elec: "#f43f5e",
+  공통: "#10b981",
+};
+
 // URL 파라미터에서 role 읽기
 function getRole() {
   // search 방식과 hash 방식 모두 지원
@@ -99,6 +117,15 @@ async function loadFromSheet(role) {
   } catch { return []; }
 }
 
+// 대시보드 - 전체 8개 에이전트 진행률 로드
+async function loadAllProgress() {
+  try {
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_all_progress`);
+    const data = await res.json();
+    return data.success ? data.data : [];
+  } catch { return []; }
+}
+
 // JSON 파싱
 function safeJSON(raw) {
   const cleaned = raw.replace(/```json|```/gi, "").trim();
@@ -123,6 +150,37 @@ function calcProgress(knowledge) {
   result["전체"] = Math.round(total / categories.length);
   return result;
 }
+
+// 대시보드 - 5개 지표를 0-100 점수로 정규화
+function calcDashboardScore(agent, allAgents) {
+  const safeMax = (key) => {
+    const max = Math.max(...allAgents.map(a => a[key] || 0));
+    return max > 0 ? max : 1;
+  };
+  const itemScore = Math.round((agent.itemCount / safeMax("itemCount")) * 100);
+  const contentScore = Math.round((agent.contentLength / safeMax("contentLength")) * 100);
+  const categoryScore = Math.round((agent.categoryCount / safeMax("categoryCount")) * 100);
+  const correctionScore = Math.round((agent.correctionCount / safeMax("correctionCount")) * 100);
+  const freshnessScore = agent.recentRate || 0;
+  const totalScore = Math.round(
+    (itemScore + contentScore + categoryScore + correctionScore + freshnessScore) / 5
+  );
+  return { itemScore, contentScore, categoryScore, correctionScore, freshnessScore, totalScore };
+}
+
+const SCORE_COLOR = (score) => {
+  if (score >= 80) return "#34d399";
+  if (score >= 60) return "#fbbf24";
+  if (score >= 40) return "#f97316";
+  return "#ef4444";
+};
+
+const SCORE_LABEL = (score) => {
+  if (score >= 80) return "우수";
+  if (score >= 60) return "양호";
+  if (score >= 40) return "보통";
+  return "부족";
+};
 
 // ─── 공통 컴포넌트 ────────────────────────────────────────────────────────────
 function Spinner() {
@@ -884,6 +942,262 @@ function TabStatus({ role, roleInfo, knowledge, onReload, loading }) {
   );
 }
 
+// ─── STEP 6: 전체 대시보드 ────────────────────────────────────────────────────
+function TabDashboard({ roleInfo }) {
+  const [data, setData] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [lastFetched, setLastFetched] = useState(null);
+
+  const fetchData = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const raw = await loadAllProgress();
+      if (raw.length === 0) {
+        setError("데이터를 불러올 수 없습니다");
+        setLoading(false);
+        return;
+      }
+      const merged = raw.map(a => ({
+        ...a,
+        line: DASHBOARD_AGENT_META[a.role]?.line || "공통",
+        roleType: DASHBOARD_AGENT_META[a.role]?.role || "-",
+        agentColor: DASHBOARD_AGENT_META[a.role]?.color || "#94a3b8",
+      }));
+      setData(merged);
+      setLastFetched(new Date().toLocaleTimeString("ko-KR"));
+    } catch (e) {
+      setError(`로드 실패: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { fetchData(); }, []);
+
+  // 점수 계산 + 정렬
+  const enriched = data.length > 0
+    ? data.map(a => ({ ...a, ...calcDashboardScore(a, data) }))
+        .sort((a, b) => b.totalScore - a.totalScore)
+    : [];
+
+  if (loading && enriched.length === 0) {
+    return (
+      <div style={{ textAlign:"center", padding:"60px 0", color:"#64748b" }}>
+        <Spinner/>
+        <div style={{ marginTop:12, fontSize:12 }}>전체 학습 데이터 로딩 중...</div>
+      </div>
+    );
+  }
+
+  if (error && enriched.length === 0) {
+    return (
+      <div style={{ textAlign:"center", padding:"40px 0" }}>
+        <div style={{ fontSize:32, marginBottom:8 }}>⚠️</div>
+        <div style={{ fontSize:13, color:"#ef4444", marginBottom:14 }}>{error}</div>
+        <button onClick={fetchData} style={{
+          padding:"8px 18px", background:"rgba(59,130,246,0.15)",
+          border:"1px solid rgba(59,130,246,0.3)", borderRadius:7,
+          color:"#93c5fd", fontSize:12, fontWeight:700, cursor:"pointer",
+        }}>🔄 다시 시도</button>
+      </div>
+    );
+  }
+
+  // 통계
+  const avgScore = Math.round(enriched.reduce((s, a) => s + a.totalScore, 0) / enriched.length);
+  const cellAgents = enriched.filter(a => a.line === "Cell");
+  const elecAgents = enriched.filter(a => a.line === "Elec");
+  const cellAvg = cellAgents.length > 0
+    ? Math.round(cellAgents.reduce((s, a) => s + a.totalScore, 0) / cellAgents.length) : 0;
+  const elecAvg = elecAgents.length > 0
+    ? Math.round(elecAgents.reduce((s, a) => s + a.totalScore, 0) / elecAgents.length) : 0;
+  const totalItems = enriched.reduce((s, a) => s + (a.itemCount || 0), 0);
+  const totalCorrections = enriched.reduce((s, a) => s + (a.correctionCount || 0), 0);
+
+  const sel = selected || enriched[0];
+  const maxItem = Math.max(...enriched.map(a => a.itemCount || 0), 1);
+
+  return (
+    <div>
+      <div style={{ marginBottom:16, display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+        <div>
+          <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📊 전체 학습 대시보드</div>
+          <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
+            8개 에이전트 학습 현황 비교 {lastFetched && `· ${lastFetched}`}
+          </div>
+        </div>
+        <button onClick={fetchData} disabled={loading} style={{
+          padding:"6px 12px", background:"rgba(59,130,246,0.1)",
+          border:"1px solid rgba(59,130,246,0.25)", borderRadius:6,
+          color:"#93c5fd", fontSize:11, fontWeight:700, cursor:"pointer",
+        }}>{loading ? "..." : "🔄"}</button>
+      </div>
+
+      {/* KPI 5개 */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(5, 1fr)", gap:6, marginBottom:18 }}>
+        <KpiCard label="전체" value={avgScore} suffix="점" color="#a78bfa" />
+        <KpiCard label="Cell" value={cellAvg} suffix="점" color={LINE_COLORS.Cell} />
+        <KpiCard label="Elec" value={elecAvg} suffix="점" color={LINE_COLORS.Elec} />
+        <KpiCard label="학습" value={totalItems} suffix="건" color="#34d399" />
+        <KpiCard label="교정" value={totalCorrections} suffix="건" color="#fbbf24" />
+      </div>
+
+      {/* 종합 순위 */}
+      <div style={{ marginBottom:20 }}>
+        <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:10, letterSpacing:1 }}>
+          🏆 종합 순위
+        </div>
+        <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+          {enriched.map((a, idx) => (
+            <RankRow key={a.role} rank={idx+1} agent={a}
+              isSelected={sel?.role === a.role}
+              onClick={() => setSelected(a)} />
+          ))}
+        </div>
+      </div>
+
+      {/* 선택된 에이전트 상세 */}
+      {sel && (
+        <div style={{ marginBottom:20 }}>
+          <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:10, letterSpacing:1 }}>
+            🔍 {sel.role} 상세 분석 · {sel.line} 라인 · {sel.roleType}
+          </div>
+
+          {/* 5개 지표 */}
+          <div style={{
+            background:"rgba(15,23,42,0.6)",
+            border:`1px solid ${sel.agentColor}25`,
+            borderRadius:10, padding:14,
+          }}>
+            <ProgressBar label={`학습 항목 (${sel.itemCount}건)`} value={sel.itemScore} color={sel.agentColor} />
+            <ProgressBar label={`내용 총량 (${sel.contentLength.toLocaleString()}자)`} value={sel.contentScore} color={sel.agentColor} />
+            <ProgressBar label={`카테고리 (${sel.categoryCount}종)`} value={sel.categoryScore} color={sel.agentColor} />
+            <ProgressBar label={`교정 사례 (${sel.correctionCount}건)`} value={sel.correctionScore} color={sel.agentColor} />
+            <ProgressBar label={`최신성 (최근 30일 ${sel.recentRate}%)`} value={sel.freshnessScore} color={sel.agentColor} />
+
+            <div style={{
+              marginTop:10, paddingTop:10,
+              borderTop:"1px solid rgba(51,65,85,0.4)",
+              display:"flex", justifyContent:"space-between", fontSize:11,
+            }}>
+              <span style={{ color:"#64748b" }}>💡 마지막 업데이트</span>
+              <span style={{ color:"#cbd5e1", fontWeight:700 }}>
+                {sel.lastUpdate || "데이터 없음"}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 에이전트별 학습 항목 비교 막대 */}
+      <div style={{ marginBottom:18 }}>
+        <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:10, letterSpacing:1 }}>
+          📈 학습 항목 수 비교
+        </div>
+        <div style={{
+          background:"rgba(15,23,42,0.5)", border:"1px solid rgba(51,65,85,0.3)",
+          borderRadius:10, padding:14,
+        }}>
+          {enriched.map(a => (
+            <div key={a.role} style={{ marginBottom:8 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
+                <span style={{ fontSize:11, color:"#cbd5e1", fontWeight:600 }}>
+                  <span style={{ color: a.agentColor, marginRight:6 }}>●</span>
+                  {a.role}
+                </span>
+                <span style={{ fontSize:11, color: a.agentColor, fontWeight:700 }}>
+                  {a.itemCount}건
+                </span>
+              </div>
+              <div style={{ height:6, background:"rgba(51,65,85,0.5)", borderRadius:3 }}>
+                <div style={{
+                  height:"100%", borderRadius:3,
+                  width:`${(a.itemCount/maxItem)*100}%`,
+                  background:`linear-gradient(90deg, ${a.agentColor}, ${a.agentColor}99)`,
+                  transition:"width 0.5s ease",
+                }}/>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* 지표 설명 */}
+      <div style={{
+        background:"rgba(8,14,26,0.6)", border:"1px solid rgba(51,65,85,0.3)",
+        borderRadius:8, padding:"11px 13px", fontSize:10, color:"#64748b",
+        lineHeight:1.7,
+      }}>
+        <div style={{ fontWeight:700, color:"#94a3b8", marginBottom:6 }}>📖 평가 지표 (5개 평균)</div>
+        <div>• <b style={{ color:"#cbd5e1" }}>학습 항목</b>: 등록된 row 수</div>
+        <div>• <b style={{ color:"#cbd5e1" }}>내용 총량</b>: content 글자수 합계</div>
+        <div>• <b style={{ color:"#cbd5e1" }}>카테고리</b>: unique category 개수</div>
+        <div>• <b style={{ color:"#cbd5e1" }}>교정 사례</b>: 교정사례 카테고리 row 수</div>
+        <div>• <b style={{ color:"#cbd5e1" }}>최신성</b>: 최근 30일 내 업데이트 비율</div>
+      </div>
+    </div>
+  );
+}
+
+// 대시보드 - KPI 카드
+function KpiCard({ label, value, suffix, color }) {
+  return (
+    <div style={{
+      background:"rgba(15,23,42,0.7)",
+      border:"1px solid rgba(51,65,85,0.4)",
+      borderLeft:`3px solid ${color}`,
+      borderRadius:7, padding:"8px 10px",
+    }}>
+      <div style={{ fontSize:9, color:"#64748b", fontWeight:700, marginBottom:2,
+        letterSpacing:1, textTransform:"uppercase" }}>{label}</div>
+      <div style={{ display:"flex", alignItems:"baseline", gap:3 }}>
+        <span style={{ fontSize:18, fontWeight:800, color:"#f1f5f9" }}>{value}</span>
+        <span style={{ fontSize:10, color:"#475569" }}>{suffix}</span>
+      </div>
+    </div>
+  );
+}
+
+// 대시보드 - 순위 행
+function RankRow({ rank, agent, isSelected, onClick }) {
+  return (
+    <div onClick={onClick} style={{
+      display:"grid",
+      gridTemplateColumns:"24px 1fr auto auto",
+      gap:10, alignItems:"center", padding:"8px 10px",
+      background: isSelected ? "rgba(51,65,85,0.5)" : "rgba(8,14,26,0.6)",
+      border: `1px solid ${isSelected ? agent.agentColor : "rgba(51,65,85,0.35)"}`,
+      borderRadius:7, cursor:"pointer", transition:"all 0.15s",
+    }}>
+      <div style={{
+        width:22, height:22, borderRadius:11,
+        background: rank <= 3 ? "#fbbf24" : "rgba(71,85,105,0.6)",
+        color: rank <= 3 ? "#1e293b" : "#cbd5e1",
+        display:"flex", alignItems:"center", justifyContent:"center",
+        fontSize:11, fontWeight:800,
+      }}>{rank}</div>
+      <div>
+        <div style={{ fontSize:12, fontWeight:700, color:"#f1f5f9" }}>{agent.role}</div>
+        <div style={{ fontSize:9.5, color:"#64748b" }}>
+          <span style={{ color: agent.agentColor }}>●</span> {agent.line} · {agent.roleType}
+        </div>
+      </div>
+      <div style={{
+        fontSize:9, padding:"2px 7px", borderRadius:9,
+        background: SCORE_COLOR(agent.totalScore) + "25",
+        color: SCORE_COLOR(agent.totalScore), fontWeight:700,
+      }}>{SCORE_LABEL(agent.totalScore)}</div>
+      <div style={{
+        fontSize:16, fontWeight:800, color:"#f1f5f9",
+        minWidth:32, textAlign:"right",
+      }}>{agent.totalScore}</div>
+    </div>
+  );
+}
+
 // ─── 메인 앱 ─────────────────────────────────────────────────────────────────
 const TABS = [
   { id:0, icon:"💬", label:"채팅 학습" },
@@ -891,6 +1205,7 @@ const TABS = [
   { id:2, icon:"🎯", label:"상황 교정" },
   { id:3, icon:"📄", label:"문서·사진" },
   { id:4, icon:"🧠", label:"학습 현황" },
+  { id:5, icon:"📊", label:"전체 비교" },
 ];
 
 export default function App() {
@@ -966,6 +1281,7 @@ export default function App() {
     <TabCorrection role={role} roleInfo={roleInfo} knowledge={knowledge}/>,
     <TabDocument role={role} roleInfo={roleInfo}/>,
     <TabStatus role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}/>,
+    <TabDashboard roleInfo={roleInfo}/>,
   ];
 
   return (
