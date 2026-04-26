@@ -1,12 +1,95 @@
 // netlify/functions/drive-upload.js
 // 학습앱 → Apps Script로 이미지 업로드 중계
-// 학습앱은 mode: "no-cors"로 응답을 못 읽으므로,
-// Netlify Function이 서버 간 호출(CORS 무관)로 중계하고 결과를 학습앱에 반환
+// Node.js 14+ 호환 (https 모듈 사용, fetch/AbortSignal 의존성 없음)
+
+const https = require("https");
+const { URL } = require("url");
 
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXpt3UjWjfgDljEiGodgbunj_UnXYc-1RlrXgNiDzAiikXoEP4g9_E/exec";
 
+// https POST 요청 + Apps Script 리다이렉트 처리
+function httpsPost(targetUrl, payload, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(targetUrl);
+    const body = JSON.stringify(payload);
+
+    const options = {
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+      timeout: timeoutMs,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+
+      // Apps Script는 종종 302로 응답하고 실제 결과는 리다이렉트 URL에 있음
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        const redirectUrl = res.headers.location;
+        if (redirectUrl) {
+          httpsGet(redirectUrl, timeoutMs).then(resolve).catch(reject);
+          return;
+        }
+      }
+
+      res.on("data", chunk => data += chunk);
+      res.on("end", () => {
+        resolve({ statusCode: res.statusCode, body: data });
+      });
+    });
+
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Request timeout"));
+    });
+
+    req.write(body);
+    req.end();
+  });
+}
+
+function httpsGet(targetUrl, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(targetUrl);
+    const options = {
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      method: "GET",
+      timeout: timeoutMs,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        const redirectUrl = res.headers.location;
+        if (redirectUrl) {
+          httpsGet(redirectUrl, timeoutMs).then(resolve).catch(reject);
+          return;
+        }
+      }
+
+      res.on("data", chunk => data += chunk);
+      res.on("end", () => {
+        resolve({ statusCode: res.statusCode, body: data });
+      });
+    });
+
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Request timeout"));
+    });
+    req.end();
+  });
+}
+
 exports.handler = async (event) => {
-  // CORS preflight
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -26,10 +109,11 @@ exports.handler = async (event) => {
   }
 
   try {
+    console.log("[drive-upload] 요청 수신");
+
     const body = JSON.parse(event.body);
     const { role, filename, base64, mimetype } = body;
 
-    // 입력 검증
     if (!role || !base64) {
       return {
         statusCode: 400,
@@ -38,41 +122,46 @@ exports.handler = async (event) => {
       };
     }
 
-    // Apps Script에 전달
-    const response = await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action: "upload_image",
-        role: role,
-        filename: filename || `image_${Date.now()}.jpg`,
-        base64: base64,
-        mimetype: mimetype || "image/jpeg",
-      }),
-      // Netlify Function에서 서버 간 호출은 timeout 30초 정도
-      signal: AbortSignal.timeout(28000),
-    });
+    console.log("[drive-upload] role=" + role + ", base64 size=" + base64.length);
 
-    if (!response.ok) {
-      throw new Error(`Apps Script HTTP ${response.status}`);
+    const payload = {
+      action: "upload_image",
+      role: role,
+      filename: filename || ("image_" + Date.now() + ".jpg"),
+      base64: base64,
+      mimetype: mimetype || "image/jpeg",
+    };
+
+    const result = await httpsPost(APPS_SCRIPT_URL, payload, 28000);
+
+    console.log("[drive-upload] Apps Script statusCode=" + result.statusCode);
+
+    if (result.statusCode !== 200) {
+      throw new Error("Apps Script HTTP " + result.statusCode + ": " + result.body.slice(0, 300));
     }
 
-    const data = await response.json();
+    let parsed;
+    try {
+      parsed = JSON.parse(result.body);
+    } catch (e) {
+      throw new Error("Apps Script JSON 파싱 실패: " + result.body.slice(0, 300));
+    }
 
-    if (!data.success) {
-      throw new Error(data.error || "Apps Script 응답 실패");
+    if (!parsed.success) {
+      throw new Error(parsed.error || "Apps Script 응답 실패");
     }
 
     return {
       statusCode: 200,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
-      body: JSON.stringify({ success: true, data: data.data }),
+      body: JSON.stringify({ success: true, data: parsed.data }),
     };
 
   } catch (err) {
+    console.error("[drive-upload] 에러:", err.message);
     return {
       statusCode: 500,
-      headers: corsHeaders,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
       body: JSON.stringify({
         error: err.message || "업로드 실패",
       }),
