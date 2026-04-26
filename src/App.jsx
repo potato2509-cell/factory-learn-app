@@ -282,14 +282,22 @@ async function saveDefectPattern(role, pattern) {
   } catch { return false; }
 }
 
-// 이미지를 드라이브에 업로드 (Netlify Function 중계)
+// 이미지를 드라이브에 업로드 (Apps Script 직접 호출)
+// Content-Type: text/plain으로 CORS preflight 회피
 // 응답: { success, data: { url, fileId, filename } } 또는 null
 async function uploadImageToDrive(role, filename, base64, mimetype) {
   try {
-    const res = await fetch("/.netlify/functions/drive-upload", {
+    const res = await fetch(APPS_SCRIPT_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ role, filename, base64, mimetype }),
+      mode: "cors",
+      headers: { "Content-Type": "text/plain" },  // text/plain으로 preflight 회피
+      body: JSON.stringify({
+        action: "upload_image",
+        role,
+        filename,
+        base64,
+        mimetype,
+      }),
     });
     if (!res.ok) {
       console.error(`드라이브 업로드 HTTP ${res.status}`);
