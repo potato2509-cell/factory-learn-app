@@ -400,12 +400,21 @@ async function scanLearningFolder(role) {
 }
 
 // 드라이브에서 파일 내용(base64) 가져오기
+// 실패 시 에러 메시지를 살려서 반환 (디버깅용)
 async function fetchDriveFile(fileId) {
   try {
     const res = await fetch(`${APPS_SCRIPT_URL}?action=get_drive_file&fileId=${fileId}`);
+    if (!res.ok) {
+      return { success: false, error: `HTTP ${res.status}` };
+    }
     const data = await res.json();
-    return data.success ? data.data : null;
-  } catch { return null; }
+    if (data.success) {
+      return { success: true, data: data.data };
+    }
+    return { success: false, error: data.error || "Apps Script 응답 success=false" };
+  } catch (e) {
+    return { success: false, error: `네트워크 오류: ${e.message}` };
+  }
 }
 
 // 파일 처리 완료로 마크
@@ -2822,12 +2831,14 @@ export default function App() {
 
       try {
         // 1. 파일 다운로드
-        const fileData = await fetchDriveFile(f.fileId);
-        if (!fileData) {
+        const fetchResult = await fetchDriveFile(f.fileId);
+        if (!fetchResult.success) {
           failCount++;
-          errors.push(`${displayName}: 파일 다운로드 실패`);
+          errors.push(`${displayName}: ${fetchResult.error}`);
+          console.error(`[Sync] 다운로드 실패: ${displayName}`, fetchResult.error);
           continue;
         }
+        const fileData = fetchResult.data;
 
         const isImageFile = (fileData.mimetype || "").startsWith("image/");
         const isPdfFile = (fileData.mimetype || "").includes("pdf") || (f.filename || "").toLowerCase().endsWith(".pdf");
