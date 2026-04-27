@@ -789,6 +789,7 @@ function TabChat({ role, roleInfo }) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [summary, setSummary] = useState(null);  // 시트에서 로드한 요약본
+  const [commonKnowledge, setCommonKnowledge] = useState([]);  // Common_Knowledge 시트 (모든 에이전트 공유)
   const [initialized, setInitialized] = useState(false);
   const [conflictQueue, setConflictQueue] = useState([]);
   const [currentConflict, setCurrentConflict] = useState(null);
@@ -806,12 +807,17 @@ function TabChat({ role, roleInfo }) {
     setCurrentConflict(null);
   };
 
-  // 시작 시 요약본 로드 + 첫 메시지 동적 생성
+  // 시작 시 요약본 + 공통 학습 데이터 로드 + 첫 메시지 동적 생성
   useEffect(() => {
     if (initialized) return;
     (async () => {
       try {
-        const summaryData = await loadSummary(role);
+        // 본인 요약과 공통 학습 데이터를 병렬 로드 (속도 최적화)
+        const [summaryData, commonData] = await Promise.all([
+          loadSummary(role),
+          loadCommonKnowledge(),
+        ]);
+        setCommonKnowledge(commonData || []);
 
         if (summaryData && summaryData.content) {
           // 요약본 있음 → AI에게 부족 부분 질문 동적 생성 요청
@@ -927,11 +933,24 @@ ${summaryData.content}
       const summaryContext = summary
         ? `\n\n[기존 학습 요약]\n${summary}\n\n위 내용을 이미 알고 있다는 전제로 답변하세요. 같은 질문을 반복하지 마세요.`
         : "";
+
+      // 공통 학습 데이터 컨텍스트 (모든 에이전트 공유 - 회사 규정/공통 지침)
+      // 디테일 모드일 때는 detailContext가 크므로 commonContext는 줄여서 토큰 절약
+      const commonLimit = isDetailMode || matchedCategories.length > 0 ? 2000 : 4000;
+      const commonContext = (commonKnowledge && commonKnowledge.length > 0)
+        ? `\n\n[공통 회사 규정/지침 - 모든 에이전트 공유]\n${
+            commonKnowledge
+              .map(c => `[${c.category}] ${c.content}`)
+              .join("\n")
+              .slice(0, commonLimit)
+          }\n\n위 공통 규정/지침은 ${roleInfo.label} 업무 답변의 기본 전제입니다. 본인 업무 답변이 위 규정과 충돌하지 않도록 답변하세요.`
+        : "";
+
       const system = `당신은 ${roleInfo.label} AI로 훈련 중입니다.
 사용자가 공장 상황과 ${role} 업무를 알려주면 자연스럽게 대화하며 더 깊이 파악하세요.
 모르는 부분은 추가 질문하고, 중요한 내용은 확인하세요.
 수율/KPI 수치보다 실제 업무 흐름, 협업 방식, 현장 문제에 집중하세요.
-150자 이내로 간결하게 한국어로 답하세요.${summaryContext}${detailContext}`;
+150자 이내로 간결하게 한국어로 답하세요.${summaryContext}${commonContext}${detailContext}`;
       const reply = await callClaude(system, msg);
       setMsgs(m => [...m, { role:"assistant", content:reply }]);
     } catch {
@@ -1013,7 +1032,21 @@ ${dataText.slice(0, 8000)}
   return (
     <div>
       <div style={{ marginBottom:14 }}>
-        <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>💬 공장 & 업무 대화로 학습</div>
+        <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+          <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>💬 공장 & 업무 대화로 학습</div>
+          {commonKnowledge.length > 0 && (
+            <span title="모든 에이전트가 공유하는 회사 규정/지침이 채팅 컨텍스트에 자동 주입됩니다" style={{
+              background:"rgba(212,175,55,0.12)",
+              border:"1px solid rgba(212,175,55,0.35)",
+              borderRadius:10,
+              padding:"2px 8px",
+              fontSize:10.5,
+              fontWeight:700,
+              color:"#d4af37",
+              cursor:"help",
+            }}>📚 공통 {commonKnowledge.length}건 적용 중</span>
+          )}
+        </div>
         <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
           공장/제품/공정/업무 방식을 자유롭게 알려주세요
         </div>
