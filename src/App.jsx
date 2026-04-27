@@ -2762,14 +2762,16 @@ export default function App() {
 
     for (let i = 0; i < allFiles.length; i++) {
       const f = allFiles[i];
-      setSyncProgress({ current: i + 1, total: allFiles.length, currentFile: f.filename });
+      // 진행 표시: 폴더 경로 + 파일명
+      const displayName = f.subPath ? `${f.subPath}/${f.filename}` : f.filename;
+      setSyncProgress({ current: i + 1, total: allFiles.length, currentFile: displayName });
 
       try {
         // 1. 파일 다운로드
         const fileData = await fetchDriveFile(f.fileId);
         if (!fileData) {
           failCount++;
-          errors.push(`${f.filename}: 파일 다운로드 실패`);
+          errors.push(`${displayName}: 파일 다운로드 실패`);
           continue;
         }
 
@@ -2778,15 +2780,16 @@ export default function App() {
         if (!isImageFile) {
           // 현재는 이미지만 자동 학습 지원 (PDF 등은 학습앱에서 직접 업로드 권장)
           failCount++;
-          errors.push(`${f.filename}: 이미지 외 파일은 미지원 (학습앱에서 직접 업로드)`);
+          errors.push(`${displayName}: 이미지 외 파일은 미지원 (학습앱에서 직접 업로드)`);
           // 다음 동기화에서 또 안 나오게 처리 마크는 함
           await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
           continue;
         }
 
-        // 3. 이미지 분석
+        // 3. 이미지 분석 (폴더 경로를 분류 힌트로 활용)
+        const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
         const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
-이 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.
+이 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.${folderHint}
 다음 형식으로 한국어 답변 (300자 이내):
 [추출 텍스트] (이미지에서 읽은 정보)
 [시각 설명] (시각적 특징 한 줄)
@@ -2798,8 +2801,9 @@ export default function App() {
         const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
         const recommendedCat = catMatch ? catMatch[1] : "판단기준";
 
-        // 4. 저장
-        const content = `[자동학습-${f.filename}] [이미지URL] ${f.url}\n${analyzed}`;
+        // 4. 저장 (폴더 경로 포함)
+        const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
+        const content = `${sourceTag} [이미지URL] ${f.url}\n${analyzed}`;
         if (f.source === "common") {
           await saveCommonKnowledge(recommendedCat, content);
         } else {
@@ -2811,7 +2815,7 @@ export default function App() {
         successCount++;
       } catch (e) {
         failCount++;
-        errors.push(`${f.filename}: ${e.message}`);
+        errors.push(`${displayName}: ${e.message}`);
       }
     }
 
@@ -3072,6 +3076,14 @@ export default function App() {
                         borderRadius:6, padding:"6px 10px", marginBottom:4,
                         fontSize:11, color:"#cbd5e1",
                       }}>
+                        {f.subPath && (
+                          <span style={{
+                            fontSize:9.5, color:roleInfo.color,
+                            background:`${roleInfo.color}15`,
+                            padding:"1px 6px", borderRadius:3, marginRight:6,
+                            fontWeight:700,
+                          }}>📁 {f.subPath}</span>
+                        )}
                         {f.filename}
                         <span style={{ fontSize:9.5, color:"#64748b", marginLeft:6 }}>
                           ({(f.size/1024).toFixed(0)}KB · {f.mimetype})
@@ -3097,6 +3109,14 @@ export default function App() {
                         borderRadius:6, padding:"6px 10px", marginBottom:4,
                         fontSize:11, color:"#cbd5e1",
                       }}>
+                        {f.subPath && (
+                          <span style={{
+                            fontSize:9.5, color:"#34d399",
+                            background:"rgba(52,211,153,0.15)",
+                            padding:"1px 6px", borderRadius:3, marginRight:6,
+                            fontWeight:700,
+                          }}>📁 {f.subPath}</span>
+                        )}
                         {f.filename}
                         <span style={{ fontSize:9.5, color:"#64748b", marginLeft:6 }}>
                           ({(f.size/1024).toFixed(0)}KB · {f.mimetype})
