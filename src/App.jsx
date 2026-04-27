@@ -2721,6 +2721,8 @@ export default function App() {
   const [syncingFiles, setSyncingFiles] = useState(false);
   const [syncProgress, setSyncProgress] = useState({ current: 0, total: 0, currentFile: "" });
   const [syncResult, setSyncResult] = useState(null);
+  const [showPdfModeDialog, setShowPdfModeDialog] = useState(false); // PDF 모드 선택 모달
+  const [syncPdfMode, setSyncPdfMode] = useState("auto"); // "auto" | "vision"
 
   const loadKB = async () => {
     if (!role) return;
@@ -2747,7 +2749,24 @@ export default function App() {
   useEffect(() => { doFolderScan(); }, [role]);
 
   // 새 파일 일괄 학습
+  // PDF가 포함되어 있으면 먼저 모달로 처리 방식 선택받은 후 진행
+  const requestSync = () => {
+    const allFiles = [
+      ...folderScan.roleFiles,
+      ...folderScan.commonFiles,
+    ];
+    const hasPdf = allFiles.some(f => (f.mimetype || "").includes("pdf") || (f.filename || "").toLowerCase().endsWith(".pdf"));
+    if (hasPdf) {
+      // PDF가 있으면 처리 방식 선택 모달
+      setShowPdfModeDialog(true);
+    } else {
+      // 이미지만 있으면 바로 진행
+      startSync();
+    }
+  };
+
   const startSync = async () => {
+    setShowPdfModeDialog(false);
     setSyncingFiles(true);
     setSyncResult(null);
     const allFiles = [
@@ -2758,6 +2777,8 @@ export default function App() {
 
     let successCount = 0;
     let failCount = 0;
+    let pdfTextCount = 0;
+    let pdfVisionCount = 0;
     const errors = [];
 
     for (let i = 0; i < allFiles.length; i++) {
@@ -2775,55 +2796,157 @@ export default function App() {
           continue;
         }
 
-        // 2. 파일 종류별 처리 (이미지만 처리 — PDF/기타는 공지)
         const isImageFile = (fileData.mimetype || "").startsWith("image/");
-        if (!isImageFile) {
-          // 현재는 이미지만 자동 학습 지원 (PDF 등은 학습앱에서 직접 업로드 권장)
-          failCount++;
-          errors.push(`${displayName}: 이미지 외 파일은 미지원 (학습앱에서 직접 업로드)`);
-          // 다음 동기화에서 또 안 나오게 처리 마크는 함
-          await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-          continue;
-        }
+        const isPdfFile = (fileData.mimetype || "").includes("pdf") || (f.filename || "").toLowerCase().endsWith(".pdf");
 
-        // 3. 이미지 분석 (폴더 경로를 분류 힌트로 활용)
-        const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
-        const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
+        if (isImageFile) {
+          // ─── 이미지 처리 (기존 로직) ───
+          const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
+          const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
 이 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.${folderHint}
 다음 형식으로 한국어 답변 (300자 이내):
 [추출 텍스트] (이미지에서 읽은 정보)
 [시각 설명] (시각적 특징 한 줄)
 [추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
 
-        const analyzed = await callClaudeVision(sys, "이 이미지를 분석하세요.", fileData.base64, fileData.mimetype);
+          const analyzed = await callClaudeVision(sys, "이 이미지를 분석하세요.", fileData.base64, fileData.mimetype);
+          const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
+          const recommendedCat = catMatch ? catMatch[1] : "판단기준";
+          const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
+          const content = `${sourceTag} [이미지URL] ${f.url}\n${analyzed}`;
+          if (f.source === "common") {
+            await saveCommonKnowledge(recommendedCat, content);
+          } else {
+            await saveToSheet(role, recommendedCat, content);
+          }
+          await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+          successCount++;
+        } else if (isPdfFile) {
+          // ─── PDF 처리 (학습앱 직접 업로드와 동일 로직) ───
+          // base64 → Blob → File로 변환해서 pdf.js에 전달
+          const byteChars = atob(fileData.base64);
+          const byteNumbers = new Array(byteChars.length);
+          for (let j = 0; j < byteChars.length; j++) {
+            byteNumbers[j] = byteChars.charCodeAt(j);
+          }
+          const byteArray = new Uint8Array(byteNumbers);
+          const blob = new Blob([byteArray], { type: "application/pdf" });
+          const fileObj = new File([blob], f.filename, { type: "application/pdf" });
 
-        // 카테고리 추출
-        const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
-        const recommendedCat = catMatch ? catMatch[1] : "판단기준";
+          const pdf = await loadPdfDocument(fileObj);
+          const pageCount = pdf.numPages;
 
-        // 4. 저장 (폴더 경로 포함)
-        const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
-        const content = `${sourceTag} [이미지URL] ${f.url}\n${analyzed}`;
-        if (f.source === "common") {
-          await saveCommonKnowledge(recommendedCat, content);
+          let pdfResult = "";
+          let usedMode = "";
+
+          // 텍스트 추출 우선 모드면 먼저 시도
+          if (syncPdfMode === "auto") {
+            setSyncProgress({ current: i + 1, total: allFiles.length, currentFile: `${displayName} (텍스트 추출 시도...)` });
+            const fullText = await extractPdfText(pdf);
+
+            if (fullText && fullText.trim().length >= 50) {
+              // 텍스트 추출 성공
+              const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트)` : "";
+              const sys = `${roleInfo.label}(${role}) AI입니다. PDF에서 추출한 텍스트입니다.${folderHint}
+한국어로 핵심 내용만 간결하게 정리. 500자 이내.
+표/구조가 있으면 살려서 정리하세요.
+마지막 줄에 [추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나로 분류.`;
+              const truncated = fullText.slice(0, 12000);
+              pdfResult = await callClaude(sys, `다음 PDF 내용에서 핵심을 추출하세요:\n\n${truncated}`);
+              pdfResult = `[PDF: ${f.filename} - 텍스트 추출, ${pageCount}페이지]\n${pdfResult}`;
+              usedMode = "text";
+              pdfTextCount++;
+            } else {
+              // 텍스트 부족 → 그림 분석으로 폴백
+              usedMode = "vision_fallback";
+            }
+          }
+
+          // 그림 분석 모드 (또는 폴백)
+          if (syncPdfMode === "vision" || usedMode === "vision_fallback") {
+            const allResults = [];
+            const pageUrls = [];
+
+            for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
+              setSyncProgress({
+                current: i + 1, total: allFiles.length,
+                currentFile: `${displayName} (페이지 ${pageNum}/${pageCount} 분석 중...)`,
+              });
+
+              const pageBase64 = await pdfPageToBase64(pdf, pageNum);
+              const pageFilename = `${f.filename.replace(/\.pdf$/i, "")}_p${pageNum}.jpg`;
+
+              // 드라이브 업로드
+              let pageUrl = "";
+              try {
+                const uploadResult = await uploadImageToDrive(role, pageFilename, pageBase64, "image/jpeg");
+                if (uploadResult && uploadResult.url) pageUrl = uploadResult.url;
+              } catch (e) { /* 업로드 실패해도 분석은 계속 */ }
+              pageUrls.push(pageUrl);
+
+              // Vision 분석
+              const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath}` : "";
+              const pagePrompt = `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pageCount} 분석.${folderHint}
+다음 형식으로 한국어 답변 (200자 이내):
+[추출 텍스트] (페이지 핵심 내용)
+[시각 설명] (레이아웃, 표, 다이어그램 등 시각 요소)`;
+
+              try {
+                const pageRes = await callClaudeVision(pagePrompt, "이 PDF 페이지를 분석하세요.", pageBase64, "image/jpeg");
+                allResults.push(`━━ 페이지 ${pageNum} ━━\n${pageRes}`);
+              } catch (e) {
+                allResults.push(`━━ 페이지 ${pageNum} ━━\n(분석 실패)`);
+              }
+            }
+
+            // 종합 요약
+            setSyncProgress({
+              current: i + 1, total: allFiles.length,
+              currentFile: `${displayName} (종합 분석 중...)`,
+            });
+            const combined = allResults.join("\n\n");
+            const sumSys = `위 페이지별 분석 결과들을 종합해서 PDF 전체의 핵심을 ${roleInfo.label}(${role}) 관점에서 한국어 500자 이내로 정리하세요.
+마지막 줄에 [추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나로 분류.`;
+            const summary = await callClaude(sumSys, combined);
+
+            const urlLines = pageUrls
+              .map((u, idx) => u ? `[페이지${idx+1}URL] ${u}` : `[페이지${idx+1}URL] (업로드 실패)`)
+              .join("\n");
+
+            const fallbackTag = usedMode === "vision_fallback" ? " (텍스트 부족으로 자동 전환)" : "";
+            pdfResult = `[PDF: ${f.filename} - 그림 분석${fallbackTag}, ${pageCount}페이지]\n${urlLines}\n\n[종합 요약]\n${summary}\n\n[페이지별 상세]\n${combined}`;
+            pdfVisionCount++;
+          }
+
+          // 카테고리 추출
+          const catMatch = pdfResult.match(/\[추천 카테고리\]\s*([가-힣]+)/);
+          const recommendedCat = catMatch ? catMatch[1] : "판단기준";
+          const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
+          const content = `${sourceTag}\n${pdfResult}`;
+
+          if (f.source === "common") {
+            await saveCommonKnowledge(recommendedCat, content);
+          } else {
+            await saveToSheet(role, recommendedCat, content);
+          }
+          await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+          successCount++;
         } else {
-          await saveToSheet(role, recommendedCat, content);
+          // 그 외 파일 (Word/Excel 등) - 미지원
+          failCount++;
+          errors.push(`${displayName}: 미지원 파일 형식 (${fileData.mimetype}) - PDF로 변환 권장`);
+          await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+          continue;
         }
-
-        // 5. 처리 완료 마크
-        await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-        successCount++;
       } catch (e) {
         failCount++;
         errors.push(`${displayName}: ${e.message}`);
       }
     }
 
-    setSyncResult({ successCount, failCount, errors });
+    setSyncResult({ successCount, failCount, errors, pdfTextCount, pdfVisionCount });
     setSyncingFiles(false);
-    // 폴더 다시 스캔
     await doFolderScan();
-    // 학습 데이터 다시 로드
     await loadKB();
   };
 
@@ -3127,7 +3250,7 @@ export default function App() {
                 )}
 
                 <div style={{ display:"flex", gap:8 }}>
-                  <button onClick={startSync} style={{
+                  <button onClick={requestSync} style={{
                     flex:1, padding:"10px",
                     background:`linear-gradient(135deg,${roleInfo.color},${roleInfo.color}cc)`,
                     border:"none", borderRadius:8, color:"#fff",
@@ -3182,6 +3305,12 @@ export default function App() {
                   <div style={{ fontSize:12, color:"#34d399", fontWeight:700, marginBottom:4 }}>
                     성공: {syncResult.successCount}개
                   </div>
+                  {(syncResult.pdfTextCount > 0 || syncResult.pdfVisionCount > 0) && (
+                    <div style={{ fontSize:10, color:"#94a3b8", marginTop:4, marginBottom:4 }}>
+                      {syncResult.pdfTextCount > 0 && `📝 PDF 텍스트 추출: ${syncResult.pdfTextCount}개  `}
+                      {syncResult.pdfVisionCount > 0 && `🖼️ PDF 그림 분석: ${syncResult.pdfVisionCount}개`}
+                    </div>
+                  )}
                   {syncResult.failCount > 0 && (
                     <div style={{ fontSize:12, color:"#f87171", fontWeight:700 }}>
                       실패: {syncResult.failCount}개
@@ -3222,6 +3351,117 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* PDF 처리 방식 선택 모달 (Step 5-C 보강) */}
+      {showPdfModeDialog && (() => {
+        // PDF 파일 통계 계산
+        const allFiles = [...folderScan.roleFiles, ...folderScan.commonFiles];
+        const pdfFiles = allFiles.filter(f =>
+          (f.mimetype || "").includes("pdf") || (f.filename || "").toLowerCase().endsWith(".pdf")
+        );
+        const pdfCount = pdfFiles.length;
+
+        return (
+          <div style={{
+            position:"fixed", top:0, left:0, right:0, bottom:0,
+            background:"rgba(0,0,0,0.75)", backdropFilter:"blur(4px)",
+            display:"flex", alignItems:"center", justifyContent:"center",
+            zIndex:1100, padding:"16px",
+          }}>
+            <div style={{
+              background:"#0f172a", border:`1.5px solid ${roleInfo.color}40`,
+              borderRadius:14, padding:"20px", maxWidth:520, width:"100%",
+            }}>
+              <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:6 }}>
+                📄 PDF 처리 방식 선택
+              </div>
+              <div style={{ fontSize:11.5, color:"#94a3b8", marginBottom:14, lineHeight:1.6 }}>
+                발견된 PDF {pdfCount}개의 처리 방식을 선택하세요.
+                <br/>
+                <span style={{ color:"#64748b", fontSize:10.5 }}>
+                  (이미지 파일은 이 설정과 무관하게 정상 처리됩니다)
+                </span>
+              </div>
+
+              {/* 텍스트 추출 우선 */}
+              <div onClick={() => setSyncPdfMode("auto")} style={{
+                padding:"12px 14px", cursor:"pointer", marginBottom:8,
+                background: syncPdfMode === "auto" ? `${roleInfo.color}15` : "rgba(8,14,26,0.7)",
+                border: `1.5px solid ${syncPdfMode === "auto" ? roleInfo.color : "rgba(51,65,85,0.5)"}`,
+                borderRadius:8,
+              }}>
+                <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:6 }}>
+                  <div style={{
+                    width:14, height:14, borderRadius:"50%",
+                    border:`2px solid ${syncPdfMode === "auto" ? roleInfo.color : "#475569"}`,
+                    background: syncPdfMode === "auto" ? roleInfo.color : "transparent",
+                  }}/>
+                  <span style={{ fontSize:13, fontWeight:700,
+                    color: syncPdfMode === "auto" ? roleInfo.color : "#cbd5e1" }}>
+                    📝 텍스트 추출 우선 (자동 폴백) ⭐
+                  </span>
+                </div>
+                <div style={{ fontSize:10.5, color:"#94a3b8", lineHeight:1.6, paddingLeft:20 }}>
+                  • 텍스트 PDF: 빠르고 저렴하게 처리 (페이지당 약 $0.0005)
+                  <br/>
+                  • 스캔 PDF: 자동으로 그림 분석으로 전환 (페이지당 $0.02)
+                  <br/>
+                  <span style={{ color:"#34d399" }}>✓ 작업 표준서, 규정, 매뉴얼에 적합</span>
+                </div>
+              </div>
+
+              {/* 모두 그림 분석 */}
+              <div onClick={() => setSyncPdfMode("vision")} style={{
+                padding:"12px 14px", cursor:"pointer", marginBottom:14,
+                background: syncPdfMode === "vision" ? `${roleInfo.color}15` : "rgba(8,14,26,0.7)",
+                border: `1.5px solid ${syncPdfMode === "vision" ? roleInfo.color : "rgba(51,65,85,0.5)"}`,
+                borderRadius:8,
+              }}>
+                <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:6 }}>
+                  <div style={{
+                    width:14, height:14, borderRadius:"50%",
+                    border:`2px solid ${syncPdfMode === "vision" ? roleInfo.color : "#475569"}`,
+                    background: syncPdfMode === "vision" ? roleInfo.color : "transparent",
+                  }}/>
+                  <span style={{ fontSize:13, fontWeight:700,
+                    color: syncPdfMode === "vision" ? roleInfo.color : "#cbd5e1" }}>
+                    🖼️ 모두 그림 분석
+                  </span>
+                </div>
+                <div style={{ fontSize:10.5, color:"#94a3b8", lineHeight:1.6, paddingLeft:20 }}>
+                  • 모든 PDF의 모든 페이지를 Vision API로 분석 (페이지당 $0.02)
+                  <br/>
+                  • 페이지별 이미지를 드라이브에 자동 저장
+                  <br/>
+                  <span style={{ color:"#34d399" }}>✓ 시각 정보 중요한 자료(검사기준서, 도면, 다이어그램)에 적합</span>
+                  <br/>
+                  <span style={{ color:"#fbbf24" }}>⚠️ 비용 ↑, 처리 시간 ↑</span>
+                </div>
+              </div>
+
+              <div style={{ display:"flex", gap:8 }}>
+                <button onClick={startSync} style={{
+                  flex:1, padding:"10px",
+                  background:`linear-gradient(135deg,${roleInfo.color},${roleInfo.color}cc)`,
+                  border:"none", borderRadius:8, color:"#fff",
+                  fontSize:13, fontWeight:700, cursor:"pointer",
+                }}>
+                  📥 학습 시작
+                </button>
+                <button onClick={() => setShowPdfModeDialog(false)} style={{
+                  padding:"10px 16px",
+                  background:"rgba(51,65,85,0.4)",
+                  border:"1px solid rgba(71,85,105,0.5)",
+                  borderRadius:8, color:"#94a3b8",
+                  fontSize:13, fontWeight:700, cursor:"pointer",
+                }}>
+                  취소
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       <style>{`
         @keyframes spin{to{transform:rotate(360deg)}}
