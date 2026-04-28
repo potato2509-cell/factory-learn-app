@@ -1206,10 +1206,50 @@ const RULE_FIELDS = {
 function TabRules({ role, roleInfo }) {
   const fields = RULE_FIELDS[role] || RULE_FIELDS[Object.keys(RULE_FIELDS)[0]];
   const [values, setValues] = useState(Object.fromEntries(fields.map((_,i) => [i, ""])));
+  const [loadingExisting, setLoadingExisting] = useState(true);  // 기존 입력 로드 중
+  const [hasExisting, setHasExisting] = useState(false);  // 기존 입력 있었는지 (배지 표시용)
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [conflictQueue, setConflictQueue] = useState([]); // 충돌 대기 큐
   const [currentConflict, setCurrentConflict] = useState(null); // 현재 처리 중인 충돌
+
+  // 시트에서 기존 입력 내용 로드 (영속성)
+  // - 같은 필드 라벨로 저장된 항목 중 가장 최근(updated_at) 것을 textarea에 복원
+  // - role이 바뀌면 다시 로드 (race condition 방지: cancelled 플래그)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoadingExisting(true);
+      setHasExisting(false);
+      // 역할 바뀐 직후 잔상 방지 — 일단 빈 칸으로 리셋
+      setValues(Object.fromEntries(fields.map((_,i) => [i, ""])));
+      try {
+        const items = await loadFromSheet(role);
+        if (cancelled) return;
+        const restored = {};
+        let foundAny = false;
+        fields.forEach((field, i) => {
+          const labelPrefix = `[${field.label}]`;
+          const matched = (items || [])
+            .filter(it => it.content && it.content.startsWith(labelPrefix))
+            .sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0))[0];
+          if (matched) {
+            restored[i] = matched.content.slice(labelPrefix.length).trim();
+            foundAny = true;
+          }
+        });
+        if (foundAny) {
+          setValues(v => ({ ...v, ...restored }));
+          setHasExisting(true);
+        }
+      } catch (e) {
+        console.error("[TabRules] 기존 입력 로드 실패:", e);
+      } finally {
+        if (!cancelled) setLoadingExisting(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [role]);
 
   // 큐에서 다음 충돌 꺼내기
   useEffect(() => {
@@ -1263,7 +1303,26 @@ function TabRules({ role, roleInfo }) {
   return (
     <div>
       <div style={{ marginBottom:16 }}>
-        <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📋 업무 규칙 & 판단 기준</div>
+        <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+          <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📋 업무 규칙 & 판단 기준</div>
+          {loadingExisting && (
+            <span style={{
+              background:"rgba(100,116,139,0.15)",
+              border:"1px solid rgba(100,116,139,0.3)",
+              borderRadius:10, padding:"2px 8px",
+              fontSize:10.5, fontWeight:700, color:"#94a3b8",
+            }}>기존 입력 불러오는 중…</span>
+          )}
+          {!loadingExisting && hasExisting && (
+            <span title="시트에 저장된 기존 입력 내용을 자동 복원했습니다" style={{
+              background:"rgba(34,197,94,0.12)",
+              border:"1px solid rgba(34,197,94,0.35)",
+              borderRadius:10, padding:"2px 8px",
+              fontSize:10.5, fontWeight:700, color:"#4ade80",
+              cursor:"help",
+            }}>✅ 기존 입력 복원됨</span>
+          )}
+        </div>
         <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
           {roleInfo.label}로서 실제로 따르는 행동 원칙을 입력하세요
         </div>
@@ -1880,6 +1939,22 @@ ${dataText.slice(0, 8000)}
           }
           setDefectInfo({ ...defectInfo, count: newCount });
         }
+
+        // 정상 저장 완료 → 다음 파일 업로드를 위해 모든 입력 초기화
+        // (충돌 분기로 들어간 경우는 사용자가 충돌 해결 후 결정해야 하므로 초기화하지 않음)
+        if (preview) URL.revokeObjectURL(preview); // 메모리 누수 방지
+        setFile(null);
+        setPreview("");
+        setAnalyzed("");
+        setImageType("");
+        setRecommendedCategory("");
+        setUploadedImageUrl("");
+        setPdfDoc(null);
+        setPdfPageCount(0);
+        setPdfImageUrls([]);
+        setPdfMode("text");
+        setError("");
+        if (fileRef.current) fileRef.current.value = "";  // 같은 파일 재업로드 가능하게 input 초기화
       }
 
       setSaved(true);
