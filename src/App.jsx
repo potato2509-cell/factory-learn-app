@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 
 // ─── 설정 ─────────────────────────────────────────────────────────────────────
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXpt3UjWjfgDljEiGodgbunj_UnXYc-1RlrXgNiDzAiikXoEP4g9_E/exec";
@@ -537,6 +537,68 @@ function safeJSON(raw) {
   const s = cleaned.indexOf("{"), e = cleaned.lastIndexOf("}");
   if (s === -1 || e === -1) throw new Error("JSON 없음");
   return JSON.parse(cleaned.slice(s, e + 1));
+}
+
+// ─── 일관성 자동 점검 (Step 7-4) ────────────────────────────────────────────
+// 신규 항목 1개를 기존 knowledge와 비교해 중복/충돌을 찾음.
+// - 같은 카테고리 + 다른 카테고리 모두 검사 (교차 검사)
+// - 비교 대상은 최근 50건으로 제한 (토큰 절약)
+// - 발견된 충돌 배열 반환 (없으면 빈 배열)
+async function checkConsistencyForItem(newItem, existingKnowledge) {
+  if (!newItem || !newItem.content || existingKnowledge.length === 0) return [];
+
+  // 비교 대상 추출 (자기 자신 제외, 최근 50건)
+  const candidates = existingKnowledge
+    .filter(k => k.content && k.content !== newItem.content)
+    .slice(-50);
+  if (candidates.length === 0) return [];
+
+  const candidatesText = candidates
+    .map((it, i) => `${i + 1}. [${it.category}] ${it.content}`)
+    .join("\n");
+
+  const sys = `당신은 학습 데이터 일관성 검증자입니다. 새로 추가된 항목이 기존 항목들과 중복되거나 충돌하는지 검사하세요.
+
+[새 항목]
+[${newItem.category}] ${newItem.content}
+
+[기존 항목들]
+${candidatesText}
+
+[판단 기준]
+- duplicate: 같은 의미를 다른 표현으로 작성한 경우
+- conflict: 같은 주제이지만 수치/절차/기준이 다른 경우
+- 카테고리가 달라도 내용이 모순되면 충돌로 판단
+
+JSON으로만 답하세요. 발견 없으면 빈 배열.
+
+응답 형식:
+{"matches":[{"existing":3,"type":"duplicate|conflict","reason":"한 줄 사유"}]}`;
+
+  try {
+    const raw = await callClaude(sys, "검사 결과를 JSON으로 답하세요.");
+    const parsed = safeJSON(raw);
+    if (!parsed.matches || !Array.isArray(parsed.matches)) return [];
+
+    const findings = [];
+    for (const m of parsed.matches) {
+      const idx = m.existing - 1;
+      if (idx < 0 || idx >= candidates.length) continue;
+      findings.push({
+        category: newItem.category,
+        itemA: { category: newItem.category, content: newItem.content, updated_at: newItem.updated_at },
+        itemB: candidates[idx],
+        type: m.type === "duplicate" ? "duplicate" : "conflict",
+        reason: m.reason || "",
+        detectedAt: new Date().toISOString(),
+        resolved: false,
+      });
+    }
+    return findings;
+  } catch (e) {
+    console.warn("[checkConsistency] 검사 실패:", e.message);
+    return [];
+  }
 }
 
 // ─── 학습 수준 계산 ───────────────────────────────────────────────────────────
@@ -2274,13 +2336,694 @@ ${dataText.slice(0, 8000)}
 }
 
 // ─── STEP 5: 학습 현황 ────────────────────────────────────────────────────────
-function TabStatus({ role, roleInfo, knowledge, onReload, loading }) {
+// ─── 검색 매치 하이라이트 헬퍼 ─────────────────────────────────────────────
+function highlightMatch(text, query) {
+  if (!text || !query) return text;
+  const idx = text.toLowerCase().indexOf(query.toLowerCase());
+  if (idx === -1) return text;
+  return (
+    <>
+      {text.slice(0, idx)}
+      <mark style={{
+        background:"rgba(251,191,36,0.3)",
+        color:"#fbbf24",
+        padding:"1px 2px", borderRadius:2,
+      }}>
+        {text.slice(idx, idx + query.length)}
+      </mark>
+      {text.slice(idx + query.length)}
+    </>
+  );
+}
+
+// ─── 학습 보관함 (TabLibrary): 검색 / 필터 / 정렬 / 열람 / 편집 / 삭제 ────
+function TabLibrary({ role, roleInfo, knowledge, onReload, loading }) {
+  const CATEGORIES = ["공장정보", "업무역할", "판단기준", "협업방식", "교정사례"];
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("전체");
+  const [sortMode, setSortMode] = useState("recent"); // recent | category | length
+  const [pageSize, setPageSize] = useState(20);
+
+  // 편집/삭제 state
+  // editingKey: 편집 중인 항목 식별자 (category|content), null이면 편집 모드 아님
+  const [editingKey, setEditingKey] = useState(null);
+  const [editText, setEditText] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+  // deleteTarget: 삭제 확인 모달용 항목 객체, null이면 모달 안 뜸
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deletingNow, setDeletingNow] = useState(false);
+
+  // 항목 식별자 생성 (category + content로 유니크 식별 - Apps Script도 동일 방식 매칭)
+  const itemKey = (item) => `${item.category}|${item.content}`;
+
+  // 편집 시작
+  const startEdit = (item) => {
+    setEditingKey(itemKey(item));
+    setEditText(item.content || "");
+  };
+
+  // 편집 취소
+  const cancelEdit = () => {
+    setEditingKey(null);
+    setEditText("");
+  };
+
+  // 편집 저장
+  const saveEdit = async (item) => {
+    const newContent = editText.trim();
+    if (!newContent) return;
+    if (newContent === (item.content || "").trim()) {
+      cancelEdit();
+      return;
+    }
+    setSavingEdit(true);
+    try {
+      await replaceKnowledge(role, item.category, item.content, newContent);
+      cancelEdit();
+      await onReload();
+    } catch (e) {
+      console.error("[TabLibrary] 편집 저장 실패:", e);
+      alert("편집 저장 실패. 다시 시도해 주세요.");
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  // 삭제 확인
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeletingNow(true);
+    try {
+      await deleteKnowledge(role, deleteTarget.category, deleteTarget.content);
+      setDeleteTarget(null);
+      await onReload();
+    } catch (e) {
+      console.error("[TabLibrary] 삭제 실패:", e);
+      alert("삭제 실패. 다시 시도해 주세요.");
+    } finally {
+      setDeletingNow(false);
+    }
+  };
+
+  // ─── 백업/내보내기 ────────────────────────────────────────────
+  // 파일 다운로드 트리거 (브라우저 표준 패턴)
+  const triggerDownload = (content, mimeType, filename) => {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // YYYYMMDD-HHmm 형식 (파일명용)
+  const timestampForFilename = () => {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+  };
+
+  // JSON 내보내기 (메타데이터 포함, 복원/이전용)
+  const exportJSON = () => {
+    const payload = {
+      version: "1.0",
+      app: "Factory Engineer AI 학습앱",
+      role,
+      role_label: roleInfo.label,
+      exported_at: new Date().toISOString(),
+      total_count: knowledge.length,
+      items: knowledge.map(k => ({
+        category: k.category,
+        content: k.content,
+        updated_at: k.updated_at || null,
+      })),
+    };
+    const json = JSON.stringify(payload, null, 2);
+    const filename = `learning-${role}-${timestampForFilename()}.json`;
+    triggerDownload(json, "application/json;charset=utf-8", filename);
+  };
+
+  // CSV 내보내기 (Excel 호환)
+  // - BOM 포함하여 한글이 Excel에서 깨지지 않도록 함
+  // - 컴마/따옴표/줄바꿈은 표준 CSV 이스케이프
+  const escapeCsvField = (val) => {
+    const s = (val == null ? "" : String(val));
+    if (/[",\n\r]/.test(s)) {
+      return `"${s.replace(/"/g, '""')}"`;
+    }
+    return s;
+  };
+
+  const exportCSV = () => {
+    const header = ["category", "content", "updated_at"];
+    const lines = [header.join(",")];
+    knowledge.forEach(k => {
+      lines.push([
+        escapeCsvField(k.category),
+        escapeCsvField(k.content),
+        escapeCsvField(k.updated_at),
+      ].join(","));
+    });
+    // BOM(\uFEFF) 추가 — Excel이 UTF-8로 인식하도록
+    const csv = "\uFEFF" + lines.join("\r\n");
+    const filename = `learning-${role}-${timestampForFilename()}.csv`;
+    triggerDownload(csv, "text/csv;charset=utf-8", filename);
+  };
+
+  // 디바운스 (입력 200ms 멈추면 필터링)
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQuery(searchQuery.trim()), 200);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
+
+  // 검색어 변경 시 페이지 사이즈 리셋
+  useEffect(() => {
+    setPageSize(20);
+  }, [debouncedQuery, categoryFilter, sortMode]);
+
+  // 카테고리별 카운트 (필터 칩 표시용)
+  const categoryCounts = useMemo(() => {
+    const counts = { "전체": knowledge.length };
+    CATEGORIES.forEach(c => {
+      counts[c] = knowledge.filter(k => k.category === c).length;
+    });
+    return counts;
+  }, [knowledge]);
+
+  // 필터링 + 정렬
+  const filteredItems = useMemo(() => {
+    let items = knowledge;
+
+    if (categoryFilter !== "전체") {
+      items = items.filter(k => k.category === categoryFilter);
+    }
+
+    if (debouncedQuery) {
+      const q = debouncedQuery.toLowerCase();
+      items = items.filter(k =>
+        (k.content || "").toLowerCase().includes(q) ||
+        (k.category || "").toLowerCase().includes(q)
+      );
+    }
+
+    items = [...items];
+    if (sortMode === "recent") {
+      items.sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));
+    } else if (sortMode === "category") {
+      items.sort((a, b) => (a.category || "").localeCompare(b.category || ""));
+    } else if (sortMode === "length") {
+      items.sort((a, b) => (b.content || "").length - (a.content || "").length);
+    }
+
+    return items;
+  }, [knowledge, categoryFilter, debouncedQuery, sortMode]);
+
+  const visibleItems = filteredItems.slice(0, pageSize);
+  const hasMore = filteredItems.length > pageSize;
+
+  return (
+    <div style={{ padding:"16px 18px" }}>
+      {/* 헤더 */}
+      <div style={{ marginBottom:14 }}>
+        <div style={{
+          display:"flex", alignItems:"center", justifyContent:"space-between",
+          gap:8, flexWrap:"wrap",
+        }}>
+          <div>
+            <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>
+              📚 학습 보관함
+            </div>
+            <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
+              학습된 내용을 검색·열람·관리합니다 · 전체 {knowledge.length}건
+            </div>
+          </div>
+          {/* 내보내기 버튼 그룹 */}
+          {knowledge.length > 0 && (
+            <div style={{ display:"flex", gap:6 }}>
+              <button
+                onClick={exportJSON}
+                title="JSON 형식으로 다운로드 (복원·이전용 권장)"
+                style={{
+                  background:"rgba(167,139,250,0.1)",
+                  border:"1px solid rgba(167,139,250,0.35)",
+                  borderRadius:6, padding:"6px 10px",
+                  color:"#a78bfa", fontSize:11, fontWeight:600,
+                  cursor:"pointer",
+                  display:"flex", alignItems:"center", gap:4,
+                }}
+              >💾 JSON</button>
+              <button
+                onClick={exportCSV}
+                title="CSV 형식으로 다운로드 (Excel 열람용)"
+                style={{
+                  background:"rgba(52,211,153,0.1)",
+                  border:"1px solid rgba(52,211,153,0.35)",
+                  borderRadius:6, padding:"6px 10px",
+                  color:"#34d399", fontSize:11, fontWeight:600,
+                  cursor:"pointer",
+                  display:"flex", alignItems:"center", gap:4,
+                }}
+              >📊 CSV</button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 검색 박스 */}
+      <div style={{ position:"relative", marginBottom:12 }}>
+        <input
+          type="text"
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          placeholder="🔍 검색어를 입력하세요"
+          style={{
+            width:"100%", padding:"11px 14px",
+            paddingRight: searchQuery ? 36 : 14,
+            background:"rgba(15,23,42,0.6)",
+            border:"1px solid rgba(51,65,85,0.5)",
+            borderRadius:10, color:"#e2e8f0",
+            fontSize:13, outline:"none",
+            boxSizing:"border-box",
+          }}
+        />
+        {searchQuery && (
+          <button onClick={() => setSearchQuery("")} style={{
+            position:"absolute", right:10, top:"50%", transform:"translateY(-50%)",
+            background:"transparent", border:"none", color:"#64748b",
+            cursor:"pointer", fontSize:18, lineHeight:1,
+          }}>×</button>
+        )}
+      </div>
+
+      {/* 카테고리 필터 칩 */}
+      <div style={{
+        display:"flex", flexWrap:"wrap", gap:6, marginBottom:10,
+      }}>
+        {["전체", ...CATEGORIES].map(cat => {
+          const isActive = categoryFilter === cat;
+          const count = categoryCounts[cat] || 0;
+          const disabled = count === 0 && cat !== "전체";
+          return (
+            <button
+              key={cat}
+              onClick={() => setCategoryFilter(cat)}
+              disabled={disabled}
+              style={{
+                padding:"6px 11px",
+                background: isActive ? roleInfo.color : "rgba(30,41,59,0.5)",
+                border:`1px solid ${isActive ? roleInfo.color : "rgba(51,65,85,0.5)"}`,
+                borderRadius:14,
+                color: isActive ? "#fff" : "#94a3b8",
+                fontSize:11, fontWeight: isActive ? 700 : 500,
+                cursor: disabled ? "not-allowed" : "pointer",
+                opacity: disabled ? 0.4 : 1,
+              }}
+            >
+              {cat} {count}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* 정렬 + 결과 카운트 */}
+      <div style={{
+        display:"flex", justifyContent:"space-between", alignItems:"center",
+        marginBottom:12, fontSize:11, color:"#64748b",
+      }}>
+        <select
+          value={sortMode}
+          onChange={(e) => setSortMode(e.target.value)}
+          style={{
+            background:"rgba(15,23,42,0.6)",
+            border:"1px solid rgba(51,65,85,0.5)",
+            borderRadius:6, padding:"5px 8px",
+            color:"#cbd5e1", fontSize:11, cursor:"pointer",
+          }}
+        >
+          <option value="recent">최신순</option>
+          <option value="category">카테고리순</option>
+          <option value="length">내용 길이순</option>
+        </select>
+        <span>표시: {filteredItems.length}건</span>
+      </div>
+
+      {/* 결과 카드 목록 */}
+      {filteredItems.length === 0 ? (
+        <div style={{
+          padding:"40px 20px", textAlign:"center", color:"#64748b",
+          background:"rgba(15,23,42,0.4)", borderRadius:10, fontSize:12,
+        }}>
+          {debouncedQuery
+            ? `"${debouncedQuery}" 일치 항목 없음`
+            : (knowledge.length === 0 ? "아직 학습된 내용이 없습니다" : "표시할 항목이 없습니다")}
+        </div>
+      ) : (
+        <>
+          {visibleItems.map((item, i) => {
+            const isEditing = editingKey === itemKey(item);
+            return (
+            <div key={item.id || `${item.updated_at}-${i}`} style={{
+              padding:"12px 14px",
+              marginBottom:8,
+              background:"rgba(30,41,59,0.4)",
+              border:`1px solid ${isEditing ? roleInfo.color : "rgba(51,65,85,0.4)"}`,
+              borderLeft:`3px solid ${roleInfo.color}`,
+              borderRadius:8,
+            }}>
+              <div style={{
+                display:"flex", alignItems:"center", gap:8, marginBottom:6,
+                flexWrap:"wrap",
+              }}>
+                <span style={{
+                  background:`${roleInfo.color}15`,
+                  color: roleInfo.color,
+                  padding:"2px 7px", borderRadius:4,
+                  fontSize:10, fontWeight:700,
+                }}>
+                  {item.category}
+                </span>
+                {item.updated_at && (
+                  <span style={{ fontSize:10, color:"#64748b" }}>
+                    {String(item.updated_at).slice(0, 10)}
+                  </span>
+                )}
+                {/* 편집/삭제 버튼 (편집 중이 아닐 때만) */}
+                {!isEditing && (
+                  <div style={{ marginLeft:"auto", display:"flex", gap:6 }}>
+                    <button
+                      onClick={() => startEdit(item)}
+                      title="편집"
+                      style={{
+                        background:"rgba(51,65,85,0.4)",
+                        border:"1px solid rgba(51,65,85,0.5)",
+                        borderRadius:5, padding:"3px 8px",
+                        color:"#94a3b8", fontSize:10, cursor:"pointer",
+                      }}
+                    >✏️ 편집</button>
+                    <button
+                      onClick={() => setDeleteTarget(item)}
+                      title="삭제"
+                      style={{
+                        background:"rgba(239,68,68,0.1)",
+                        border:"1px solid rgba(239,68,68,0.3)",
+                        borderRadius:5, padding:"3px 8px",
+                        color:"#f87171", fontSize:10, cursor:"pointer",
+                      }}
+                    >🗑️</button>
+                  </div>
+                )}
+              </div>
+
+              {/* 편집 모드 / 일반 모드 분기 */}
+              {isEditing ? (
+                <div>
+                  <textarea
+                    value={editText}
+                    onChange={(e) => setEditText(e.target.value)}
+                    rows={Math.min(10, Math.max(3, Math.ceil(editText.length / 50)))}
+                    style={{
+                      width:"100%", padding:"8px 10px",
+                      background:"rgba(15,23,42,0.7)",
+                      border:`1px solid ${roleInfo.color}50`,
+                      borderRadius:6, color:"#e2e8f0",
+                      fontSize:12, fontFamily:"inherit", lineHeight:1.6,
+                      resize:"vertical", outline:"none", boxSizing:"border-box",
+                    }}
+                    autoFocus
+                  />
+                  <div style={{ display:"flex", gap:6, marginTop:8, justifyContent:"flex-end" }}>
+                    <button
+                      onClick={cancelEdit}
+                      disabled={savingEdit}
+                      style={{
+                        background:"rgba(51,65,85,0.4)",
+                        border:"1px solid rgba(51,65,85,0.5)",
+                        borderRadius:6, padding:"6px 12px",
+                        color:"#94a3b8", fontSize:11,
+                        cursor: savingEdit ? "not-allowed" : "pointer",
+                      }}
+                    >취소</button>
+                    <button
+                      onClick={() => saveEdit(item)}
+                      disabled={savingEdit || !editText.trim()}
+                      style={{
+                        background: savingEdit || !editText.trim()
+                          ? "rgba(51,65,85,0.3)"
+                          : roleInfo.color,
+                        border:"none", borderRadius:6,
+                        padding:"6px 14px",
+                        color: savingEdit || !editText.trim() ? "#475569" : "#fff",
+                        fontSize:11, fontWeight:700,
+                        cursor: savingEdit || !editText.trim() ? "not-allowed" : "pointer",
+                        display:"flex", alignItems:"center", gap:6,
+                      }}
+                    >
+                      {savingEdit ? <><Spinner/>저장 중</> : "저장"}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div style={{
+                  fontSize:12, color:"#cbd5e1", lineHeight:1.6,
+                  wordBreak:"break-word", whiteSpace:"pre-wrap",
+                }}>
+                  {highlightMatch(item.content, debouncedQuery)}
+                </div>
+              )}
+            </div>
+            );
+          })}
+
+          {/* 더 보기 */}
+          {hasMore && (
+            <button
+              onClick={() => setPageSize(p => p + 20)}
+              style={{
+                width:"100%", padding:"10px",
+                background:"rgba(51,65,85,0.3)",
+                border:"1px solid rgba(51,65,85,0.4)",
+                borderRadius:8, color:"#94a3b8",
+                fontSize:12, cursor:"pointer", marginTop:6,
+              }}
+            >
+              ↓ 더 보기 (남은 {filteredItems.length - pageSize}건)
+            </button>
+          )}
+        </>
+      )}
+
+      {/* 새로고침 */}
+      <button onClick={onReload} disabled={loading} style={{
+        width:"100%", padding:"10px", marginTop:14,
+        background:"rgba(51,65,85,0.3)", border:"1px solid rgba(51,65,85,0.4)",
+        borderRadius:8, color:"#64748b", fontSize:11, cursor:"pointer",
+        display:"flex", alignItems:"center", justifyContent:"center", gap:8,
+      }}>
+        {loading ? <><Spinner/>로딩 중...</> : "🔄 최신 데이터 불러오기"}
+      </button>
+
+      {/* 삭제 확인 모달 */}
+      {deleteTarget && (
+        <div style={{
+          position:"fixed", inset:0,
+          background:"rgba(0,0,0,0.7)", zIndex:1000,
+          display:"flex", alignItems:"center", justifyContent:"center",
+          padding:20,
+        }} onClick={() => !deletingNow && setDeleteTarget(null)}>
+          <div onClick={(e) => e.stopPropagation()} style={{
+            background:"#0f172a",
+            border:"1px solid rgba(239,68,68,0.4)",
+            borderRadius:12, padding:"20px 22px",
+            maxWidth:420, width:"100%",
+            boxShadow:"0 20px 50px rgba(0,0,0,0.6)",
+          }}>
+            <div style={{ fontSize:14, fontWeight:800, color:"#f1f5f9", marginBottom:8 }}>
+              🗑️ 학습 항목 삭제
+            </div>
+            <div style={{ fontSize:11.5, color:"#94a3b8", marginBottom:14, lineHeight:1.6 }}>
+              아래 항목을 영구 삭제합니다. 이 동작은 되돌릴 수 없습니다.
+            </div>
+            <div style={{
+              padding:"10px 12px",
+              background:"rgba(15,23,42,0.7)",
+              border:"1px solid rgba(51,65,85,0.4)",
+              borderLeft:`3px solid ${roleInfo.color}`,
+              borderRadius:6, marginBottom:16,
+              fontSize:11, color:"#cbd5e1", lineHeight:1.6,
+              maxHeight:140, overflowY:"auto",
+              wordBreak:"break-word", whiteSpace:"pre-wrap",
+            }}>
+              <span style={{
+                background:`${roleInfo.color}15`, color: roleInfo.color,
+                padding:"1px 6px", borderRadius:3,
+                fontSize:9.5, fontWeight:700, marginRight:6,
+              }}>{deleteTarget.category}</span>
+              {deleteTarget.content}
+            </div>
+            <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
+              <button
+                onClick={() => setDeleteTarget(null)}
+                disabled={deletingNow}
+                style={{
+                  background:"rgba(51,65,85,0.4)",
+                  border:"1px solid rgba(51,65,85,0.5)",
+                  borderRadius:6, padding:"8px 16px",
+                  color:"#94a3b8", fontSize:12,
+                  cursor: deletingNow ? "not-allowed" : "pointer",
+                }}
+              >취소</button>
+              <button
+                onClick={confirmDelete}
+                disabled={deletingNow}
+                style={{
+                  background: deletingNow
+                    ? "rgba(239,68,68,0.3)"
+                    : "linear-gradient(135deg,#ef4444,#dc2626)",
+                  border:"none", borderRadius:6,
+                  padding:"8px 16px",
+                  color:"#fff", fontSize:12, fontWeight:700,
+                  cursor: deletingNow ? "not-allowed" : "pointer",
+                  display:"flex", alignItems:"center", gap:6,
+                }}
+              >
+                {deletingNow ? <><Spinner/>삭제 중</> : "삭제"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TabStatus({ role, roleInfo, knowledge, onReload, loading, autoConflicts = [], autoCheckBusy = false, onResolveAutoConflict }) {
   const progress = calcProgress(knowledge);
   const [scanning, setScanning] = useState(false);
   const [scanResults, setScanResults] = useState(null); // { conflicts: [...], scannedAt: timestamp }
   const [resolving, setResolving] = useState(null); // 현재 처리 중인 충돌 인덱스
 
   const CATEGORIES_TO_SCAN = ["공장정보", "업무역할", "판단기준", "협업방식", "교정사례"];
+
+  // ─── 품질 진단 분석 (메모이제이션) ────────────────────────────────────
+  // knowledge 또는 scanResults 변경 시에만 재계산
+  const qualityReport = useMemo(() => {
+    if (!knowledge || knowledge.length === 0) return null;
+
+    // 1. 카테고리별 항목 수
+    const byCategory = {};
+    CATEGORIES_TO_SCAN.forEach(c => {
+      byCategory[c] = knowledge.filter(k => k.category === c).length;
+    });
+    const totalItems = knowledge.length;
+    const maxCategoryCount = Math.max(...Object.values(byCategory), 1);
+
+    // 2. 빈/약한 카테고리 (5건 미만)
+    const weakCategories = CATEGORIES_TO_SCAN.filter(c => byCategory[c] < 5);
+    const emptyCategories = CATEGORIES_TO_SCAN.filter(c => byCategory[c] === 0);
+
+    // 3. 평균 항목 길이 (단답형 감지)
+    const lengths = knowledge.map(k => (k.content || "").length);
+    const avgLen = lengths.reduce((a, b) => a + b, 0) / lengths.length;
+    const shortItems = knowledge.filter(k => (k.content || "").length < 30);
+    const shortRatio = totalItems > 0 ? (shortItems.length / totalItems) * 100 : 0;
+
+    // 4. 최근 활동 (30일 이내 갱신된 항목)
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const recentItems = knowledge.filter(k => {
+      if (!k.updated_at) return false;
+      const d = new Date(k.updated_at);
+      return !isNaN(d.getTime()) && d >= thirtyDaysAgo;
+    });
+    const stalecategories = CATEGORIES_TO_SCAN.filter(c => {
+      const items = knowledge.filter(k => k.category === c);
+      if (items.length === 0) return false;
+      // 해당 카테고리 항목 모두가 30일 이상 갱신 안 됐는지
+      return !items.some(k => {
+        if (!k.updated_at) return false;
+        const d = new Date(k.updated_at);
+        return !isNaN(d.getTime()) && d >= thirtyDaysAgo;
+      });
+    });
+
+    // 5. 미해결 충돌 (수동 풀 스캔 + 자동 점검 통합)
+    const manualUnresolved = scanResults
+      ? scanResults.conflicts.filter(c => !c.resolved).length
+      : 0;
+    const autoUnresolved = (autoConflicts || []).filter(c => !c.resolved).length;
+    const unresolvedConflicts = (scanResults || autoConflicts.length > 0)
+      ? manualUnresolved + autoUnresolved
+      : null;
+
+    // 6. 종합 품질 점수 (0~100)
+    // - 카테고리 균형도 (30점): 가장 적은 카테고리가 평균의 몇 % 인가
+    // - 분량 적정성 (25점): 평균 길이 100자 기준
+    // - 단답형 비율 (15점): 단답형이 적을수록 좋음
+    // - 최근 활동 (15점): 30일 내 갱신 비율
+    // - 충돌 정리 (15점): 미해결 0이면 만점, scan 안 했으면 중간 점수
+    const balanceScore = Math.round(
+      (Math.min(...Object.values(byCategory)) / Math.max(maxCategoryCount, 1)) * 30
+    );
+    const lengthScore = Math.min(25, Math.round((avgLen / 100) * 25));
+    const conciseScore = Math.round(15 * (1 - shortRatio / 100));
+    const freshScore = totalItems > 0
+      ? Math.round((recentItems.length / totalItems) * 15)
+      : 0;
+    const conflictScore = unresolvedConflicts == null
+      ? 8 // 검사 안 함 — 중간 점수
+      : (unresolvedConflicts === 0 ? 15 : Math.max(0, 15 - unresolvedConflicts * 3));
+    const totalScore = balanceScore + lengthScore + conciseScore + freshScore + conflictScore;
+
+    // 7. 추천 액션
+    const recommendations = [];
+    if (emptyCategories.length > 0) {
+      recommendations.push(`"${emptyCategories[0]}" 카테고리가 비어 있음 — 학습 추가 필요`);
+    } else if (weakCategories.length > 0) {
+      recommendations.push(`"${weakCategories[0]}" 카테고리 보강 권장 (현재 ${byCategory[weakCategories[0]]}건)`);
+    }
+    if (shortRatio > 20) {
+      recommendations.push(`단답형 항목이 ${shortRatio.toFixed(0)}% — 더 자세히 입력 권장`);
+    }
+    if (stalecategories.length > 0) {
+      recommendations.push(`"${stalecategories[0]}" 30일째 갱신 없음 — 최신화 검토`);
+    }
+    if (unresolvedConflicts && unresolvedConflicts > 0) {
+      if (autoUnresolved > 0) {
+        recommendations.push(`자동 감지된 충돌 ${autoUnresolved}건 — 아래 "자동 감지 결과"에서 검토`);
+      }
+      if (manualUnresolved > 0) {
+        recommendations.push(`수동 검사 미해결 ${manualUnresolved}건 — 아래 "데이터 정리"에서 검토`);
+      }
+    }
+    if (unresolvedConflicts == null && totalItems >= 10) {
+      recommendations.push(`"전체 검사"를 실행해 중복/충돌을 확인해 보세요`);
+    }
+    if (recommendations.length === 0) {
+      recommendations.push(`✨ 학습 상태 양호 — 꾸준히 업데이트하세요`);
+    }
+
+    return {
+      totalScore, byCategory, totalItems, maxCategoryCount,
+      weakCategories, emptyCategories, stalecategories,
+      avgLen, shortItems, shortRatio,
+      recentItems, unresolvedConflicts,
+      recommendations,
+      breakdown: { balanceScore, lengthScore, conciseScore, freshScore, conflictScore },
+    };
+  }, [knowledge, scanResults, autoConflicts]);
+
+  // 품질 점수 색상
+  const qualityColor = (score) => {
+    if (score >= 80) return "#34d399"; // green
+    if (score >= 60) return "#fbbf24"; // amber
+    if (score >= 40) return "#fb923c"; // orange
+    return "#f87171"; // red
+  };
 
   // 카테고리별 풀 검사 (Step 3 수동 검사)
   const startFullScan = async () => {
@@ -2400,6 +3143,167 @@ JSON으로만 답하세요. 충돌 없으면 빈 배열.
         <ProgressBar key={cat} label={cat} value={progress[cat]||0} color={roleInfo.color}/>
       ))}
 
+      {/* ─── 품질 진단 ─── */}
+      {qualityReport && (
+        <div style={{
+          marginTop:18, padding:"14px 16px",
+          background:"rgba(15,23,42,0.5)",
+          border:"1px solid rgba(51,65,85,0.4)",
+          borderRadius:10,
+        }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+            <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1" }}>
+              📊 학습 품질 진단
+            </div>
+            <div style={{
+              padding:"3px 10px",
+              background: `${qualityColor(qualityReport.totalScore)}20`,
+              border: `1px solid ${qualityColor(qualityReport.totalScore)}50`,
+              borderRadius:12,
+              color: qualityColor(qualityReport.totalScore),
+              fontSize:11, fontWeight:800,
+            }}>
+              {qualityReport.totalScore}/100
+            </div>
+          </div>
+
+          {/* 점수 막대 */}
+          <div style={{
+            height:6, background:"rgba(51,65,85,0.4)", borderRadius:3,
+            overflow:"hidden", marginBottom:14,
+          }}>
+            <div style={{
+              width:`${qualityReport.totalScore}%`, height:"100%",
+              background: qualityColor(qualityReport.totalScore),
+              transition:"width 0.4s ease",
+            }}/>
+          </div>
+
+          {/* 카테고리 균형도 */}
+          <div style={{ marginBottom:14 }}>
+            <div style={{ fontSize:10.5, color:"#94a3b8", fontWeight:700, marginBottom:6 }}>
+              📊 카테고리 균형도
+            </div>
+            {CATEGORIES_TO_SCAN.map(cat => {
+              const count = qualityReport.byCategory[cat];
+              const pct = qualityReport.maxCategoryCount > 0
+                ? (count / qualityReport.maxCategoryCount) * 100
+                : 0;
+              const isWeak = count < 5;
+              return (
+                <div key={cat} style={{ marginBottom:5, display:"flex", alignItems:"center", gap:8 }}>
+                  <div style={{ fontSize:10, color:"#94a3b8", width:60, flexShrink:0 }}>{cat}</div>
+                  <div style={{
+                    flex:1, height:6, background:"rgba(51,65,85,0.3)",
+                    borderRadius:3, overflow:"hidden",
+                  }}>
+                    <div style={{
+                      width:`${pct}%`, height:"100%",
+                      background: isWeak ? "#f87171" : roleInfo.color,
+                      opacity: count === 0 ? 0.3 : 1,
+                    }}/>
+                  </div>
+                  <div style={{
+                    fontSize:9.5, color: isWeak ? "#f87171" : "#64748b",
+                    width:30, textAlign:"right", flexShrink:0,
+                  }}>{count}건</div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 데이터 건강도 지표 그리드 */}
+          <div style={{
+            display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:14,
+          }}>
+            <div style={{
+              padding:"8px 10px",
+              background:"rgba(30,41,59,0.5)",
+              borderRadius:6, borderLeft:"3px solid #34d399",
+            }}>
+              <div style={{ fontSize:9, color:"#64748b", marginBottom:2 }}>평균 분량</div>
+              <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1" }}>
+                {Math.round(qualityReport.avgLen)}<span style={{ fontSize:9, color:"#64748b", fontWeight:400 }}>자</span>
+              </div>
+            </div>
+            <div style={{
+              padding:"8px 10px",
+              background:"rgba(30,41,59,0.5)",
+              borderRadius:6,
+              borderLeft: `3px solid ${qualityReport.shortRatio > 20 ? "#fb923c" : "#34d399"}`,
+            }}>
+              <div style={{ fontSize:9, color:"#64748b", marginBottom:2 }}>단답형 비율</div>
+              <div style={{
+                fontSize:13, fontWeight:700,
+                color: qualityReport.shortRatio > 20 ? "#fb923c" : "#cbd5e1",
+              }}>
+                {qualityReport.shortRatio.toFixed(0)}<span style={{ fontSize:9, color:"#64748b", fontWeight:400 }}>%</span>
+              </div>
+            </div>
+            <div style={{
+              padding:"8px 10px",
+              background:"rgba(30,41,59,0.5)",
+              borderRadius:6, borderLeft:"3px solid #a78bfa",
+            }}>
+              <div style={{ fontSize:9, color:"#64748b", marginBottom:2 }}>최근 30일 갱신</div>
+              <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1" }}>
+                {qualityReport.recentItems.length}<span style={{ fontSize:9, color:"#64748b", fontWeight:400 }}>/{qualityReport.totalItems}건</span>
+              </div>
+            </div>
+            <div style={{
+              padding:"8px 10px",
+              background:"rgba(30,41,59,0.5)",
+              borderRadius:6,
+              borderLeft: `3px solid ${
+                qualityReport.unresolvedConflicts == null ? "#64748b"
+                  : qualityReport.unresolvedConflicts === 0 ? "#34d399"
+                  : "#f87171"
+              }`,
+            }}>
+              <div style={{ fontSize:9, color:"#64748b", marginBottom:2 }}>미해결 충돌</div>
+              <div style={{
+                fontSize:13, fontWeight:700,
+                color: qualityReport.unresolvedConflicts == null ? "#64748b"
+                  : qualityReport.unresolvedConflicts === 0 ? "#34d399"
+                  : "#f87171",
+              }}>
+                {qualityReport.unresolvedConflicts == null
+                  ? "—"
+                  : <>{qualityReport.unresolvedConflicts}<span style={{ fontSize:9, color:"#64748b", fontWeight:400 }}>건</span></>
+                }
+              </div>
+            </div>
+          </div>
+
+          {/* 추천 액션 */}
+          <div style={{
+            padding:"10px 12px",
+            background:"rgba(167,139,250,0.06)",
+            border:"1px solid rgba(167,139,250,0.2)",
+            borderRadius:8,
+          }}>
+            <div style={{ fontSize:10.5, color:"#a78bfa", fontWeight:700, marginBottom:6 }}>
+              💡 추천 다음 행동
+            </div>
+            {qualityReport.recommendations.map((rec, i) => (
+              <div key={i} style={{
+                fontSize:11, color:"#cbd5e1", lineHeight:1.6,
+                paddingLeft: rec.startsWith("✨") ? 0 : 12,
+                position:"relative",
+              }}>
+                {!rec.startsWith("✨") && (
+                  <span style={{
+                    position:"absolute", left:0, top:0,
+                    color:"#a78bfa",
+                  }}>→</span>
+                )}
+                {rec}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <button onClick={onReload} disabled={loading} style={{
         width:"100%", padding:"10px", marginTop:8,
         background:"rgba(51,65,85,0.3)", border:"1px solid rgba(51,65,85,0.4)",
@@ -2408,6 +3312,141 @@ JSON으로만 답하세요. 충돌 없으면 빈 배열.
       }}>
         {loading ? <><Spinner/>로딩 중...</> : "🔄 최신 데이터 불러오기"}
       </button>
+
+      {/* ─── 자동 감지 결과 (Step 7-4) ─── */}
+      {(autoConflicts.length > 0 || autoCheckBusy) && (
+        <div style={{
+          marginTop:18, padding:"14px 16px",
+          background:"rgba(245,158,11,0.05)",
+          border:"1px solid rgba(245,158,11,0.25)",
+          borderRadius:10,
+        }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+            <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1" }}>
+              ⚡ 자동 감지 결과
+            </div>
+            {autoCheckBusy && (
+              <span style={{
+                background:"rgba(100,116,139,0.15)",
+                border:"1px solid rgba(100,116,139,0.3)",
+                borderRadius:10, padding:"2px 8px",
+                fontSize:9.5, fontWeight:700, color:"#94a3b8",
+                display:"flex", alignItems:"center", gap:4,
+              }}><Spinner/>점검 중</span>
+            )}
+          </div>
+          <div style={{ fontSize:10.5, color:"#64748b", marginBottom:10, lineHeight:1.6 }}>
+            새로 추가된 학습 항목과 기존 항목 간 중복/충돌을 자동으로 검사한 결과입니다.
+            (브라우저 세션에만 저장 · 새로고침 시 초기화)
+          </div>
+
+          {autoConflicts.length === 0 && !autoCheckBusy ? null : autoConflicts.length === 0 ? (
+            <div style={{ fontSize:11, color:"#94a3b8", textAlign:"center", padding:"10px 0" }}>
+              현재 검사 진행 중...
+            </div>
+          ) : (
+            autoConflicts.map((c, idx) => (
+              <div key={idx} style={{
+                background:"rgba(15,23,42,0.6)",
+                border:`1px solid ${c.resolved ? "rgba(52,211,153,0.4)" : "rgba(245,158,11,0.3)"}`,
+                borderRadius:8, padding:"12px 14px", marginBottom:10,
+                opacity: c.resolved ? 0.6 : 1,
+              }}>
+                <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8, flexWrap:"wrap" }}>
+                  <span style={{
+                    background: c.type === "duplicate" ? "rgba(167,139,250,0.2)" : "rgba(245,158,11,0.2)",
+                    color: c.type === "duplicate" ? "#a78bfa" : "#fbbf24",
+                    padding:"2px 7px", borderRadius:4, fontSize:9, fontWeight:800,
+                  }}>{c.type === "duplicate" ? "중복" : "충돌"}</span>
+                  <span style={{ fontSize:10, color:"#64748b" }}>
+                    {c.itemA.category}
+                    {c.itemA.category !== c.itemB.category && ` ↔ ${c.itemB.category}`}
+                  </span>
+                  {c.resolved && (
+                    <span style={{ marginLeft:"auto", fontSize:10, color:"#34d399", fontWeight:700 }}>
+                      ✓ 처리됨
+                    </span>
+                  )}
+                </div>
+
+                {c.reason && (
+                  <div style={{ fontSize:10.5, color:"#94a3b8", marginBottom:8, fontStyle:"italic" }}>
+                    {c.reason}
+                  </div>
+                )}
+
+                <div style={{ marginBottom:6 }}>
+                  <div style={{ fontSize:9.5, color:"#64748b", fontWeight:700, marginBottom:3 }}>새 항목 (A)</div>
+                  <div style={{
+                    fontSize:11, color:"#cbd5e1",
+                    background:"rgba(30,41,59,0.5)", padding:"6px 9px", borderRadius:5,
+                    borderLeft:`2px solid ${roleInfo.color}`,
+                    lineHeight:1.5, wordBreak:"break-word", whiteSpace:"pre-wrap",
+                  }}>{c.itemA.content}</div>
+                </div>
+                <div style={{ marginBottom:c.resolved ? 0 : 8 }}>
+                  <div style={{ fontSize:9.5, color:"#64748b", fontWeight:700, marginBottom:3 }}>기존 항목 (B)</div>
+                  <div style={{
+                    fontSize:11, color:"#cbd5e1",
+                    background:"rgba(30,41,59,0.5)", padding:"6px 9px", borderRadius:5,
+                    borderLeft:"2px solid rgba(100,116,139,0.5)",
+                    lineHeight:1.5, wordBreak:"break-word", whiteSpace:"pre-wrap",
+                  }}>{c.itemB.content}</div>
+                </div>
+
+                {!c.resolved && onResolveAutoConflict && (
+                  <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                    <button
+                      onClick={() => onResolveAutoConflict(idx, "skip")}
+                      style={{
+                        flex:1, padding:"6px 8px",
+                        background:"rgba(51,65,85,0.4)",
+                        border:"1px solid rgba(51,65,85,0.5)",
+                        borderRadius:5, color:"#94a3b8", fontSize:10,
+                        cursor:"pointer", fontWeight:600,
+                      }}
+                    >건너뛰기</button>
+                    <button
+                      onClick={async () => {
+                        // 새 항목 삭제 (B 유지)
+                        try {
+                          await deleteKnowledge(role, c.itemA.category, c.itemA.content);
+                          onResolveAutoConflict(idx, "keep_b");
+                          await onReload();
+                        } catch (e) { alert("처리 실패"); }
+                      }}
+                      style={{
+                        flex:1, padding:"6px 8px",
+                        background:"rgba(239,68,68,0.1)",
+                        border:"1px solid rgba(239,68,68,0.3)",
+                        borderRadius:5, color:"#f87171", fontSize:10,
+                        cursor:"pointer", fontWeight:600,
+                      }}
+                    >A 삭제</button>
+                    <button
+                      onClick={async () => {
+                        // 기존 항목 삭제 (A 유지)
+                        try {
+                          await deleteKnowledge(role, c.itemB.category, c.itemB.content);
+                          onResolveAutoConflict(idx, "keep_a");
+                          await onReload();
+                        } catch (e) { alert("처리 실패"); }
+                      }}
+                      style={{
+                        flex:1, padding:"6px 8px",
+                        background:"rgba(239,68,68,0.1)",
+                        border:"1px solid rgba(239,68,68,0.3)",
+                        borderRadius:5, color:"#f87171", fontSize:10,
+                        cursor:"pointer", fontWeight:600,
+                      }}
+                    >B 삭제</button>
+                  </div>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      )}
 
       {/* 데이터 정리 (풀 검사) */}
       <div style={{
@@ -2820,7 +3859,8 @@ const TABS = [
   { id:1, icon:"📋", label:"업무 규칙" },
   { id:2, icon:"🎯", label:"상황 교정" },
   { id:3, icon:"📄", label:"문서·사진" },
-  { id:4, icon:"🧠", label:"학습 현황" },
+  { id:4, icon:"📚", label:"보관함" },
+  { id:5, icon:"🧠", label:"학습 현황" },
 ];
 
 export default function App() {
@@ -2841,6 +3881,15 @@ export default function App() {
   const [showPdfModeDialog, setShowPdfModeDialog] = useState(false); // PDF 모드 선택 모달
   const [syncPdfMode, setSyncPdfMode] = useState("auto"); // "auto" | "vision"
 
+  // ─── 일관성 자동 점검 (Step 7-4) ───
+  // autoConflicts: 자동 감지된 충돌/중복 (세션 메모리에만 보관, 브라우저 재시작 시 초기화)
+  const [autoConflicts, setAutoConflicts] = useState([]);
+  // 마지막으로 검사한 시점의 knowledge 스냅샷 (signature 비교용)
+  const lastCheckedSignatureRef = useRef(null);
+  // 현재 점검 진행 중인지 (중복 호출 방지)
+  const checkingRef = useRef(false);
+  const [autoCheckBusy, setAutoCheckBusy] = useState(false);
+
   const loadKB = async () => {
     if (!role) return;
     setLoadingKB(true);
@@ -2849,6 +3898,84 @@ export default function App() {
       setKnowledge(data);
     } catch {}
     finally { setLoadingKB(false); }
+  };
+
+  // ─── 일관성 자동 점검: knowledge 변경 감지 → 신규 항목 백그라운드 비교 ───
+  // 동작 원리:
+  // 1. knowledge가 처음 로드되면 lastCheckedSignature를 저장하고 점검 안 함 (기존 데이터)
+  // 2. 이후 knowledge가 늘어나면 새 항목들만 추출해 checkConsistencyForItem 호출
+  // 3. role이 바뀌면 autoConflicts와 signature 모두 초기화
+  useEffect(() => {
+    // 역할 변경 시 초기화
+    setAutoConflicts([]);
+    lastCheckedSignatureRef.current = null;
+    checkingRef.current = false;
+    setAutoCheckBusy(false);
+  }, [role]);
+
+  useEffect(() => {
+    if (!role || !knowledge || knowledge.length === 0) return;
+    if (checkingRef.current) return; // 진행 중이면 스킵
+
+    // signature: 항목 식별 (category|content|updated_at)
+    const buildSig = (k) => `${k.category}|${k.content}|${k.updated_at || ""}`;
+    const currentSigs = new Set(knowledge.map(buildSig));
+
+    // 첫 로드: signature만 저장하고 점검 X
+    if (lastCheckedSignatureRef.current === null) {
+      lastCheckedSignatureRef.current = currentSigs;
+      return;
+    }
+
+    // 신규 항목 추출
+    const newItems = knowledge.filter(k => !lastCheckedSignatureRef.current.has(buildSig(k)));
+    if (newItems.length === 0) {
+      // 추가된 항목 없음 (삭제만 일어났을 수 있음) → signature만 갱신
+      lastCheckedSignatureRef.current = currentSigs;
+      return;
+    }
+
+    // 백그라운드 점검 (non-blocking)
+    checkingRef.current = true;
+    setAutoCheckBusy(true);
+    (async () => {
+      try {
+        const allFindings = [];
+        // 신규 항목이 너무 많으면 최근 5건까지만 (대량 일괄 학습 시 토큰 폭주 방지)
+        const targets = newItems.slice(-5);
+        for (const item of targets) {
+          // 비교 대상은 점검 시점의 신규 외 기존 데이터
+          const existing = knowledge.filter(k => buildSig(k) !== buildSig(item));
+          const findings = await checkConsistencyForItem(item, existing);
+          if (findings.length > 0) allFindings.push(...findings);
+        }
+        if (allFindings.length > 0) {
+          setAutoConflicts(prev => {
+            // 같은 쌍 중복 추가 방지
+            const seen = new Set(prev.map(c =>
+              `${c.itemA.category}|${c.itemA.content}|${c.itemB.category}|${c.itemB.content}`
+            ));
+            const fresh = allFindings.filter(c =>
+              !seen.has(`${c.itemA.category}|${c.itemA.content}|${c.itemB.category}|${c.itemB.content}`)
+            );
+            return [...prev, ...fresh];
+          });
+        }
+      } catch (e) {
+        console.warn("[자동 점검] 실패:", e.message);
+      } finally {
+        lastCheckedSignatureRef.current = currentSigs;
+        checkingRef.current = false;
+        setAutoCheckBusy(false);
+      }
+    })();
+  }, [knowledge, role]);
+
+  // 충돌을 해결됨으로 표시 (TabStatus에서 사용)
+  const markAutoConflictResolved = (idx, resolvedAs) => {
+    setAutoConflicts(prev => prev.map((c, i) =>
+      i === idx ? { ...c, resolved: true, resolvedAs } : c
+    ));
   };
 
   // 학습자료 폴더 스캔 (학습 화면 진입 시 자동)
@@ -3173,7 +4300,11 @@ export default function App() {
     <TabRules role={role} roleInfo={roleInfo}/>,
     <TabCorrection role={role} roleInfo={roleInfo} knowledge={knowledge}/>,
     <TabDocument role={role} roleInfo={roleInfo}/>,
-    <TabStatus role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}/>,
+    <TabLibrary role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}/>,
+    <TabStatus role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}
+      autoConflicts={autoConflicts}
+      autoCheckBusy={autoCheckBusy}
+      onResolveAutoConflict={markAutoConflictResolved}/>,
   ];
 
   return (
