@@ -533,10 +533,18 @@ JSON으로만 답하세요. 다른 설명 없이.
 
 // JSON 파싱
 function safeJSON(raw) {
-  const cleaned = raw.replace(/```json|```/gi, "").trim();
+  const cleaned = (raw || "").replace(/```json|```/gi, "").trim();
   const s = cleaned.indexOf("{"), e = cleaned.lastIndexOf("}");
-  if (s === -1 || e === -1) throw new Error("JSON 없음");
-  return JSON.parse(cleaned.slice(s, e + 1));
+  if (s === -1 || e === -1) {
+    // 진짜 원인을 알 수 있도록 raw 응답을 에러 메시지에 포함
+    const preview = (cleaned || "").slice(0, 200) || "(빈 응답)";
+    throw new Error(`AI가 JSON 형식으로 답하지 않았습니다. 응답: ${preview}`);
+  }
+  try {
+    return JSON.parse(cleaned.slice(s, e + 1));
+  } catch (parseErr) {
+    throw new Error(`JSON 파싱 실패: ${parseErr.message}`);
+  }
 }
 
 // ─── 일관성 자동 점검 (Step 7-4) ────────────────────────────────────────────
@@ -1064,40 +1072,129 @@ ${dataText.slice(0, 8000)}
 
   const saveChat = async () => {
     setSaving(true);
-    try {
-      const conv = msgs.map(m => `${m.role==="user"?"사용자":"AI"}: ${m.content}`).join("\n");
-      const system = `대화에서 ${roleInfo.label} 업무 정보를 추출해 JSON만 출력:
-{"공장정보":"공장/제품/공정 요약","업무역할":"${role} 담당 업무","협업방식":"타 엔지니어 소통 방식"}`;
-      const raw = await callClaude(system, conv);
-      const parsed = safeJSON(raw);
+    let stage = "준비"; // 어느 단계에서 실패했는지 추적
 
-      // 각 카테고리별로 충돌 검사 후 처리
+    try {
+      // ─── 0단계: 메시지가 충분한지 확인 ───
+      stage = "사전 검증";
+      const userMsgs = msgs.filter(m => m.role === "user");
+      if (userMsgs.length < 2) {
+        alert("저장할 만큼 대화가 충분하지 않습니다. (사용자 메시지 2개 이상 필요)");
+        return;
+      }
+
+      // ─── 1단계: AI에 정보 추출 요청 ───
+      stage = "AI 정보 추출";
+      const conv = msgs.map(m => `${m.role === "user" ? "사용자" : "AI"}: ${m.content}`).join("\n");
+
+      // 시스템 프롬프트 강화: JSON만, 정보 없으면 빈 문자열
+      const system = `대화에서 ${roleInfo.label} 업무 정보를 추출해 JSON으로만 답하세요. 다른 설명 없이 JSON만.
+
+추출 규칙:
+- 각 카테고리에 해당 정보가 있으면 한 줄로 요약
+- 정보가 없거나 불충분하면 빈 문자열 ""
+- 절대 일반 텍스트로 답하지 말 것
+
+응답 형식 (정확히 이 키 사용):
+{"공장정보":"","업무역할":"","협업방식":""}`;
+
+      let raw;
+      try {
+        raw = await callClaude(system, conv);
+      } catch (apiErr) {
+        throw new Error(`AI 호출 실패: ${apiErr.message || "네트워크 오류"}`);
+      }
+
+      // ─── 2단계: JSON 파싱 ───
+      stage = "JSON 파싱";
+      let parsed;
+      try {
+        parsed = safeJSON(raw);
+      } catch (parseErr) {
+        // raw 응답을 콘솔에 남겨서 사후 분석 가능하게
+        console.error("[saveChat] JSON 파싱 실패. AI 응답 원문:", raw);
+        throw new Error(`AI가 추출 가능한 정보를 인식하지 못했습니다. ${parseErr.message}`);
+      }
+
+      // ─── 3단계: 비어있지 않은 항목만 추리기 ───
+      stage = "유효 항목 검증";
+      const validEntries = Object.entries(parsed)
+        .filter(([cat, content]) => content && typeof content === "string" && content.trim().length > 0);
+
+      if (validEntries.length === 0) {
+        alert("대화에서 추출할 만한 업무 정보가 없습니다. 더 구체적으로 대화해 주세요.");
+        return;
+      }
+
+      // ─── 4단계: 카테고리별 저장 (각 항목 독립 try/catch — 부분 성공 허용) ───
+      stage = "시트 저장";
       const conflicts = [];
-      for (const [cat, content] of Object.entries(parsed)) {
-        if (!content) continue;
-        const conflict = await checkConflict(role, cat, content);
-        if (conflict) {
-          conflicts.push({ category: cat, content, conflict });
-        } else {
-          await saveToSheet(role, cat, content);
+      const savedCats = [];
+      const failedCats = [];
+
+      for (const [cat, content] of validEntries) {
+        try {
+          const conflict = await checkConflict(role, cat, content);
+          if (conflict) {
+            conflicts.push({ category: cat, content, conflict });
+          } else {
+            await saveToSheet(role, cat, content);
+            savedCats.push(cat);
+          }
+        } catch (itemErr) {
+          console.error(`[saveChat] '${cat}' 저장 실패:`, itemErr);
+          failedCats.push({ cat, msg: itemErr.message || "알 수 없는 오류" });
         }
       }
 
-      // 충돌 항목들을 큐에 쌓아 사용자가 차례로 처리
+      // ─── 5단계: 충돌 큐 + 결과 메시지 ───
       if (conflicts.length > 0) {
         setConflictQueue(conflicts);
       }
 
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-
-      // 5건 누적 시 백그라운드에서 요약 재생성
-      const countData = await loadSummaryCount(role);
-      if (countData && countData.count >= 5) {
-        regenerateSummary(); // await 안 함 (백그라운드 실행)
+      // 결과별 사용자 알림
+      if (savedCats.length > 0 && failedCats.length === 0 && conflicts.length === 0) {
+        // 전체 성공 — 토스트만
+        setSaved(true);
+        setTimeout(() => setSaved(false), 3000);
+      } else if (savedCats.length > 0 && (failedCats.length > 0 || conflicts.length > 0)) {
+        // 부분 성공
+        const parts = [`${savedCats.length}개 저장됨 (${savedCats.join(", ")})`];
+        if (conflicts.length > 0) parts.push(`${conflicts.length}개 충돌 검토 필요`);
+        if (failedCats.length > 0) parts.push(`${failedCats.length}개 실패: ${failedCats.map(f => f.cat).join(", ")}`);
+        alert(parts.join("\n"));
+        setSaved(true);
+        setTimeout(() => setSaved(false), 3000);
+      } else if (savedCats.length === 0 && conflicts.length > 0) {
+        // 모두 충돌만 — 충돌 모달이 알아서 뜨므로 별도 알림 X
+        setSaved(true);
+        setTimeout(() => setSaved(false), 3000);
+      } else {
+        // 전부 실패
+        const detail = failedCats.map(f => `· ${f.cat}: ${f.msg}`).join("\n");
+        alert(`저장 실패\n\n${detail}`);
+        return;
       }
-    } catch { alert("저장 실패. 다시 시도해주세요."); }
-    finally { setSaving(false); }
+
+      // ─── 6단계: 백그라운드 요약 재생성 ───
+      stage = "요약 재생성";
+      try {
+        const countData = await loadSummaryCount(role);
+        if (countData && countData.count >= 5) {
+          regenerateSummary(); // await 안 함 (백그라운드)
+        }
+      } catch (summaryErr) {
+        // 요약 재생성 실패는 저장 자체엔 영향 없음 — 콘솔에만
+        console.warn("[saveChat] 요약 재생성 실패 (저장은 정상):", summaryErr);
+      }
+
+    } catch (e) {
+      // 진짜 에러 메시지를 콘솔과 사용자 모두에게 노출
+      console.error(`[saveChat] '${stage}' 단계에서 실패:`, e);
+      alert(`저장 실패 (${stage} 단계)\n\n${e.message || "알 수 없는 오류"}\n\n다시 시도하거나 콘솔(F12)을 확인해 주세요.`);
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
