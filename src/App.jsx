@@ -972,25 +972,41 @@ ${summaryData.content}
     setMsgs(newMsgs);
     setLoading(true);
     try {
-      // ─── 디테일 모드 감지 ───
-      // 사용자가 구체적/디테일한 정보를 원하는지 키워드로 판단
-      const detailKeywords = ["상세", "자세히", "정확", "구체적", "수치", "값", "기준", "정확한", "어떤", "뭐였", "무엇", "얼마"];
+      // ─── 디테일 모드: 잡담 감지 기반 (Step 7-7) ───
+      // 기존엔 특정 키워드 있을 때만 학습 데이터를 봤는데,
+      // 사용자가 매번 "상세히"를 붙여야 하는 부자연스러움이 있어
+      // → 기본 ON, 명백한 잡담만 OFF.
+
+      const trimmed = msg.trim();
+      const wordCount = trimmed.split(/\s+/).length;
+
+      // 명백한 잡담/짧은 응답 패턴 (디테일 모드 OFF)
+      const chitchatPatterns = [
+        /^(안녕|하이|hi|hello|반가|감사|고마워|고맙|땡큐|thanks?)/i,
+        /^(응|네|예|ㅇㅇ|ㄴㄴ|아니|noo*|yes|ok|okay|오케이)$/i,
+        /^(잘\s*있|좋아|좋네|괜찮|굿|good|great|nice)/,
+        /^(ㅋ+|ㅎ+|ㅠ+|ㅜ+|ㅡㅡ)$/,
+      ];
+      const isChitchat = wordCount <= 2 && chitchatPatterns.some(re => re.test(trimmed));
+
+      // 카테고리 키워드 매칭 (있으면 해당 카테고리만 우선 추출)
       const categoryKeywords = {
-        "공장정보": ["공장", "제품", "공정", "라인"],
+        "공장정보": ["공장", "제품", "공정", "라인", "설비", "장비"],
         "업무역할": ["역할", "업무", "담당", "책임"],
-        "판단기준": ["판단", "기준", "결정", "우선순위", "보고", "에스컬레이션"],
+        "판단기준": ["판단", "기준", "결정", "우선순위", "에스컬레이션"],
         "협업방식": ["협업", "협조", "소통", "보고", "회의"],
         "교정사례": ["사례", "케이스", "예시", "이전", "지난번"],
       };
-
-      const isDetailMode = detailKeywords.some(kw => msg.includes(kw));
       const matchedCategories = Object.entries(categoryKeywords)
         .filter(([_, kws]) => kws.some(kw => msg.includes(kw)))
         .map(([cat]) => cat);
 
+      // 디테일 모드 결정: 잡담이 아니면 ON
+      const isDetailMode = !isChitchat;
+
       // 디테일 모드면 원본 데이터 로드
       let detailContext = "";
-      if (isDetailMode || matchedCategories.length > 0) {
+      if (isDetailMode) {
         const allKnowledge = await loadFromSheet(role);
         // _요약은 제외
         const filtered = allKnowledge.filter(k => k.category !== "_요약");
@@ -1005,7 +1021,7 @@ ${summaryData.content}
           // 너무 많으면 최신 30건까지만
           const limited = targetData.slice(-30);
           const dataText = limited.map(k => `[${k.category}] ${k.content}`).join("\n");
-          detailContext = `\n\n[참고 - 원본 학습 데이터 ${matchedCategories.length > 0 ? `(${matchedCategories.join(", ")} 카테고리)` : "(전체)"}]\n${dataText.slice(0, 6000)}\n\n위 원본 데이터에서 정확한 정보를 찾아 답변하세요.`;
+          detailContext = `\n\n[참고 - 원본 학습 데이터 ${matchedCategories.length > 0 ? `(${matchedCategories.join(", ")} 카테고리)` : "(전체)"}]\n${dataText.slice(0, 6000)}\n\n위 원본 데이터에서 정확한 정보를 찾아 답변하세요. 학습된 내용에 관한 질문이면 반드시 위 데이터를 근거로 답하고, 없는 정보는 모른다고 답하세요.`;
         }
       }
 
