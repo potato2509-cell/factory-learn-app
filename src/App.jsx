@@ -1028,29 +1028,14 @@ ${summaryData.content}
         const allKnowledge = await loadFromSheet(role);
         const filtered = allKnowledge.filter(k => k.category !== "_요약" && k.content);
 
-        // ─── 디버그 (Step 7-8 진단) ───
-        console.log("[채팅 진단] role:", role);
-        console.log("[채팅 진단] allKnowledge.length:", allKnowledge.length);
-        console.log("[채팅 진단] filtered.length:", filtered.length);
-        console.log("[채팅 진단] 카테고리별 분포:", filtered.reduce((acc, k) => {
-          acc[k.category] = (acc[k.category] || 0) + 1;
-          return acc;
-        }, {}));
-        // "Ceramic"이 들어간 항목이 있는지 즉시 확인
-        const ceramicItems = filtered.filter(k => (k.content || "").toLowerCase().includes("ceramic"));
-        console.log("[채팅 진단] 'ceramic' 포함 항목 수:", ceramicItems.length);
-        if (ceramicItems.length > 0) {
-          console.log("[채팅 진단] 첫 ceramic 항목:", ceramicItems[0].content.slice(0, 150));
-        }
-        // "외부학습" 태그 들어간 항목 수
-        const externalItems = filtered.filter(k => (k.content || "").includes("외부학습"));
-        console.log("[채팅 진단] '외부학습' 태그 항목 수:", externalItems.length);
-
         if (filtered.length > 0) {
           const tokens = extractTokens(trimmed);
-          console.log("[채팅 진단] 추출 토큰:", tokens);
 
-          // 각 항목 점수 계산
+          // 각 항목 점수 계산 (Step 7-9 보완):
+          //   - 출현 횟수 cap (3회): 한 항목 안에서 같은 토큰이 N번 반복돼도 가중 안 함
+          //     → 자동학습 PDF 메타처럼 단어 반복이 많은 항목이 부당하게 점수 폭증하는 것 방지
+          //   - 자동학습 PDF 메타 항목 페널티 (×0.4): 파일명/페이지 URL뿐인 메타 항목은
+          //     실제 정보 항목보다 후순위로 밀어냄
           const scored = filtered.map(k => {
             const content = (k.content || "").toLowerCase();
             let score = 0;
@@ -1058,6 +1043,7 @@ ${summaryData.content}
             for (const tok of tokens) {
               const lowerTok = tok.toLowerCase();
               if (!lowerTok) continue;
+              // 출현 횟수 카운트
               let count = 0;
               let idx = 0;
               while ((idx = content.indexOf(lowerTok, idx)) !== -1) {
@@ -1066,31 +1052,33 @@ ${summaryData.content}
               }
               if (count > 0) {
                 matchedTokens++;
-                score += tok.length * Math.log(1 + count);
+                // 출현 횟수 cap → 3회 초과는 점수 안 늘림 (다회 등장 가중 폭증 차단)
+                const cappedCount = Math.min(count, 3);
+                score += tok.length * Math.log(1 + cappedCount);
               }
             }
+            // 매칭 토큰 다양성 가중치
             score += matchedTokens * 2;
+
+            // 자동학습 PDF 메타 항목 페널티
+            // 패턴: "[파일: xxx.pdf] [PDF: xxx.pdf - 그림 분석, N페이지]" 또는 페이지 URL만 다수
+            const rawContent = k.content || "";
+            const isAutoMeta = /^\[파일:\s*[^\]]+\.(pdf|png|jpg|jpeg)\]\s*\[(PDF|이미지)/i.test(rawContent);
+            if (isAutoMeta) {
+              score *= 0.4;
+            }
+
             return { item: k, score, matchedTokens };
           });
 
+          // 점수 0보다 큰 것만 우선, 점수 내림차순 정렬
           const matched = scored
             .filter(s => s.score > 0)
             .sort((a, b) => b.score - a.score);
           topMatchCount = matched.length;
           usedScoring = matched.length > 0;
 
-          // ─── 디버그: 매칭 결과 ───
-          console.log("[채팅 진단] 점수>0 매칭 항목 수:", matched.length);
-          if (matched.length > 0) {
-            console.log("[채팅 진단] 상위 3건:", matched.slice(0, 3).map(s => ({
-              score: s.score.toFixed(2),
-              matchedTokens: s.matchedTokens,
-              preview: s.item.content.slice(0, 80),
-            })));
-          } else {
-            console.log("[채팅 진단] ⚠️ 매칭 0건 — fallback 작동 예정");
-          }
-
+          // 우선순위 항목 (점수 매칭) → 6000자 cap까지 채우기
           const selected = [];
           let usedChars = 0;
           const HARD_CAP = 6000;
@@ -1098,9 +1086,10 @@ ${summaryData.content}
             const formatted = `[${s.item.category}] ${s.item.content}`;
             if (usedChars + formatted.length > HARD_CAP) break;
             selected.push(formatted);
-            usedChars += formatted.length + 1;
+            usedChars += formatted.length + 1; // \n 포함
           }
 
+          // 남는 공간 → 매칭 안 된 최근 항목으로 컨텍스트 보완
           if (usedChars < HARD_CAP * 0.6) {
             const unmatchedRecent = scored
               .filter(s => s.score === 0)
@@ -1113,8 +1102,6 @@ ${summaryData.content}
               usedChars += formatted.length + 1;
             }
           }
-
-          console.log("[채팅 진단] 최종 선택 항목 수:", selected.length, "/ 사용 문자수:", usedChars);
 
           if (selected.length > 0) {
             const header = usedScoring
