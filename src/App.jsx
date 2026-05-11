@@ -972,15 +972,17 @@ ${summaryData.content}
     setMsgs(newMsgs);
     setLoading(true);
     try {
-      // ─── 디테일 모드: 잡담 감지 기반 (Step 7-7) ───
-      // 기존엔 특정 키워드 있을 때만 학습 데이터를 봤는데,
-      // 사용자가 매번 "상세히"를 붙여야 하는 부자연스러움이 있어
-      // → 기본 ON, 명백한 잡담만 OFF.
+      // ─── 디테일 모드: 토큰 점수 기반 매칭 (Step 7-8) ───
+      // 이전 v7: 카테고리 키워드 매칭 → 카테고리 칸막이로 인해 같은 주제도 표현에 따라
+      //          다른 카테고리만 보고 답을 못 함 (예: "Ceramic Bushing 적용된 라인"이
+      //          "라인" 키워드 때문에 공장정보만 매칭되어 교정사례 데이터를 못 봄).
+      // v8: 카테고리 무관, 질문의 단어가 학습 항목 content에 얼마나 매칭되는지
+      //     점수로 정렬하여 우선 포함. 매칭 없으면 최근 N건 추가.
 
       const trimmed = msg.trim();
       const wordCount = trimmed.split(/\s+/).length;
 
-      // 명백한 잡담/짧은 응답 패턴 (디테일 모드 OFF)
+      // 명백한 잡담/짧은 응답 패턴 (디테일 모드 OFF — 학습 데이터 로드 안 함)
       const chitchatPatterns = [
         /^(안녕|하이|hi|hello|반가|감사|고마워|고맙|땡큐|thanks?)/i,
         /^(응|네|예|ㅇㅇ|ㄴㄴ|아니|noo*|yes|ok|okay|오케이)$/i,
@@ -988,40 +990,112 @@ ${summaryData.content}
         /^(ㅋ+|ㅎ+|ㅠ+|ㅜ+|ㅡㅡ)$/,
       ];
       const isChitchat = wordCount <= 2 && chitchatPatterns.some(re => re.test(trimmed));
-
-      // 카테고리 키워드 매칭 (있으면 해당 카테고리만 우선 추출)
-      const categoryKeywords = {
-        "공장정보": ["공장", "제품", "공정", "라인", "설비", "장비"],
-        "업무역할": ["역할", "업무", "담당", "책임"],
-        "판단기준": ["판단", "기준", "결정", "우선순위", "에스컬레이션"],
-        "협업방식": ["협업", "협조", "소통", "보고", "회의"],
-        "교정사례": ["사례", "케이스", "예시", "이전", "지난번"],
-      };
-      const matchedCategories = Object.entries(categoryKeywords)
-        .filter(([_, kws]) => kws.some(kw => msg.includes(kw)))
-        .map(([cat]) => cat);
-
-      // 디테일 모드 결정: 잡담이 아니면 ON
       const isDetailMode = !isChitchat;
 
-      // 디테일 모드면 원본 데이터 로드
+      // 질문에서 의미 토큰 추출
+      // - 한글 2글자 이상 어절 + 영문/숫자 2글자 이상 단어
+      // - 흔한 조사·접속사·의문어 제외 (의미 단어만 남김)
+      const STOPWORDS = new Set([
+        "있는","있어","있음","있나","없는","없어","없음","하는","하고","하면","합니다",
+        "하나요","뭐야","뭐였","뭐지","무엇","어떻","어디","언제","누구","얼마","얼마나",
+        "그리고","그러나","하지만","따라서","그래서","또는","그것","그거","이것","저것",
+        "거기","여기","저기","우리","나는","나의","내가","당신","구체","정확","상세",
+        "자세히","알려","알려줘","말해","말해줘","적용","적용된","대해","대한","위한",
+        "그게","그건","그건가","해줘","해주세요","주세요","해야","해야하","입니다","이야",
+        "이에요","에서","에게","에서는","에는","으로","에서의",
+      ]);
+      const extractTokens = (text) => {
+        const tokens = [];
+        // 한글 어절
+        const koreanWords = text.match(/[가-힣]{2,}/g) || [];
+        koreanWords.forEach(w => {
+          // 조사 제거 시도 (마지막 1글자가 조사이면 제거)
+          const stripped = w.replace(/(은|는|이|가|을|를|에|의|와|과|도|만|랑|로|으로|에서|에게|한테|부터|까지|보다|처럼|같이|마저|밖에|이라|라는|이라는|이라서|라서)$/, "");
+          const final = stripped.length >= 2 ? stripped : w;
+          if (!STOPWORDS.has(final)) tokens.push(final);
+        });
+        // 영문/숫자
+        const enWords = text.match(/[A-Za-z0-9][A-Za-z0-9\-_]{1,}/g) || [];
+        enWords.forEach(w => tokens.push(w));
+        return [...new Set(tokens)]; // 중복 제거
+      };
+
       let detailContext = "";
+      let usedScoring = false;
+      let topMatchCount = 0;
+
       if (isDetailMode) {
         const allKnowledge = await loadFromSheet(role);
-        // _요약은 제외
-        const filtered = allKnowledge.filter(k => k.category !== "_요약");
+        const filtered = allKnowledge.filter(k => k.category !== "_요약" && k.content);
 
-        // 매칭 카테고리가 있으면 해당 카테고리만, 없으면 모든 원본
-        let targetData = filtered;
-        if (matchedCategories.length > 0) {
-          targetData = filtered.filter(k => matchedCategories.includes(k.category));
-        }
+        if (filtered.length > 0) {
+          const tokens = extractTokens(trimmed);
 
-        if (targetData.length > 0) {
-          // 너무 많으면 최신 30건까지만
-          const limited = targetData.slice(-30);
-          const dataText = limited.map(k => `[${k.category}] ${k.content}`).join("\n");
-          detailContext = `\n\n[참고 - 원본 학습 데이터 ${matchedCategories.length > 0 ? `(${matchedCategories.join(", ")} 카테고리)` : "(전체)"}]\n${dataText.slice(0, 6000)}\n\n위 원본 데이터에서 정확한 정보를 찾아 답변하세요. 학습된 내용에 관한 질문이면 반드시 위 데이터를 근거로 답하고, 없는 정보는 모른다고 답하세요.`;
+          // 각 항목 점수 계산: content에 토큰이 몇 개 등장하는지 + 출현 횟수
+          // 짧은 항목은 매칭 1번도 강한 신호 → log scaling으로 가중치 균형
+          const scored = filtered.map(k => {
+            const content = (k.content || "").toLowerCase();
+            let score = 0;
+            let matchedTokens = 0;
+            for (const tok of tokens) {
+              const lowerTok = tok.toLowerCase();
+              if (!lowerTok) continue;
+              // 출현 횟수 카운트
+              let count = 0;
+              let idx = 0;
+              while ((idx = content.indexOf(lowerTok, idx)) !== -1) {
+                count++;
+                idx += lowerTok.length;
+              }
+              if (count > 0) {
+                matchedTokens++;
+                // 토큰 길이 × log(1+출현횟수) → 긴 토큰일수록 가산점
+                score += tok.length * Math.log(1 + count);
+              }
+            }
+            // 매칭 토큰 수 자체에도 가중치 (다양한 키워드 매칭 우선)
+            score += matchedTokens * 2;
+            return { item: k, score, matchedTokens };
+          });
+
+          // 점수 0보다 큰 것만 우선, 점수 내림차순 정렬
+          const matched = scored
+            .filter(s => s.score > 0)
+            .sort((a, b) => b.score - a.score);
+          topMatchCount = matched.length;
+          usedScoring = matched.length > 0;
+
+          // 우선순위 항목 (점수 매칭) → 6000자 cap까지 채우기
+          const selected = [];
+          let usedChars = 0;
+          const HARD_CAP = 6000;
+          for (const s of matched) {
+            const formatted = `[${s.item.category}] ${s.item.content}`;
+            if (usedChars + formatted.length > HARD_CAP) break;
+            selected.push(formatted);
+            usedChars += formatted.length + 1; // \n 포함
+          }
+
+          // 남는 공간 → 매칭 안 된 최근 항목으로 컨텍스트 보완
+          if (usedChars < HARD_CAP * 0.6) {
+            const unmatchedRecent = scored
+              .filter(s => s.score === 0)
+              .slice(-15)
+              .reverse();
+            for (const s of unmatchedRecent) {
+              const formatted = `[${s.item.category}] ${s.item.content}`;
+              if (usedChars + formatted.length > HARD_CAP) break;
+              selected.push(formatted);
+              usedChars += formatted.length + 1;
+            }
+          }
+
+          if (selected.length > 0) {
+            const header = usedScoring
+              ? `[참고 - 원본 학습 데이터 (질문 관련 ${matched.length}건 중 상위 ${selected.length}건)]`
+              : `[참고 - 원본 학습 데이터 (최근 ${selected.length}건)]`;
+            detailContext = `\n\n${header}\n${selected.join("\n")}\n\n위 원본 데이터에서 정확한 정보를 찾아 답변하세요. 학습된 내용에 관한 질문이면 반드시 위 데이터를 근거로 답하고, 데이터에 없는 정보만 모른다고 답하세요. 데이터에 라인·수치·날짜 같은 구체 정보가 있으면 빠뜨리지 말고 답에 포함하세요.`;
+          }
         }
       }
 
@@ -1031,7 +1105,7 @@ ${summaryData.content}
 
       // 공통 학습 데이터 컨텍스트 (모든 에이전트 공유 - 회사 규정/공통 지침)
       // 디테일 모드일 때는 detailContext가 크므로 commonContext는 줄여서 토큰 절약
-      const commonLimit = isDetailMode || matchedCategories.length > 0 ? 2000 : 4000;
+      const commonLimit = isDetailMode ? 2000 : 4000;
       const commonContext = (commonKnowledge && commonKnowledge.length > 0)
         ? `\n\n[공통 회사 규정/지침 - 모든 에이전트 공유]\n${
             commonKnowledge
@@ -1041,11 +1115,18 @@ ${summaryData.content}
           }\n\n위 공통 규정/지침은 ${roleInfo.label} 업무 답변의 기본 전제입니다. 본인 업무 답변이 위 규정과 충돌하지 않도록 답변하세요.`
         : "";
 
+      // 답변 길이 정책: 사실 조회면 300자, 일반 대화면 150자
+      // 사실 조회 추정: 토큰 매칭이 다수 발생했고 잡담이 아닐 때
+      const isFactualQuery = usedScoring && topMatchCount >= 2;
+      const lengthGuide = isFactualQuery
+        ? "300자 이내로 답하되, 학습된 사실(라인·수치·날짜·부품명 등)은 빠뜨리지 말고 모두 포함하세요. 사용자에게 되묻기보다 데이터에서 찾아 답하는 것을 우선하세요."
+        : "150자 이내로 간결하게 한국어로 답하세요.";
+
       const system = `당신은 ${roleInfo.label} AI로 훈련 중입니다.
 사용자가 공장 상황과 ${role} 업무를 알려주면 자연스럽게 대화하며 더 깊이 파악하세요.
 모르는 부분은 추가 질문하고, 중요한 내용은 확인하세요.
 수율/KPI 수치보다 실제 업무 흐름, 협업 방식, 현장 문제에 집중하세요.
-150자 이내로 간결하게 한국어로 답하세요.${summaryContext}${commonContext}${detailContext}`;
+${lengthGuide}${summaryContext}${commonContext}${detailContext}`;
       const reply = await callClaude(system, msg);
       setMsgs(m => [...m, { role:"assistant", content:reply }]);
     } catch {
