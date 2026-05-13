@@ -3235,7 +3235,7 @@ function TabLibrary({ role, roleInfo, knowledge, onReload, loading }) {
   );
 }
 
-function TabStatus({ role, roleInfo, knowledge, onReload, loading, autoConflicts = [], autoCheckBusy = false, onResolveAutoConflict }) {
+function TabStatus({ role, roleInfo, knowledge, onReload, loading, autoConflicts = [], autoCheckBusy = false, onResolveAutoConflict, onStartRelearn, relearning = false, relearnProgress = { current:0, total:0, currentFile:"" } }) {
   const progress = calcProgress(knowledge);
   const [scanning, setScanning] = useState(false);
   const [scanResults, setScanResults] = useState(null); // { conflicts: [...], scannedAt: timestamp }
@@ -3337,6 +3337,19 @@ function TabStatus({ role, roleInfo, knowledge, onReload, loading, autoConflicts
     if (unresolvedConflicts == null && totalItems >= 10) {
       recommendations.push(`"전체 검사"를 실행해 중복/충돌을 확인해 보세요`);
     }
+
+    // 빈약 자동학습 항목 감지 (Step 7-11)
+    // 조건: content가 [파일: 또는 [PDF: 로 시작 AND 길이 < 500자
+    // → 200자 제한 시기에 학습되어 정보 부족한 항목
+    const weakAutoItems = knowledge.filter(k => {
+      const c = k.content || "";
+      if (c.length >= 500) return false;
+      return /^\[(파일|PDF):/i.test(c);
+    });
+    if (weakAutoItems.length > 0) {
+      recommendations.push(`빈약 자동학습 항목 ${weakAutoItems.length}건 — 아래 "재학습"으로 품질 개선 가능`);
+    }
+
     if (recommendations.length === 0) {
       recommendations.push(`✨ 학습 상태 양호 — 꾸준히 업데이트하세요`);
     }
@@ -3346,6 +3359,7 @@ function TabStatus({ role, roleInfo, knowledge, onReload, loading, autoConflicts
       weakCategories, emptyCategories, stalecategories,
       avgLen, shortItems, shortRatio,
       recentItems, unresolvedConflicts,
+      weakAutoItems,
       recommendations,
       breakdown: { balanceScore, lengthScore, conciseScore, freshScore, conflictScore },
     };
@@ -3646,6 +3660,61 @@ JSON으로만 답하세요. 충돌 없으면 빈 배열.
       }}>
         {loading ? <><Spinner/>로딩 중...</> : "🔄 최신 데이터 불러오기"}
       </button>
+
+      {/* ─── 빈약 데이터 재학습 (Step 7-11) ─── */}
+      {qualityReport && qualityReport.weakAutoItems && qualityReport.weakAutoItems.length > 0 && (
+        <div style={{
+          marginTop:18, padding:"14px 16px",
+          background:"rgba(99,102,241,0.05)",
+          border:"1px solid rgba(99,102,241,0.25)",
+          borderRadius:10,
+        }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+            <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1" }}>
+              🔄 빈약 학습 데이터 재학습
+            </div>
+            <span style={{
+              background:"rgba(99,102,241,0.15)",
+              border:"1px solid rgba(99,102,241,0.3)",
+              borderRadius:10, padding:"2px 8px",
+              fontSize:9.5, fontWeight:700, color:"#a5b4fc",
+            }}>{qualityReport.weakAutoItems.length}건</span>
+          </div>
+          <div style={{ fontSize:10.5, color:"#64748b", marginBottom:10, lineHeight:1.6 }}>
+            200자 제한 시기에 학습된 빈약한 자동학습 항목들을 Drive 폴더 원본으로 다시 분석하여
+            품질을 개선합니다. (현재 v10 프롬프트 적용, 청크 분할 자동)
+          </div>
+
+          {relearning ? (
+            <div>
+              <div style={{ fontSize:11, color:"#cbd5e1", marginBottom:6 }}>
+                ⏳ {relearnProgress.current}/{relearnProgress.total} — {relearnProgress.currentFile || "준비 중..."}
+              </div>
+              <div style={{
+                height:6, background:"rgba(51,65,85,0.4)", borderRadius:3, overflow:"hidden",
+              }}>
+                <div style={{
+                  width: relearnProgress.total > 0
+                    ? `${(relearnProgress.current / relearnProgress.total) * 100}%` : "0%",
+                  height:"100%", background:"#a5b4fc",
+                  transition:"width 0.3s ease",
+                }}/>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={onStartRelearn}
+              style={{
+                width:"100%", padding:"10px",
+                background:"rgba(99,102,241,0.15)",
+                border:"1px solid rgba(99,102,241,0.4)",
+                borderRadius:6, color:"#a5b4fc",
+                fontSize:12, fontWeight:700, cursor:"pointer",
+              }}
+            >📥 재학습 시작 ({qualityReport.weakAutoItems.length}건)</button>
+          )}
+        </div>
+      )}
 
       {/* ─── 자동 감지 결과 (Step 7-4) ─── */}
       {(autoConflicts.length > 0 || autoCheckBusy) && (
@@ -4224,6 +4293,205 @@ export default function App() {
   const checkingRef = useRef(false);
   const [autoCheckBusy, setAutoCheckBusy] = useState(false);
 
+  // ─── 빈약 데이터 재학습 (Step 7-11) ─────────────────────────────────
+  // 상태: 모달 표시, 진행률, 결과
+  const [showRelearnDialog, setShowRelearnDialog] = useState(false);
+  const [relearning, setRelearning] = useState(false);
+  const [relearnProgress, setRelearnProgress] = useState({ current: 0, total: 0, currentFile: "" });
+  const [relearnResult, setRelearnResult] = useState(null);
+  const relearnCancelRef = useRef(false);
+
+  // 빈약 항목에서 파일명 추출
+  // 예: "[파일: report.pdf] ..." → "report.pdf"
+  //     "[PDF: scan.pdf - 그림 분석, 6페이지]" → "scan.pdf"
+  const extractFilenameFromWeakItem = (content) => {
+    if (!content) return null;
+    // [파일: xxx.pdf] 또는 [파일: xxx.png] 등
+    const m1 = content.match(/^\[파일:\s*([^\]]+?)\]/);
+    if (m1) return m1[1].trim();
+    // [PDF: xxx.pdf - ...]
+    const m2 = content.match(/^\[PDF:\s*([^\]\s-]+\.pdf)/i);
+    if (m2) return m2[1].trim();
+    return null;
+  };
+
+  // 재학습 실행
+  // - weakItems: 시트의 빈약 항목 배열
+  // - 폴더 스캔 결과(folderScan)에서 파일명 매칭
+  // - 매칭된 파일을 새 학습 흐름으로 다시 분석 → saveToSheet (청크 분할 자동 적용)
+  // - 학습 성공 시 기존 빈약 항목 deleteKnowledge로 삭제
+  const startRelearn = async (weakItems) => {
+    setRelearning(true);
+    relearnCancelRef.current = false;
+    setRelearnResult(null);
+
+    // 폴더 스캔이 안 되어 있으면 먼저 스캔
+    let scan = folderScan;
+    if ((!scan.roleFiles || scan.roleFiles.length === 0) &&
+        (!scan.commonFiles || scan.commonFiles.length === 0)) {
+      try {
+        const res = await fetch(`${APPS_SCRIPT_URL}?action=scan_learning_folder&role=${role}`);
+        const data = await res.json();
+        if (data.success) {
+          scan = { roleFiles: data.roleFiles || [], commonFiles: data.commonFiles || [] };
+          setFolderScan(scan);
+        }
+      } catch (e) {
+        console.error("[재학습] 폴더 스캔 실패:", e);
+      }
+    }
+    const allFolderFiles = [...(scan.roleFiles || []), ...(scan.commonFiles || [])];
+
+    // 빈약 항목별 매칭
+    const matched = []; // { weakItem, file }
+    const notFound = []; // weakItem (Drive에 파일 없음)
+    for (const w of weakItems) {
+      const fname = extractFilenameFromWeakItem(w.content);
+      if (!fname) {
+        notFound.push({ item: w, reason: "파일명 추출 불가" });
+        continue;
+      }
+      const file = allFolderFiles.find(f => f.filename === fname);
+      if (!file) {
+        notFound.push({ item: w, reason: `Drive에 '${fname}' 없음` });
+        continue;
+      }
+      matched.push({ weakItem: w, file });
+    }
+
+    setRelearnProgress({ current: 0, total: matched.length, currentFile: "" });
+
+    let successCount = 0;
+    let failCount = 0;
+    const errors = [];
+
+    for (let i = 0; i < matched.length; i++) {
+      if (relearnCancelRef.current) break;
+
+      const { weakItem, file } = matched[i];
+      setRelearnProgress({ current: i + 1, total: matched.length, currentFile: file.filename });
+
+      try {
+        // 1. 파일 다운로드
+        const fetchResult = await fetchDriveFile(file.fileId);
+        if (!fetchResult.success) {
+          failCount++;
+          errors.push(`${file.filename}: 다운로드 실패 — ${fetchResult.error}`);
+          continue;
+        }
+        const fileData = fetchResult.data;
+        const isImageFile = (fileData.mimetype || "").startsWith("image/");
+        const isPdfFile = (fileData.mimetype || "").includes("pdf") ||
+                          (file.filename || "").toLowerCase().endsWith(".pdf");
+
+        let newContent = null;
+        let category = weakItem.category || "공장정보"; // 기존 카테고리 유지 기본
+
+        if (isImageFile) {
+          // 단일 이미지 재학습 (v10 프롬프트 사용)
+          const folderHint = file.subPath ? `\n폴더 경로: ${file.subPath}` : "";
+          const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
+이 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.${folderHint}
+
+이미지가 매뉴얼·작업 지시서·도면이면 단계·수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음.
+
+다음 4블록 형식:
+[추출 텍스트] (이미지의 실제 내용. 구체값 빠뜨리지 말 것)
+[핵심 정보] (이 이미지가 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
+[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
+          const analyzed = await callClaudeVision(sys, "이 이미지를 분석하세요.", fileData.base64, fileData.mimetype);
+          const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
+          if (catMatch && ["공장정보","업무역할","판단기준","협업방식","교정사례"].includes(catMatch[1])) {
+            category = catMatch[1];
+          }
+          newContent = `[파일: ${file.filename}] ${analyzed}`;
+        } else if (isPdfFile) {
+          // PDF 재학습: 페이지별 분석 후 종합 (단순화: 텍스트 추출 우선, 부족하면 Vision)
+          // pdf.js로 페이지별 처리
+          if (!window.pdfjsLib) {
+            await loadPdfjs();
+          }
+          const pdf = await window.pdfjsLib.getDocument({ data: base64ToUint8Array(fileData.base64) }).promise;
+          const pageCount = pdf.numPages;
+          const pageResults = [];
+          for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
+            if (relearnCancelRef.current) break;
+            const pageBase64 = await pdfPageToBase64(pdf, pageNum);
+            const folderHint = file.subPath ? `\n폴더 경로: ${file.subPath}` : "";
+            const pagePrompt = `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pageCount} 분석.${folderHint}
+
+페이지가 매뉴얼·작업 지시서·도면이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음.
+
+다음 3블록 형식:
+[추출 텍스트] (페이지의 실제 내용. 구체값 빠뜨리지 말 것)
+[핵심 정보] (이 페이지가 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (문서 제목, Rev, 작성일, 페이지 번호 등이 보이면 기재)`;
+            try {
+              const pageRes = await callClaudeVision(pagePrompt, "이 PDF 페이지를 분석하세요.", pageBase64, "image/jpeg");
+              pageResults.push(`━━ 페이지 ${pageNum} ━━\n${pageRes}`);
+            } catch (e) {
+              pageResults.push(`━━ 페이지 ${pageNum} ━━\n(분석 실패)`);
+            }
+          }
+          newContent = `[파일: ${file.filename}] [PDF: ${file.filename} - 그림 분석, ${pageCount}페이지]\n\n${pageResults.join("\n\n")}`;
+        } else {
+          failCount++;
+          errors.push(`${file.filename}: 지원 안 되는 형식`);
+          continue;
+        }
+
+        if (!newContent) {
+          failCount++;
+          errors.push(`${file.filename}: 분석 결과 없음`);
+          continue;
+        }
+
+        // 2. 기존 빈약 항목 삭제
+        try {
+          await deleteKnowledge(role, weakItem.category, weakItem.content);
+        } catch (delErr) {
+          console.warn("[재학습] 기존 항목 삭제 실패 (계속 진행):", delErr);
+        }
+
+        // 3. 새 학습 결과 저장 (청크 분할 자동 적용)
+        await saveToSheet(role, category, newContent);
+        successCount++;
+
+      } catch (e) {
+        failCount++;
+        errors.push(`${file.filename}: ${e.message || "알 수 없는 오류"}`);
+        console.error("[재학습] 처리 실패:", file.filename, e);
+      }
+    }
+
+    // 완료 — 결과 보고
+    setRelearnResult({
+      total: matched.length,
+      success: successCount,
+      failed: failCount,
+      notFound: notFound,
+      errors,
+      cancelled: relearnCancelRef.current,
+    });
+    setRelearning(false);
+
+    // 시트 다시 로드
+    await loadKB();
+  };
+
+  const cancelRelearn = () => {
+    relearnCancelRef.current = true;
+  };
+
+  // base64 → Uint8Array (PDF 처리용)
+  const base64ToUint8Array = (b64) => {
+    const binStr = atob(b64);
+    const bytes = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+    return bytes;
+  };
+
   const loadKB = async () => {
     if (!role) return;
     setLoadingKB(true);
@@ -4646,7 +4914,10 @@ export default function App() {
     <TabStatus role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}
       autoConflicts={autoConflicts}
       autoCheckBusy={autoCheckBusy}
-      onResolveAutoConflict={markAutoConflictResolved}/>,
+      onResolveAutoConflict={markAutoConflictResolved}
+      onStartRelearn={() => setShowRelearnDialog(true)}
+      relearning={relearning}
+      relearnProgress={relearnProgress}/>,
   ];
 
   return (
@@ -4943,6 +5214,191 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* ─── 빈약 데이터 재학습 모달 (Step 7-11) ─── */}
+      {showRelearnDialog && (() => {
+        const weakItems = knowledge.filter(k => {
+          const c = k.content || "";
+          if (c.length >= 500) return false;
+          return /^\[(파일|PDF):/i.test(c);
+        });
+        const fileNameSet = new Set();
+        weakItems.forEach(w => {
+          const c = w.content || "";
+          const m1 = c.match(/^\[파일:\s*([^\]]+?)\]/);
+          const m2 = c.match(/^\[PDF:\s*([^\]\s-]+\.pdf)/i);
+          const fname = m1 ? m1[1].trim() : (m2 ? m2[1].trim() : null);
+          if (fname) fileNameSet.add(fname);
+        });
+        const uniqueFiles = fileNameSet.size;
+        const costEst = (weakItems.length * 0.003).toFixed(3); // 대략 항목당 $0.003
+
+        return (
+          <div style={{
+            position:"fixed", top:0, left:0, right:0, bottom:0,
+            background:"rgba(0,0,0,0.7)", backdropFilter:"blur(4px)",
+            display:"flex", alignItems:"center", justifyContent:"center",
+            zIndex:1000, padding:"16px",
+          }}>
+            <div style={{
+              background:"#0f172a", border:`1.5px solid ${roleInfo.color}40`,
+              borderRadius:14, padding:"20px", maxWidth:540, width:"100%",
+              maxHeight:"90vh", overflowY:"auto",
+            }}>
+              {!relearning && !relearnResult && (
+                <>
+                  <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:6 }}>
+                    🔄 빈약 학습 데이터 재학습
+                  </div>
+                  <div style={{ fontSize:12, color:"#94a3b8", marginBottom:14, lineHeight:1.6 }}>
+                    빈약하게 학습된 항목을 Drive 폴더의 원본 파일로 다시 분석합니다.
+                    새 v10 프롬프트 (글자수 제한 없음 + 3블록 형식) + 청크 분할 자동 적용.
+                  </div>
+
+                  <div style={{
+                    background:"rgba(15,23,42,0.6)", borderRadius:8,
+                    padding:"12px 14px", marginBottom:14,
+                  }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
+                      <span style={{ fontSize:11, color:"#64748b" }}>대상 항목</span>
+                      <span style={{ fontSize:12, color:"#cbd5e1", fontWeight:700 }}>{weakItems.length}건</span>
+                    </div>
+                    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
+                      <span style={{ fontSize:11, color:"#64748b" }}>고유 파일 수</span>
+                      <span style={{ fontSize:12, color:"#cbd5e1", fontWeight:700 }}>{uniqueFiles}개</span>
+                    </div>
+                    <div style={{ display:"flex", justifyContent:"space-between" }}>
+                      <span style={{ fontSize:11, color:"#64748b" }}>예상 비용</span>
+                      <span style={{ fontSize:12, color:"#a5b4fc", fontWeight:700 }}>약 ${costEst}</span>
+                    </div>
+                  </div>
+
+                  <div style={{
+                    fontSize:10.5, color:"#fbbf24",
+                    background:"rgba(245,158,11,0.08)",
+                    border:"1px solid rgba(245,158,11,0.2)",
+                    borderRadius:6, padding:"8px 10px", marginBottom:14, lineHeight:1.6,
+                  }}>
+                    ⚠️ Drive 학습자료 폴더에 원본 파일이 있어야 합니다.
+                    파일이 없는 항목은 자동 스킵되고 결과에 보고됩니다.
+                    기존 빈약 항목은 새 학습 성공 시 자동 삭제됩니다.
+                  </div>
+
+                  <div style={{ display:"flex", gap:8 }}>
+                    <button
+                      onClick={() => setShowRelearnDialog(false)}
+                      style={{
+                        flex:1, padding:"10px",
+                        background:"rgba(51,65,85,0.4)",
+                        border:"1px solid rgba(51,65,85,0.5)",
+                        borderRadius:6, color:"#94a3b8",
+                        fontSize:12, fontWeight:600, cursor:"pointer",
+                      }}
+                    >취소</button>
+                    <button
+                      onClick={() => startRelearn(weakItems)}
+                      style={{
+                        flex:2, padding:"10px",
+                        background:"rgba(99,102,241,0.2)",
+                        border:"1px solid rgba(99,102,241,0.5)",
+                        borderRadius:6, color:"#a5b4fc",
+                        fontSize:12, fontWeight:700, cursor:"pointer",
+                      }}
+                    >📥 재학습 시작</button>
+                  </div>
+                </>
+              )}
+
+              {relearning && (
+                <>
+                  <div style={{ fontSize:16, fontWeight:800, color:"#f1f5f9", marginBottom:14 }}>
+                    🔄 재학습 진행 중
+                  </div>
+                  <div style={{ fontSize:11, color:"#cbd5e1", marginBottom:8 }}>
+                    {relearnProgress.current}/{relearnProgress.total} — {relearnProgress.currentFile || "준비 중..."}
+                  </div>
+                  <div style={{
+                    height:8, background:"rgba(51,65,85,0.4)", borderRadius:4, overflow:"hidden",
+                    marginBottom:14,
+                  }}>
+                    <div style={{
+                      width: relearnProgress.total > 0
+                        ? `${(relearnProgress.current / relearnProgress.total) * 100}%` : "0%",
+                      height:"100%", background:"#a5b4fc",
+                      transition:"width 0.3s ease",
+                    }}/>
+                  </div>
+                  <button
+                    onClick={cancelRelearn}
+                    style={{
+                      width:"100%", padding:"8px",
+                      background:"rgba(239,68,68,0.1)",
+                      border:"1px solid rgba(239,68,68,0.3)",
+                      borderRadius:6, color:"#f87171",
+                      fontSize:11, fontWeight:600, cursor:"pointer",
+                    }}
+                  >⏹ 중단</button>
+                </>
+              )}
+
+              {relearnResult && (
+                <>
+                  <div style={{ fontSize:16, fontWeight:800, color:"#f1f5f9", marginBottom:14 }}>
+                    {relearnResult.cancelled ? "⏹ 재학습 중단됨" : "✅ 재학습 완료"}
+                  </div>
+                  <div style={{
+                    background:"rgba(15,23,42,0.6)", borderRadius:8,
+                    padding:"12px 14px", marginBottom:14, fontSize:11.5,
+                  }}>
+                    <div style={{ marginBottom:6, color:"#34d399" }}>
+                      ✓ 성공: <b>{relearnResult.success}</b>건
+                    </div>
+                    {relearnResult.failed > 0 && (
+                      <div style={{ marginBottom:6, color:"#f87171" }}>
+                        ✗ 실패: <b>{relearnResult.failed}</b>건
+                      </div>
+                    )}
+                    {relearnResult.notFound.length > 0 && (
+                      <div style={{ color:"#fbbf24" }}>
+                        ⚠ Drive 파일 없음: <b>{relearnResult.notFound.length}</b>건
+                      </div>
+                    )}
+                  </div>
+
+                  {(relearnResult.errors.length > 0 || relearnResult.notFound.length > 0) && (
+                    <div style={{
+                      maxHeight:200, overflowY:"auto",
+                      background:"rgba(15,23,42,0.5)", borderRadius:6,
+                      padding:"8px 10px", marginBottom:14, fontSize:10.5,
+                      color:"#94a3b8", lineHeight:1.6,
+                    }}>
+                      {relearnResult.errors.map((e, i) => (
+                        <div key={`err-${i}`} style={{ color:"#fca5a5" }}>· {e}</div>
+                      ))}
+                      {relearnResult.notFound.map((n, i) => (
+                        <div key={`nf-${i}`} style={{ color:"#fbbf24" }}>
+                          · {n.reason}: {(n.item.content || "").slice(0, 50)}...
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <button
+                    onClick={() => { setShowRelearnDialog(false); setRelearnResult(null); }}
+                    style={{
+                      width:"100%", padding:"10px",
+                      background:"rgba(99,102,241,0.15)",
+                      border:"1px solid rgba(99,102,241,0.4)",
+                      borderRadius:6, color:"#a5b4fc",
+                      fontSize:12, fontWeight:700, cursor:"pointer",
+                    }}
+                  >확인</button>
+                </>
+              )}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* PDF 처리 방식 선택 모달 (Step 5-C 보강) */}
       {showPdfModeDialog && (() => {
