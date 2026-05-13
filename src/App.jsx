@@ -4386,20 +4386,21 @@ export default function App() {
     relearnCancelRef.current = false;
     setRelearnResult(null);
 
-    // 폴더 스캔이 안 되어 있으면 먼저 스캔
-    let scan = folderScan;
-    if ((!scan.roleFiles || scan.roleFiles.length === 0) &&
-        (!scan.commonFiles || scan.commonFiles.length === 0)) {
-      try {
-        const res = await fetch(`${APPS_SCRIPT_URL}?action=scan_learning_folder&role=${role}`);
-        const data = await res.json();
-        if (data.success) {
-          scan = { roleFiles: data.roleFiles || [], commonFiles: data.commonFiles || [] };
-          setFolderScan(scan);
-        }
-      } catch (e) {
-        console.error("[재학습] 폴더 스캔 실패:", e);
+    // 재학습 전용 폴더 스캔 (Step 7-11 v6)
+    // - scan_learning_folder는 Processed_Files 필터링으로 이미 학습된 파일을 제외함
+    // - 재학습은 정작 그 파일들이 필요하므로 _all 액션 사용
+    // - 기존 folderScan state(학습 화면용)는 무시하고 항상 새로 스캔
+    let scan = { roleFiles: [], commonFiles: [] };
+    try {
+      const res = await fetch(`${APPS_SCRIPT_URL}?action=scan_learning_folder_all&role=${role}`);
+      const data = await res.json();
+      if (data.success) {
+        scan = { roleFiles: data.roleFiles || [], commonFiles: data.commonFiles || [] };
+      } else {
+        console.error("[재학습] 폴더 스캔 실패:", data.error);
       }
+    } catch (e) {
+      console.error("[재학습] 폴더 스캔 오류:", e);
     }
     const allFolderFiles = [...(scan.roleFiles || []), ...(scan.commonFiles || [])];
 
