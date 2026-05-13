@@ -632,12 +632,16 @@ function safeJSON(raw) {
   }
 }
 
-// ─── 빈약 자동학습 항목 감지 (Step 7-11 v2) ─────────────────────────────────
+// ─── 빈약 자동학습 항목 감지 (Step 7-11 v3) ─────────────────────────────────
 // 다중 신호 기반 — 분량만으로 판단하지 않음
 // 신호:
 //   (1) [시각 설명] 블록 존재 → v10 이전 학습 (옛 프롬프트). 가장 강한 신호
 //   (2) 분량 < 500자 + 자동학습 prefix → 기존 짧은 빈약
-//   (3) 분량 대비 정보 밀도 낮음 (페이지당 평균 < 150자)
+//   (3) 분량 대비 정보 밀도 매우 낮음 (페이지 3개 이상 + 페이지당 평균 < 100자)
+//
+// v13 변경: 신호 3을 더 보수적으로 조정 — 풍부한 종합요약이 잘못 잡히는 오탐 방지
+//   - 페이지 마커 3개 이상 (단순 1~2개는 페이지 번호 표기일 수 있어 제외)
+//   - 페이지당 평균 글자수를 150 → 100으로 강화 (진짜 빈약한 것만)
 //
 // 자동학습 항목 식별: [파일: 또는 [PDF: 시작, 또는 PDF 페이지 분석 표지 포함
 function isWeakAutoItem(content) {
@@ -645,7 +649,7 @@ function isWeakAutoItem(content) {
 
   // 자동학습 항목인지 먼저 식별
   const isAutoLearning =
-    /^\[(파일|PDF):/i.test(content) ||
+    /^\[(파일|PDF|자동학습)/i.test(content) ||
     /# PDF 페이지 분석|━━ 페이지 \d+ ━━/.test(content);
   if (!isAutoLearning) return false;
 
@@ -653,14 +657,15 @@ function isWeakAutoItem(content) {
   const hasOldPromptMarker = /\[시각 설명\]|## \[시각 설명\]/.test(content);
   if (hasOldPromptMarker) return true;
 
-  // 신호 2: 짧음 (기존 기준 유지)
+  // 신호 2: 짧음
   if (content.length < 500) return true;
 
-  // 신호 3: 정보 밀도 낮음 — 페이지당 평균 글자수 < 150
+  // 신호 3: 정보 밀도 매우 낮음 — 페이지 3개 이상 + 페이지당 평균 < 100자
+  // (1~2 페이지 마커는 단순 페이지 번호 표기일 수 있으므로 제외)
   const pageMatches = content.match(/━━ 페이지 \d+ ━━|# PDF 페이지 분석 \(\d+\/\d+\)/g);
-  if (pageMatches && pageMatches.length >= 2) {
+  if (pageMatches && pageMatches.length >= 3) {
     const avgPerPage = content.length / pageMatches.length;
-    if (avgPerPage < 150) return true;
+    if (avgPerPage < 100) return true;
   }
 
   return false;
@@ -4333,18 +4338,23 @@ export default function App() {
   const [relearnResult, setRelearnResult] = useState(null);
   const relearnCancelRef = useRef(false);
 
-  // 빈약 항목에서 파일명 추출
-  // 예: "[파일: report.pdf] ..." → "report.pdf"
-  //     "[PDF: scan.pdf - 그림 분석, 6페이지]" → "scan.pdf"
+  // 빈약 항목에서 파일명 추출 (v13: prefix 무관, basename만)
+  // - prefix가 [파일:, [PDF:, [자동학습-, [PDF: xxx - 그림 분석] 등 어떤 형태든 작동
+  // - content 앞 500자에서 첫 파일명 패턴 검색
+  // - subPath 포함된 경로면 basename만 반환 (Drive 스캔 결과의 filename과 매칭)
+  // - "자동학습-" prefix가 파일명 앞에 붙어 추출된 경우 제거
   const extractFilenameFromWeakItem = (content) => {
     if (!content) return null;
-    // [파일: xxx.pdf] 또는 [파일: xxx.png] 등
-    const m1 = content.match(/^\[파일:\s*([^\]]+?)\]/);
-    if (m1) return m1[1].trim();
-    // [PDF: xxx.pdf - ...]
-    const m2 = content.match(/^\[PDF:\s*([^\]\s-]+\.pdf)/i);
-    if (m2) return m2[1].trim();
-    return null;
+    const head = content.slice(0, 500);
+    // 파일명 패턴: 공백·대괄호·슬래시·콜론 등이 아닌 문자 + 확장자
+    const m = head.match(/([^\s\[\]<>:|*?"]+\.(?:pdf|png|jpg|jpeg))/i);
+    if (!m) return null;
+    let fname = m[1];
+    // subPath 제거 — basename만 반환
+    fname = fname.split("/").pop().split("\\").pop();
+    // "자동학습-" prefix 제거 (예: "자동학습-FA롤물류.pdf" → "FA롤물류.pdf")
+    fname = fname.replace(/^자동학습-/, "");
+    return fname.trim();
   };
 
   // 재학습 실행
@@ -4374,16 +4384,18 @@ export default function App() {
     }
     const allFolderFiles = [...(scan.roleFiles || []), ...(scan.commonFiles || [])];
 
-    // 빈약 항목별 매칭
+    // 빈약 항목별 매칭 (v13: basename 비교 — subPath/대소문자 영향 없도록)
     const matched = []; // { weakItem, file }
     const notFound = []; // weakItem (Drive에 파일 없음)
+    const getBasename = (p) => (p || "").split("/").pop().split("\\").pop().trim();
     for (const w of weakItems) {
       const fname = extractFilenameFromWeakItem(w.content);
       if (!fname) {
         notFound.push({ item: w, reason: "파일명 추출 불가" });
         continue;
       }
-      const file = allFolderFiles.find(f => f.filename === fname);
+      const fnameBase = getBasename(fname).toLowerCase();
+      const file = allFolderFiles.find(f => getBasename(f.filename).toLowerCase() === fnameBase);
       if (!file) {
         notFound.push({ item: w, reason: `Drive에 '${fname}' 없음` });
         continue;
