@@ -632,26 +632,23 @@ function safeJSON(raw) {
   }
 }
 
-// ─── 빈약 자동학습 항목 감지 (Step 7-11 v3) ─────────────────────────────────
-// 다중 신호 기반 — 분량만으로 판단하지 않음
+// ─── 빈약 자동학습 항목 감지 (Step 7-11 v4) ─────────────────────────────────
+// v14 변경: 메타 row만 대상으로 — 같은 파일이 여러 row로 분리 저장되는 구조 반영
+//   - 시트는 한 파일 = 메타 row(파일명+URL) + 종합요약 row + 페이지별 row
+//   - 종합요약·페이지별 row를 빈약으로 잡으면 파일명 추출 실패 → "Drive 파일 없음"
+//   - 메타 row만 트리거로 잡고, 재학습 시 같은 파일 다른 row도 함께 정리
+//
+// 메타 row 식별: 자동학습 prefix 시작 + 페이지 URL 다수 또는 [PDF: ...] 메타 형식
 // 신호:
 //   (1) [시각 설명] 블록 존재 → v10 이전 학습 (옛 프롬프트). 가장 강한 신호
-//   (2) 분량 < 500자 + 자동학습 prefix → 기존 짧은 빈약
-//   (3) 분량 대비 정보 밀도 매우 낮음 (페이지 3개 이상 + 페이지당 평균 < 100자)
-//
-// v13 변경: 신호 3을 더 보수적으로 조정 — 풍부한 종합요약이 잘못 잡히는 오탐 방지
-//   - 페이지 마커 3개 이상 (단순 1~2개는 페이지 번호 표기일 수 있어 제외)
-//   - 페이지당 평균 글자수를 150 → 100으로 강화 (진짜 빈약한 것만)
-//
-// 자동학습 항목 식별: [파일: 또는 [PDF: 시작, 또는 PDF 페이지 분석 표지 포함
+//   (2) 분량 < 500자 + 자동학습 prefix → 짧은 빈약
+//   (3) 페이지당 평균 매우 낮음 (페이지 3+ + 평균 <100자)
 function isWeakAutoItem(content) {
   if (!content) return false;
 
-  // 자동학습 항목인지 먼저 식별
-  const isAutoLearning =
-    /^\[(파일|PDF|자동학습)/i.test(content) ||
-    /# PDF 페이지 분석|━━ 페이지 \d+ ━━/.test(content);
-  if (!isAutoLearning) return false;
+  // 메타 row 식별: 자동학습 prefix로 시작 (종합 요약/페이지별 row 제외)
+  const isMetaRow = /^\[(자동학습-|파일:\s*|PDF:\s*)/i.test(content);
+  if (!isMetaRow) return false;
 
   // 신호 1: v10 이전 프롬프트 표지 (가장 신뢰)
   const hasOldPromptMarker = /\[시각 설명\]|## \[시각 설명\]/.test(content);
@@ -661,11 +658,20 @@ function isWeakAutoItem(content) {
   if (content.length < 500) return true;
 
   // 신호 3: 정보 밀도 매우 낮음 — 페이지 3개 이상 + 페이지당 평균 < 100자
-  // (1~2 페이지 마커는 단순 페이지 번호 표기일 수 있으므로 제외)
   const pageMatches = content.match(/━━ 페이지 \d+ ━━|# PDF 페이지 분석 \(\d+\/\d+\)/g);
   if (pageMatches && pageMatches.length >= 3) {
     const avgPerPage = content.length / pageMatches.length;
     if (avgPerPage < 100) return true;
+  }
+
+  // 신호 4 (v14 신규): 메타 row인데 URL 다수 + 본문 적음 → 빈약 메타 row
+  // 페이지 URL이 5개 이상인데 분량이 작으면 본문이 비어 있다는 뜻
+  const urlMatches = (content.match(/\[페이지\d+URL\]/g) || []).length;
+  if (urlMatches >= 5) {
+    // URL이 차지하는 글자 수 추정 (페이지당 약 100자: "[페이지N URL] https://...")
+    const estimatedUrlChars = urlMatches * 100;
+    const bodyChars = content.length - estimatedUrlChars;
+    if (bodyChars < 200) return true; // 본문 200자 미만이면 빈약
   }
 
   return false;
@@ -4338,23 +4344,31 @@ export default function App() {
   const [relearnResult, setRelearnResult] = useState(null);
   const relearnCancelRef = useRef(false);
 
-  // 빈약 항목에서 파일명 추출 (v13: prefix 무관, basename만)
-  // - prefix가 [파일:, [PDF:, [자동학습-, [PDF: xxx - 그림 분석] 등 어떤 형태든 작동
-  // - content 앞 500자에서 첫 파일명 패턴 검색
-  // - subPath 포함된 경로면 basename만 반환 (Drive 스캔 결과의 filename과 매칭)
-  // - "자동학습-" prefix가 파일명 앞에 붙어 추출된 경우 제거
+  // 빈약 항목에서 파일명 추출 (v14: prefix별 명시 패턴, 공백 허용)
+  // 시트의 실제 prefix 형태:
+  //   [자동학습-제작사양서/220421 OHT 제작 사양서 v1.3.pdf] ← 공백 포함
+  //   [파일: 1000228935.jpg]
+  //   [PDF: my-file.pdf - 그림 분석, 11페이지]
+  // 공통: 대괄호 ] 가 종료자. 그 안에 공백 허용.
   const extractFilenameFromWeakItem = (content) => {
     if (!content) return null;
     const head = content.slice(0, 500);
-    // 파일명 패턴: 공백·대괄호·슬래시·콜론 등이 아닌 문자 + 확장자
-    const m = head.match(/([^\s\[\]<>:|*?"]+\.(?:pdf|png|jpg|jpeg))/i);
-    if (!m) return null;
-    let fname = m[1];
-    // subPath 제거 — basename만 반환
-    fname = fname.split("/").pop().split("\\").pop();
-    // "자동학습-" prefix 제거 (예: "자동학습-FA롤물류.pdf" → "FA롤물류.pdf")
-    fname = fname.replace(/^자동학습-/, "");
-    return fname.trim();
+    // 3가지 prefix 패턴별 매칭 (대괄호 안 ] 직전까지)
+    const patterns = [
+      /\[자동학습-([^\]]+?\.(?:pdf|png|jpg|jpeg))\]/i,
+      /\[파일:\s*([^\]]+?\.(?:pdf|png|jpg|jpeg))\s*\]/i,
+      /\[PDF:\s*([^\]\s]+(?:\s+[^\]\s]+)*?\.pdf)/i,
+    ];
+    for (const pat of patterns) {
+      const m = head.match(pat);
+      if (m) {
+        let fname = m[1].trim();
+        // subPath 제거 — basename만
+        fname = fname.split("/").pop().split("\\").pop();
+        return fname.trim();
+      }
+    }
+    return null;
   };
 
   // 재학습 실행
@@ -4491,9 +4505,27 @@ export default function App() {
           continue;
         }
 
-        // 2. 기존 빈약 항목 삭제
+        // 2. 기존 빈약 항목 + 같은 파일의 동료 row 모두 삭제 (v14)
+        //    한 파일이 시트에 여러 row로 분리 저장된 구조 반영
+        //    - 메타 row, [종합 요약] row, [페이지N] row 등 동료들 모두 정리
+        //    - 식별: 같은 파일명이 content에 포함된 모든 row
         try {
           await deleteKnowledge(role, weakItem.category, weakItem.content);
+
+          // 같은 파일의 동료 row들도 삭제 (메타 row 외에)
+          // 현재 knowledge에서 fname이 포함된 다른 row 찾기
+          const companionRows = knowledge.filter(k => {
+            if (!k.content || k.content === weakItem.content) return false;
+            return k.content.includes(file.filename);
+          });
+          for (const companion of companionRows) {
+            try {
+              await deleteKnowledge(role, companion.category, companion.content);
+              console.log(`[재학습] 동료 row 삭제: ${companion.content.slice(0, 60)}...`);
+            } catch (compErr) {
+              console.warn("[재학습] 동료 row 삭제 실패:", compErr);
+            }
+          }
         } catch (delErr) {
           console.warn("[재학습] 기존 항목 삭제 실패 (계속 진행):", delErr);
         }
