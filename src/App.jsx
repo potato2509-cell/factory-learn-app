@@ -261,7 +261,92 @@ function estimateTime(pageCount, mode) {
   return `약 ${Math.round(seconds / 60)}분`;
 }
 
+// ─── 청크 분할 헬퍼 (Step 7-10A) ────────────────────────────────────────────
+// 긴 학습 항목을 단락 경계로 분할하여 채팅 컨텍스트 점유와 시트 가독성 개선.
+// - 2,500자 초과 시 분할 (그 미만은 분할 안 함)
+// - 청크당 목표 2,000자, 단락 경계 우선
+// - content 앞에 (1/N) 형태 라벨 추가 → 자동 점검에서 같은 출처로 인식
+const CHUNK_THRESHOLD = 2500;
+const CHUNK_TARGET = 2000;
+
+function splitContentIntoChunks(content) {
+  if (!content || content.length <= CHUNK_THRESHOLD) return [content];
+
+  // 단락 경계 후보 (우선순위 높은 순): \n\n > \n > . / 。 / 다. > 공백
+  const chunks = [];
+  let remaining = content;
+
+  while (remaining.length > CHUNK_TARGET) {
+    let cut = CHUNK_TARGET;
+    // 목표 길이 근처에서 가장 가까운 경계 탐색 (목표 ±20% 범위)
+    const minCut = Math.floor(CHUNK_TARGET * 0.7);
+    const maxCut = Math.min(remaining.length, Math.floor(CHUNK_TARGET * 1.2));
+    const window = remaining.slice(minCut, maxCut);
+
+    // 단락 (\n\n) → 문장 (. ! ? 다.) → 줄바꿈 (\n) → 공백 → 마지막에 강제 컷
+    const breakPatterns = [
+      /\n\n/g,        // 단락 경계
+      /[\.!?]\s/g,    // 영문 문장
+      /다\.\s/g,      // 한글 문장
+      /\n/g,          // 줄바꿈
+      /\s\/\s/g,      // " / " 구분자 (이 앱에서 자주 씀)
+      /,\s/g,         // 컴마
+      /\s/g,          // 공백
+    ];
+
+    let breakAt = -1;
+    for (const pat of breakPatterns) {
+      const matches = [...window.matchAll(pat)];
+      if (matches.length > 0) {
+        // 가장 끝쪽 경계 사용 (chunk를 가능한 크게 유지)
+        breakAt = matches[matches.length - 1].index + matches[matches.length - 1][0].length;
+        break;
+      }
+    }
+
+    if (breakAt > 0) {
+      cut = minCut + breakAt;
+    }
+    // 경계 못 찾으면 강제 컷
+
+    chunks.push(remaining.slice(0, cut).trim());
+    remaining = remaining.slice(cut).trim();
+  }
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+  return chunks;
+}
+
+// 청크 라벨 추가: 원본 prefix(예: "[외부학습 v12]") 다음에 "(1/3)" 삽입
+// prefix가 없으면 content 앞에 "(1/3) " 추가
+function applyChunkLabel(chunk, idx, total) {
+  if (total === 1) return chunk;
+  // 대괄호로 시작하는 prefix 패턴 ("[외부학습 v12] ..." 또는 "[파일: xxx] ...")
+  const prefixMatch = chunk.match(/^(\[[^\]]+\])\s*/);
+  if (prefixMatch) {
+    return `${prefixMatch[1]} (${idx + 1}/${total}) ${chunk.slice(prefixMatch[0].length)}`;
+  }
+  return `(${idx + 1}/${total}) ${chunk}`;
+}
+
 async function saveToSheet(role, category, content) {
+  // 청크 분할 적용 (긴 항목은 자동 다중 행 저장)
+  const chunks = splitContentIntoChunks(content);
+  if (chunks.length === 1) {
+    return saveToSheetSingle(role, category, content);
+  }
+  // 다중 청크 저장 — 직렬 처리 (Apps Script 일괄 호출 회피)
+  let ok = true;
+  for (let i = 0; i < chunks.length; i++) {
+    const labeled = applyChunkLabel(chunks[i], i, chunks.length);
+    const r = await saveToSheetSingle(role, category, labeled);
+    if (!r) ok = false;
+  }
+  return ok;
+}
+
+async function saveToSheetSingle(role, category, content) {
   try {
     await fetch(APPS_SCRIPT_URL, {
       method: "POST",
@@ -555,9 +640,26 @@ function safeJSON(raw) {
 async function checkConsistencyForItem(newItem, existingKnowledge) {
   if (!newItem || !newItem.content || existingKnowledge.length === 0) return [];
 
-  // 비교 대상 추출 (자기 자신 제외, 최근 50건)
+  // 같은 출처(prefix) 청크끼리는 비교 대상에서 제외
+  // - 청크 분할 시 (1/3), (2/3), (3/3) 형태로 같은 원본에서 나옴 → 충돌로 잘못 잡힘 방지
+  // - prefix 추출 패턴: "[xxx] (N/M)" 또는 "[xxx]"의 첫 대괄호
+  const extractSourcePrefix = (content) => {
+    if (!content) return null;
+    const m = content.match(/^(\[[^\]]+\])/);
+    return m ? m[1] : null;
+  };
+  const newPrefix = extractSourcePrefix(newItem.content);
+
+  // 비교 대상 추출 (자기 자신 제외, 같은 출처 prefix 제외, 최근 50건)
   const candidates = existingKnowledge
-    .filter(k => k.content && k.content !== newItem.content)
+    .filter(k => {
+      if (!k.content || k.content === newItem.content) return false;
+      if (newPrefix) {
+        const candPrefix = extractSourcePrefix(k.content);
+        if (candPrefix === newPrefix) return false; // 같은 출처 → 제외
+      }
+      return true;
+    })
     .slice(-50);
   if (candidates.length === 0) return [];
 
@@ -1078,12 +1180,20 @@ ${summaryData.content}
           topMatchCount = matched.length;
           usedScoring = matched.length > 0;
 
-          // 우선순위 항목 (점수 매칭) → 6000자 cap까지 채우기
+          // 우선순위 항목 (점수 매칭) → 6000자 cap까지 채우기 (Step 7-10C)
+          // - 한 항목이 너무 크면 다른 매칭 항목이 못 들어감 → 항목당 3000자 cap
+          // - 청크 분할(7-10A)로 대부분 안 걸리지만, 외부에서 들어온 큰 항목 안전망
           const selected = [];
           let usedChars = 0;
           const HARD_CAP = 6000;
+          const ITEM_CAP = 3000;
+          const truncateForContext = (text) => {
+            if (text.length <= ITEM_CAP) return text;
+            return text.slice(0, ITEM_CAP) + ` ... [잘림: 전체 ${text.length}자 중 앞 ${ITEM_CAP}자]`;
+          };
           for (const s of matched) {
-            const formatted = `[${s.item.category}] ${s.item.content}`;
+            const truncatedContent = truncateForContext(s.item.content || "");
+            const formatted = `[${s.item.category}] ${truncatedContent}`;
             if (usedChars + formatted.length > HARD_CAP) break;
             selected.push(formatted);
             usedChars += formatted.length + 1; // \n 포함
@@ -1096,7 +1206,8 @@ ${summaryData.content}
               .slice(-15)
               .reverse();
             for (const s of unmatchedRecent) {
-              const formatted = `[${s.item.category}] ${s.item.content}`;
+              const truncatedContent = truncateForContext(s.item.content || "");
+              const formatted = `[${s.item.category}] ${truncatedContent}`;
               if (usedChars + formatted.length > HARD_CAP) break;
               selected.push(formatted);
               usedChars += formatted.length + 1;
@@ -1107,7 +1218,7 @@ ${summaryData.content}
             const header = usedScoring
               ? `[참고 - 원본 학습 데이터 (질문 관련 ${matched.length}건 중 상위 ${selected.length}건)]`
               : `[참고 - 원본 학습 데이터 (최근 ${selected.length}건)]`;
-            detailContext = `\n\n${header}\n${selected.join("\n")}\n\n위 원본 데이터에서 정확한 정보를 찾아 답변하세요. 학습된 내용에 관한 질문이면 반드시 위 데이터를 근거로 답하고, 데이터에 없는 정보만 모른다고 답하세요. 데이터에 라인·수치·날짜 같은 구체 정보가 있으면 빠뜨리지 말고 답에 포함하세요.`;
+            detailContext = `\n\n${header}\n${selected.join("\n")}\n\n위 원본 데이터에서 정확한 정보를 찾아 답변하세요. 학습된 내용에 관한 질문이면 반드시 위 데이터를 근거로 답하고, 데이터에 없는 정보만 모른다고 답하세요. 데이터에 라인·수치·날짜 같은 구체 정보가 있으면 빠뜨리지 말고 답에 포함하세요. 항목 끝에 "[잘림: ...]" 표시가 있으면 그 항목엔 더 많은 정보가 있다는 의미입니다 — 사용자가 그 부분을 묻거나 "더 알려줘"라고 하면 "이 항목은 일부만 표시되었습니다. '(2/3) 또는 (3/3)' 같은 후속 청크가 있는지 보관함에서 확인해주세요"라고 안내하거나, 잘린 부분과 관련된 구체적 후속 질문을 안내하세요.`;
           }
         }
       }
@@ -2007,15 +2118,20 @@ JSON으로만 답하세요. 다른 설명 없이.
         setAnalyzeStep(`${detectedType} 분석 중...`);
         const specificPrompt = getTypeSpecificPrompt(detectedType);
 
-        // 시각 메타데이터 + 추출 텍스트를 한꺼번에 요청
+        // 시각 메타데이터 + 추출 텍스트 + 메타데이터를 한꺼번에 요청 (Step 7-10B)
         const analysisPrompt = `${specificPrompt}
 
-다음 형식으로 한국어 답변:
-[추출 텍스트]
-(이미지에서 읽거나 추론한 정보, 핵심만 간결하게)
+이미지가 매뉴얼·작업 지시서·도면이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출하세요. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게.
 
-[시각 설명]
-(이미지의 시각적 특징을 한 줄로: 레이아웃, 색상, 강조 표시 등)`;
+다음 3블록 형식으로 한국어 답변:
+[추출 텍스트]
+(이미지에서 읽거나 추론한 정보. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
+
+[핵심 정보]
+(이 이미지가 다루는 공정·설비·이슈 — 한 문장)
+
+[메타데이터]
+(문서 제목, Rev, 작성일, 페이지 번호 등이 보이면 기재. 없으면 생략)`;
 
         result = await callClaudeVision(
           analysisPrompt,
@@ -2085,12 +2201,16 @@ JSON으로만 답하세요. 다른 설명 없이.
             }
             pageUrls.push(pageUrl);
 
-            // 3단계: Vision API로 분석
+            // 3단계: Vision API로 분석 (Step 7-10B)
             const pagePrompt = `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pdfPageCount} 분석.
 카테고리: ${category}
-다음 형식으로 한국어 답변 (200자 이내):
-[추출 텍스트] (페이지 핵심 내용)
-[시각 설명] (레이아웃, 표, 다이어그램 등 시각 요소)`;
+
+페이지가 매뉴얼·작업 지시서·도면이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출하세요. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게.
+
+다음 3블록 형식:
+[추출 텍스트] (페이지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
+[핵심 정보] (이 페이지가 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재. 없으면 생략)`;
 
             try {
               const pageResult = await callClaudeVision(
@@ -2121,9 +2241,16 @@ JSON으로만 답하세요. 다른 설명 없이.
           result = `[PDF: ${file.name} - 그림 분석, ${pdfPageCount}페이지]\n${urlLines}\n\n[종합 요약]\n${summary}\n\n[페이지별 상세]\n${combinedText}`;
         }
       } else {
-        // 텍스트 파일 처리 (기존 그대로)
+        // 텍스트 파일 처리 (Step 7-10B 적용)
         setAnalyzeStep("파일 분석 중...");
-        const sys = `${roleInfo.label}(${role}) AI입니다. 카테고리: ${category}.\n한국어로 핵심 내용만 간결하게 정리. 200자 이내.`;
+        const sys = `${roleInfo.label}(${role}) AI입니다. 카테고리: ${category}.
+
+파일이 매뉴얼·작업 지시서·도면 텍스트면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게.
+
+다음 3블록 형식:
+[추출 텍스트] (파일의 실제 내용. 구체값 빠뜨리지 말 것)
+[핵심 정보] (이 파일이 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)`;
         let text = await extractTextFromFile(file);
         if (!text || text.length < 10) text = `파일명: ${file.name}`;
         const truncated = text.slice(0, 2000);
@@ -4253,13 +4380,17 @@ export default function App() {
         const isPdfFile = (fileData.mimetype || "").includes("pdf") || (f.filename || "").toLowerCase().endsWith(".pdf");
 
         if (isImageFile) {
-          // ─── 이미지 처리 (기존 로직) ───
+          // ─── 이미지 처리 (Step 7-10B 적용) ───
           const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
           const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
 이 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.${folderHint}
-다음 형식으로 한국어 답변 (300자 이내):
-[추출 텍스트] (이미지에서 읽은 정보)
-[시각 설명] (시각적 특징 한 줄)
+
+이미지가 매뉴얼·작업 지시서·도면이면 단계·수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음.
+
+다음 4블록 형식:
+[추출 텍스트] (이미지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
+[핵심 정보] (이 이미지가 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
 [추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
 
           const analyzed = await callClaudeVision(sys, "이 이미지를 분석하세요.", fileData.base64, fileData.mimetype);
@@ -4337,12 +4468,16 @@ export default function App() {
               } catch (e) { /* 업로드 실패해도 분석은 계속 */ }
               pageUrls.push(pageUrl);
 
-              // Vision 분석
+              // Vision 분석 (Step 7-10B)
               const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath}` : "";
               const pagePrompt = `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pageCount} 분석.${folderHint}
-다음 형식으로 한국어 답변 (200자 이내):
-[추출 텍스트] (페이지 핵심 내용)
-[시각 설명] (레이아웃, 표, 다이어그램 등 시각 요소)`;
+
+페이지가 매뉴얼·작업 지시서·도면이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게.
+
+다음 3블록 형식:
+[추출 텍스트] (페이지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
+[핵심 정보] (이 페이지가 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (문서 제목, Rev, 작성일, 페이지 번호 등이 보이면 기재)`;
 
               try {
                 const pageRes = await callClaudeVision(pagePrompt, "이 PDF 페이지를 분석하세요.", pageBase64, "image/jpeg");
