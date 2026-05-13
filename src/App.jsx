@@ -632,6 +632,40 @@ function safeJSON(raw) {
   }
 }
 
+// ─── 빈약 자동학습 항목 감지 (Step 7-11 v2) ─────────────────────────────────
+// 다중 신호 기반 — 분량만으로 판단하지 않음
+// 신호:
+//   (1) [시각 설명] 블록 존재 → v10 이전 학습 (옛 프롬프트). 가장 강한 신호
+//   (2) 분량 < 500자 + 자동학습 prefix → 기존 짧은 빈약
+//   (3) 분량 대비 정보 밀도 낮음 (페이지당 평균 < 150자)
+//
+// 자동학습 항목 식별: [파일: 또는 [PDF: 시작, 또는 PDF 페이지 분석 표지 포함
+function isWeakAutoItem(content) {
+  if (!content) return false;
+
+  // 자동학습 항목인지 먼저 식별
+  const isAutoLearning =
+    /^\[(파일|PDF):/i.test(content) ||
+    /# PDF 페이지 분석|━━ 페이지 \d+ ━━/.test(content);
+  if (!isAutoLearning) return false;
+
+  // 신호 1: v10 이전 프롬프트 표지 (가장 신뢰)
+  const hasOldPromptMarker = /\[시각 설명\]|## \[시각 설명\]/.test(content);
+  if (hasOldPromptMarker) return true;
+
+  // 신호 2: 짧음 (기존 기준 유지)
+  if (content.length < 500) return true;
+
+  // 신호 3: 정보 밀도 낮음 — 페이지당 평균 글자수 < 150
+  const pageMatches = content.match(/━━ 페이지 \d+ ━━|# PDF 페이지 분석 \(\d+\/\d+\)/g);
+  if (pageMatches && pageMatches.length >= 2) {
+    const avgPerPage = content.length / pageMatches.length;
+    if (avgPerPage < 150) return true;
+  }
+
+  return false;
+}
+
 // ─── 일관성 자동 점검 (Step 7-4) ────────────────────────────────────────────
 // 신규 항목 1개를 기존 knowledge와 비교해 중복/충돌을 찾음.
 // - 같은 카테고리 + 다른 카테고리 모두 검사 (교차 검사)
@@ -2121,7 +2155,7 @@ JSON으로만 답하세요. 다른 설명 없이.
         // 시각 메타데이터 + 추출 텍스트 + 메타데이터를 한꺼번에 요청 (Step 7-10B)
         const analysisPrompt = `${specificPrompt}
 
-이미지가 매뉴얼·작업 지시서·도면이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출하세요. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게.
+이미지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출하세요. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 항목명·대수·사양·비고 등 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
 
 다음 3블록 형식으로 한국어 답변:
 [추출 텍스트]
@@ -2205,7 +2239,7 @@ JSON으로만 답하세요. 다른 설명 없이.
             const pagePrompt = `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pdfPageCount} 분석.
 카테고리: ${category}
 
-페이지가 매뉴얼·작업 지시서·도면이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출하세요. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게.
+페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출하세요. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 항목명·대수·사양·비고 등 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
 
 다음 3블록 형식:
 [추출 텍스트] (페이지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
@@ -3338,14 +3372,12 @@ function TabStatus({ role, roleInfo, knowledge, onReload, loading, autoConflicts
       recommendations.push(`"전체 검사"를 실행해 중복/충돌을 확인해 보세요`);
     }
 
-    // 빈약 자동학습 항목 감지 (Step 7-11)
-    // 조건: content가 [파일: 또는 [PDF: 로 시작 AND 길이 < 500자
-    // → 200자 제한 시기에 학습되어 정보 부족한 항목
-    const weakAutoItems = knowledge.filter(k => {
-      const c = k.content || "";
-      if (c.length >= 500) return false;
-      return /^\[(파일|PDF):/i.test(c);
-    });
+    // 빈약 자동학습 항목 감지 (Step 7-11 v2)
+    // 헬퍼: isWeakAutoItem (다중 신호 기반)
+    // - v10 이전 프롬프트 표지 ([시각 설명] 블록) → 강한 신호
+    // - 분량 < 500자 → 짧은 빈약
+    // - 페이지당 평균 < 150자 → 정보 밀도 낮음
+    const weakAutoItems = knowledge.filter(k => isWeakAutoItem(k.content));
     if (weakAutoItems.length > 0) {
       recommendations.push(`빈약 자동학습 항목 ${weakAutoItems.length}건 — 아래 "재학습"으로 품질 개선 가능`);
     }
@@ -4393,7 +4425,7 @@ export default function App() {
           const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
 이 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.${folderHint}
 
-이미지가 매뉴얼·작업 지시서·도면이면 단계·수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음.
+이미지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계·수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
 
 다음 4블록 형식:
 [추출 텍스트] (이미지의 실제 내용. 구체값 빠뜨리지 말 것)
@@ -4421,7 +4453,7 @@ export default function App() {
             const folderHint = file.subPath ? `\n폴더 경로: ${file.subPath}` : "";
             const pagePrompt = `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pageCount} 분석.${folderHint}
 
-페이지가 매뉴얼·작업 지시서·도면이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음.
+페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 항목명·대수·사양·비고 등 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
 
 다음 3블록 형식:
 [추출 텍스트] (페이지의 실제 내용. 구체값 빠뜨리지 말 것)
@@ -4653,7 +4685,7 @@ export default function App() {
           const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
 이 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.${folderHint}
 
-이미지가 매뉴얼·작업 지시서·도면이면 단계·수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음.
+이미지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계·수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
 
 다음 4블록 형식:
 [추출 텍스트] (이미지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
@@ -4740,7 +4772,7 @@ export default function App() {
               const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath}` : "";
               const pagePrompt = `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pageCount} 분석.${folderHint}
 
-페이지가 매뉴얼·작업 지시서·도면이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게.
+페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 항목명·대수·사양·비고 등 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
 
 다음 3블록 형식:
 [추출 텍스트] (페이지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
@@ -5217,11 +5249,7 @@ export default function App() {
 
       {/* ─── 빈약 데이터 재학습 모달 (Step 7-11) ─── */}
       {showRelearnDialog && (() => {
-        const weakItems = knowledge.filter(k => {
-          const c = k.content || "";
-          if (c.length >= 500) return false;
-          return /^\[(파일|PDF):/i.test(c);
-        });
+        const weakItems = knowledge.filter(k => isWeakAutoItem(k.content));
         const fileNameSet = new Set();
         weakItems.forEach(w => {
           const c = w.content || "";
