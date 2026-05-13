@@ -646,9 +646,14 @@ function safeJSON(raw) {
 function isWeakAutoItem(content) {
   if (!content) return false;
 
-  // 메타 row 식별: 자동학습 prefix로 시작 (종합 요약/페이지별 row 제외)
-  const isMetaRow = /^\[(자동학습-|파일:\s*|PDF:\s*)/i.test(content);
-  if (!isMetaRow) return false;
+  // 학습앱 자동학습이 만든 row만 대상 (v15)
+  // - [자동학습-...] : 학습앱이 폴더 동기화로 만든 row
+  // - [파일: xxx.pdf/png/jpg/jpeg] : 학습앱이 만든 메타 row
+  // 그 외 (docx, 외부학습 v12, 채팅학습 등)는 원본 재학습 불가능하므로 제외
+  const isLearningAppRow =
+    /^\[자동학습-/i.test(content) ||
+    /^\[파일:\s*[^\]]+\.(?:pdf|png|jpg|jpeg)\s*\]/i.test(content);
+  if (!isLearningAppRow) return false;
 
   // 신호 1: v10 이전 프롬프트 표지 (가장 신뢰)
   const hasOldPromptMarker = /\[시각 설명\]|## \[시각 설명\]/.test(content);
@@ -5436,6 +5441,18 @@ export default function App() {
                       </div>
                     )}
                   </div>
+
+                  {relearnResult.notFound.length > 0 && (
+                    <div style={{
+                      fontSize:10.5, color:"#fbbf24",
+                      background:"rgba(245,158,11,0.08)",
+                      border:"1px solid rgba(245,158,11,0.2)",
+                      borderRadius:6, padding:"8px 10px", marginBottom:10, lineHeight:1.6,
+                    }}>
+                      💡 Drive 파일 없음 항목은 학습앱 자동학습이 아닌 다른 경로로 들어온 데이터입니다.
+                      (외부 도구 학습, 임시 업로드, 채팅 학습 등) 학습앱은 이 파일들의 원본을 찾을 수 없어 재학습할 수 없습니다.
+                    </div>
+                  )}
 
                   {(relearnResult.errors.length > 0 || relearnResult.notFound.length > 0) && (
                     <div style={{
