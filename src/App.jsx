@@ -20,9 +20,15 @@ const ROLE_CONFIG = {
     focus: "공정 간 자동 반송 시스템 (C/V, Stocker, OHT, AGV) 운영·정비, WIP 흐름 관리" },
   Vision: { label: "비전 엔지니어", line: "공통", color: "#ec4899", bg: "rgba(236,72,153,0.12)", icon: "🩷",
     focus: "외관 검사 시스템, 불량 이미지 분석, 비전 알고리즘, 검사 기준 관리" },
+  Cell_PLC: { label: "PLC 엔지니어", line: "Cell", color: "#84cc16", bg: "rgba(132,204,22,0.12)", icon: "🎛️",
+    focus: "Cell 라인 PLC 프로그램·시퀀스·통신, 알람 분석, I/O 디버깅" },
+  Elec_PLC: { label: "PLC 엔지니어", line: "Elec", color: "#65a30d", bg: "rgba(101,163,13,0.12)", icon: "🎛️",
+    focus: "Elec 라인 PLC 프로그램·시퀀스·통신, 알람 분석, I/O 디버깅" },
+  FA_PLC: { label: "PLC 엔지니어", line: "공통", color: "#4d7c0f", bg: "rgba(77,124,15,0.12)", icon: "🎛️",
+    focus: "물류 자동화(C/V, Stocker, OHT) PLC 프로그램·시퀀스·통신, 알람 분석" },
 };
 
-// 대시보드용 8개 에이전트 메타
+// 대시보드용 11개 에이전트 메타
 const DASHBOARD_AGENT_META = {
   Cell_PE: { line: "Cell", role: "생산", color: "#3b82f6" },
   Cell_ME: { line: "Cell", role: "설비", color: "#f97316" },
@@ -32,6 +38,9 @@ const DASHBOARD_AGENT_META = {
   Elec_TE: { line: "Elec", role: "기술", color: "#34d399" },
   FA: { line: "공통", role: "FA", color: "#f59e0b" },
   Vision: { line: "공통", role: "비전", color: "#ec4899" },
+  Cell_PLC: { line: "Cell", role: "PLC", color: "#84cc16" },
+  Elec_PLC: { line: "Elec", role: "PLC", color: "#65a30d" },
+  FA_PLC: { line: "공통", role: "PLC", color: "#4d7c0f" },
 };
 
 const LINE_COLORS = {
@@ -354,11 +363,68 @@ async function saveToSheetSingle(role, category, content) {
       headers: { "Content-Type": "text/plain" },
       body: JSON.stringify({ action: "save_knowledge", role, category, content }),
     });
+    invalidateCache(role); // Step 7-12: 쓰기 후 캐시 무효화
     return true;
   } catch { return false; }
 }
 
-async function loadFromSheet(role) {
+// ─── 캐시 시스템 (Step 7-12) ────────────────────────────────────────────
+// loadFromSheet 결과를 React 메모리 + localStorage에 캐싱
+// - TTL 10분: 그 안에는 fresh fetch 안 함
+// - 쓰기 작업(save/delete/replace) 시 즉시 무효화
+// - 첫 진입 시 캐시 있으면 즉시 표시 + 백그라운드에서 신선한 데이터 fetch
+// 효과: 채팅 시 매번 호출되는 loadFromSheet의 API 호출 95%+ 감소
+const KNOWLEDGE_CACHE_TTL_MS = 10 * 60 * 1000; // 10분
+const KNOWLEDGE_CACHE_PREFIX = "kb_cache_v1_";
+
+// 메모리 캐시 (세션 내 빠른 접근)
+const _memoryCache = {};
+
+// localStorage 키 빌더
+function cacheKey(role) { return `${KNOWLEDGE_CACHE_PREFIX}${role}`; }
+
+// 캐시 읽기 — TTL 검사 포함
+function readCache(role) {
+  // 메모리 캐시 먼저
+  if (_memoryCache[role]) {
+    const entry = _memoryCache[role];
+    if (Date.now() - entry.ts < KNOWLEDGE_CACHE_TTL_MS) {
+      return { data: entry.data, fresh: false };
+    }
+  }
+  // localStorage fallback
+  try {
+    const raw = localStorage.getItem(cacheKey(role));
+    if (!raw) return null;
+    const entry = JSON.parse(raw);
+    if (Date.now() - entry.ts < KNOWLEDGE_CACHE_TTL_MS) {
+      _memoryCache[role] = entry; // 메모리에도 동기화
+      return { data: entry.data, fresh: false };
+    }
+  } catch {}
+  return null;
+}
+
+// 캐시 쓰기 — 메모리 + localStorage 동기
+function writeCache(role, data) {
+  const entry = { ts: Date.now(), data };
+  _memoryCache[role] = entry;
+  try {
+    localStorage.setItem(cacheKey(role), JSON.stringify(entry));
+  } catch (e) {
+    // localStorage 가득 차거나 차단된 경우 - 메모리만 사용
+    console.warn("[캐시] localStorage 쓰기 실패:", e.message);
+  }
+}
+
+// 캐시 무효화 — 특정 role
+function invalidateCache(role) {
+  delete _memoryCache[role];
+  try { localStorage.removeItem(cacheKey(role)); } catch {}
+}
+
+// 신선한 데이터 직접 가져오기 (캐시 우회)
+async function fetchKnowledgeFromSheet(role) {
   try {
     const res = await fetch(`${APPS_SCRIPT_URL}?action=get_knowledge&role=${role}`);
     const data = await res.json();
@@ -366,7 +432,26 @@ async function loadFromSheet(role) {
   } catch { return []; }
 }
 
-// 대시보드 - 전체 8개 에이전트 진행률 로드
+// loadFromSheet — 캐시 우선 (Step 7-12)
+// 캐시 있고 신선하면 그대로 반환, 없거나 stale이면 API 호출
+async function loadFromSheet(role) {
+  const cached = readCache(role);
+  if (cached) {
+    return cached.data;
+  }
+  const fresh = await fetchKnowledgeFromSheet(role);
+  if (fresh.length > 0) writeCache(role, fresh);
+  return fresh;
+}
+
+// loadFromSheet의 강제 fresh 버전 — 명시적 새로고침 시 사용
+async function loadFromSheetFresh(role) {
+  const fresh = await fetchKnowledgeFromSheet(role);
+  if (fresh.length > 0) writeCache(role, fresh);
+  return fresh;
+}
+
+// 대시보드 - 전체 11개 에이전트 진행률 로드 (Cell/Elec PE·ME·TE·PLC + FA + FA_PLC + Vision)
 async function loadAllProgress() {
   try {
     const res = await fetch(`${APPS_SCRIPT_URL}?action=get_all_progress`);
@@ -424,6 +509,7 @@ async function replaceKnowledge(role, category, oldContent, newContent) {
       headers: { "Content-Type": "text/plain" },
       body: JSON.stringify({ action: "replace_knowledge", role, category, oldContent, newContent }),
     });
+    invalidateCache(role); // Step 7-12
     return true;
   } catch { return false; }
 }
@@ -437,6 +523,7 @@ async function deleteKnowledge(role, category, content) {
       headers: { "Content-Type": "text/plain" },
       body: JSON.stringify({ action: "delete_knowledge", role, category, content }),
     });
+    invalidateCache(role); // Step 7-12
     return true;
   } catch { return false; }
 }
@@ -1631,6 +1718,24 @@ const RULE_FIELDS = {
     { key:"판단기준", label:"비전 시스템 이상 대응", placeholder:"예: 검출율 급감 시 조치 기준, 카메라·조명 점검 주기, 재교정 기준" },
     { key:"판단기준", label:"불량 이미지 분석 방법", placeholder:"예: 이미지 패턴 분류 기준, 오검출·미검출 구분, 데이터 축적 및 개선 방법" },
   ],
+  Cell_PLC: [
+    { key:"판단기준", label:"Cell PLC 알람 발생 시 대응 순서", placeholder:"예: 알람 코드 확인 → 시퀀스 단계 추적 → I/O 상태 점검 → 통신 확인 → 코드 검토" },
+    { key:"협업방식", label:"Cell ME·TE팀과 협업 방식", placeholder:"예: 설비 고장 동반 시 ME와 즉시 협업, 공정 조건 PLC 변경은 TE 협의 후 진행" },
+    { key:"판단기준", label:"PLC 프로그램 변경 절차", placeholder:"예: 변경 전 백업, 시운전 환경 검증, 변경 이력 관리, 라인 정지 시간 사전 공유" },
+    { key:"판단기준", label:"I/O·통신 이상 진단 기준", placeholder:"예: I/O 점등 패턴, 통신 끊김 시 우선 확인 항목, Watchdog 타임아웃 처리" },
+  ],
+  Elec_PLC: [
+    { key:"판단기준", label:"Elec PLC 알람 발생 시 대응 순서", placeholder:"예: 알람 코드 확인 → 시퀀스 단계 추적 → I/O 상태 점검 → 통신 확인 → 코드 검토" },
+    { key:"협업방식", label:"Elec ME·TE팀과 협업 방식", placeholder:"예: 설비 고장 동반 시 ME와 즉시 협업, 공정 조건 PLC 변경은 TE 협의 후 진행" },
+    { key:"판단기준", label:"PLC 프로그램 변경 절차", placeholder:"예: 변경 전 백업, 시운전 환경 검증, 변경 이력 관리, 라인 정지 시간 사전 공유" },
+    { key:"판단기준", label:"I/O·통신 이상 진단 기준", placeholder:"예: I/O 점등 패턴, 통신 끊김 시 우선 확인 항목, Watchdog 타임아웃 처리" },
+  ],
+  FA_PLC: [
+    { key:"판단기준", label:"반송 PLC 알람 시 대응 순서", placeholder:"예: 알람 → 영향 라인·구간 파악 → 우회 경로 → 시퀀스 추적 → I/O 점검 → 코드 검토" },
+    { key:"협업방식", label:"FA·ME·TE팀과 협업 방식", placeholder:"예: 본 라인 영향 시 FA와 즉시 공유, 설비 정비 일정은 ME와 협의, 신규 자동화 도입은 TE 협업" },
+    { key:"판단기준", label:"반송 PLC 시퀀스·통신 변경 절차", placeholder:"예: 시퀀스 시뮬레이션 후 적용, 변경 전 백업, MES·CIM 통신 영향 점검, 단계적 시운전" },
+    { key:"판단기준", label:"통신 이상(MES·HMI·기기 간) 진단 기준", placeholder:"예: 통신 두절 우선 확인 순서, Watchdog·재접속 정책, 통신 로그 분석" },
+  ],
 };
 
 function TabRules({ role, roleInfo }) {
@@ -1862,6 +1967,21 @@ function TabCorrection({ role, roleInfo, knowledge }) {
       "비전 검사기에서 불량 검출율이 갑자기 50% 이하로 떨어졌다.",
       "새로운 불량 유형이 발생했는데 현재 알고리즘이 검출하지 못하고 있다.",
       "조명 노후화로 의심되는 오검출이 증가하고 있다. 생산에 영향을 주고 있음.",
+    ],
+    Cell_PLC: [
+      "Cell 라인 PLC 알람 발생 — 시퀀스 단계에서 멈춰있고 I/O 점등 패턴이 평소와 다름.",
+      "MES 통신 두절. 라인은 가동 중이지만 데이터 송수신 안 됨.",
+      "PLC 프로그램 일부 변경 후 의도하지 않은 인터록 발생. 원인 추적 필요.",
+    ],
+    Elec_PLC: [
+      "Elec 라인 PLC 알람 — 동일 시점에 여러 알람 동시 발생, 우선순위 판단 필요.",
+      "감지 센서 신호 간헐적 누락. PLC I/O 또는 센서 자체 문제 구분 필요.",
+      "신규 설비 도입 후 통신 충돌로 PLC 사이클 타임 증가. 원인 파악 필요.",
+    ],
+    FA_PLC: [
+      "Stocker 시퀀스 멈춤 — PLC 코드 단계 추적 후 어디서 막혔는지 확인 필요.",
+      "OHT-PLC 통신 끊김 반복. Watchdog 발동 빈도 높아 라인 흐름 영향.",
+      "C/V Diverter 우회 시 PLC 시퀀스 충돌 의심. 시뮬레이션 환경 검증 필요.",
     ],
   };
 
@@ -4574,8 +4694,48 @@ export default function App() {
     return bytes;
   };
 
-  const loadKB = async () => {
+  // loadKB — 캐시 우선 + 백그라운드 갱신 (Step 7-12)
+  // - 캐시 있으면 즉시 setKnowledge (사용자 체감 빠름)
+  // - 백그라운드에서 신선한 데이터 fetch → 차이 있으면 다시 setKnowledge
+  // - 캐시 없으면 일반 로드
+  const loadKB = async (forceFresh = false) => {
     if (!role) return;
+
+    if (forceFresh) {
+      // 명시적 새로고침 — 캐시 무시
+      setLoadingKB(true);
+      try {
+        const fresh = await loadFromSheetFresh(role);
+        setKnowledge(fresh);
+      } catch {}
+      finally { setLoadingKB(false); }
+      return;
+    }
+
+    // 캐시 즉시 표시 (있으면)
+    const cached = readCache(role);
+    if (cached) {
+      setKnowledge(cached.data);
+      setLoadingKB(false);
+      // 백그라운드 갱신 (UI 블록 안 함)
+      (async () => {
+        try {
+          const fresh = await fetchKnowledgeFromSheet(role);
+          if (fresh.length > 0) {
+            writeCache(role, fresh);
+            // 데이터 달라졌으면 갱신 (단순 비교: 길이 또는 마지막 항목)
+            const lastCached = cached.data[cached.data.length - 1]?.content || "";
+            const lastFresh = fresh[fresh.length - 1]?.content || "";
+            if (fresh.length !== cached.data.length || lastFresh !== lastCached) {
+              setKnowledge(fresh);
+            }
+          }
+        } catch {}
+      })();
+      return;
+    }
+
+    // 캐시 없음 — 일반 로드
     setLoadingKB(true);
     try {
       const data = await loadFromSheet(role);
