@@ -2513,7 +2513,6 @@ JSON으로만 답하세요. 다른 설명 없이.
 
           result = `[PDF: ${file.name} - 텍스트 추출, ${pdfPageCount}페이지]\n${result}`;
         } else {
-        } else {
           // v19: 그림 분석 모드 — 페이지별 카드 + 페이지별 row 저장 (종합 요약 없음)
           // 1) 목차 파싱 (성공하면 페이지→챕터 매핑)
           setAnalyzeStep("PDF 목차 파싱 중...");
