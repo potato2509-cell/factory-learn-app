@@ -1,3 +1,19 @@
+// App_Step7_v19.jsx
+// 트랙 1 단계 3·4: PDF 학습에 출처 메타 보존 추가
+//
+// 주요 변경 (v18 → v19):
+//   - 신규 헬퍼: extractPdfOutline (목차 파싱) / parseChapterFromAnalysis (Vision 응답에서 챕터 추출) / buildSourceMeta
+//   - saveToSheet / saveToSheetSingle / saveCommonKnowledge: 4번째 인자 sourceMeta 받음 (하위 호환)
+//   - Vision 프롬프트에 [챕터/섹션] 블록 추가
+//   - TabDocument PDF Vision 모드: 페이지별 N개 row 저장 (종합 요약 row 없음), 페이지별 카드 UI
+//   - TabDocument PDF 텍스트 모드: 4블록 형식 적용 (챕터 정보 추출)
+//   - startSync (폴더 동기화) PDF Vision 모드: 페이지별 N개 row, 첫 페이지로 카테고리 결정
+//   - startRelearn (재학습) PDF Vision 모드: 페이지별 N개 row, 카테고리는 기존 유지
+//   - 챕터 결정 순서: 목차 매핑 → Vision 응답 → 직전 페이지 상속 → 빈 칸
+//   - source_url: 자동학습 PDF는 driveUrl#page=N, 직접 업로드 PDF는 페이지별 이미지 URL
+//
+// 호환성: 기존 학습 데이터는 영향 없음 (sourceMeta 안 보내면 Apps Script v9가 빈 칸으로 저장)
+
 import { useState, useRef, useEffect, useMemo } from "react";
 
 // ─── 설정 ─────────────────────────────────────────────────────────────────────
@@ -235,6 +251,114 @@ async function pdfPageToBase64(pdf, pageNum) {
   return dataUrl.split(",")[1]; // base64 부분만
 }
 
+// ─── 트랙 1: PDF 출처 메타 보존 헬퍼 (v19) ─────────────────────────────────
+// pdf.js outline API로 PDF 목차 파싱 → 페이지별 챕터 매핑 (Dense)
+// 반환: { 1: "1. 개요", 2: "1. 개요", ..., 40: "2. 안전 인터록", 42: "2. 안전 인터록 > 2.1 도어 인터록", ... }
+// 목차 없거나 추출 실패 시 빈 객체 {} 반환 (Vision fallback으로 동작)
+async function extractPdfOutline(pdf) {
+  try {
+    const outline = await pdf.getOutline();
+    if (!outline || outline.length === 0) return {};
+
+    // 1단계: 모든 outline 항목을 평탄화 + 페이지 번호 추출
+    const entries = [];
+    const walk = async (items, depth, ancestors) => {
+      for (const item of items) {
+        let pageNum = null;
+        try {
+          if (item.dest) {
+            const dest = typeof item.dest === "string"
+              ? await pdf.getDestination(item.dest)
+              : item.dest;
+            if (dest && dest[0]) {
+              const ref = dest[0];
+              const idx = await pdf.getPageIndex(ref);
+              pageNum = idx + 1; // 1-based
+            }
+          }
+        } catch { /* 페이지 매핑 실패 — 이 항목 스킵 */ }
+
+        if (pageNum) {
+          entries.push({
+            pageNum,
+            depth,
+            title: (item.title || "").trim(),
+            ancestors: [...ancestors],
+          });
+        }
+        if (item.items && item.items.length > 0) {
+          await walk(item.items, depth + 1, [...ancestors, (item.title || "").trim()]);
+        }
+      }
+    };
+    await walk(outline, 0, []);
+
+    if (entries.length === 0) return {};
+
+    // 2단계: 페이지 순으로 정렬
+    entries.sort((a, b) => a.pageNum - b.pageNum);
+
+    // 3단계: Dense 매핑 — 1페이지부터 마지막 페이지까지 챕터 채우기
+    // - 챕터 깊이는 1단계+2단계까지 결합
+    // - 형식: "1단계 > 2단계" (둘 다 있을 때) 또는 "1단계" (1단계만)
+    const totalPages = pdf.numPages;
+    const mapping = {};
+
+    let currentL0 = ""; // 1단계 챕터
+    let currentL1 = ""; // 2단계 챕터
+    let entryIdx = 0;
+
+    for (let p = 1; p <= totalPages; p++) {
+      while (entryIdx < entries.length && entries[entryIdx].pageNum <= p) {
+        const e = entries[entryIdx];
+        if (e.depth === 0) {
+          currentL0 = e.title;
+          currentL1 = ""; // 1단계 바뀌면 2단계 초기화
+        } else if (e.depth === 1) {
+          currentL1 = e.title;
+        }
+        entryIdx++;
+      }
+
+      if (currentL0 && currentL1) {
+        mapping[p] = `${currentL0} > ${currentL1}`;
+      } else if (currentL0) {
+        mapping[p] = currentL0;
+      }
+    }
+
+    return mapping;
+  } catch (e) {
+    console.warn("[PDF 목차 파싱 실패]", e.message);
+    return {};
+  }
+}
+
+// Vision 응답 텍스트에서 [챕터/섹션] 블록 내용 추출
+// - 블록 없음 → 빈 문자열
+// - 블록 있고 "없음" / "해당 없음" / "N/A" 류 → 빈 문자열
+// - 블록 있고 내용 있음 → trim해서 반환
+function parseChapterFromAnalysis(text) {
+  if (!text) return "";
+  const match = text.match(/\[챕터\/섹션\]\s*\n?([^\n\[]*)/);
+  if (!match) return "";
+  const value = (match[1] || "").trim();
+  if (!value) return "";
+  const negativePatterns = /^(없음|해당\s*없음|N\/A|n\/a|null|undefined|-)$/i;
+  if (negativePatterns.test(value)) return "";
+  return value;
+}
+
+// sourceMeta 객체 빌더 — 4개 필드 명시적 생성
+function buildSourceMeta(file, page, section, url) {
+  return {
+    file: file || "",
+    page: page || "",
+    section: section || "",
+    url: url || "",
+  };
+}
+
 // 비용 계산 (PDF 처리)
 const PDF_COST = {
   visionPerPage: 0.02,  // Vision API 페이지당 $0.02
@@ -339,29 +463,33 @@ function applyChunkLabel(chunk, idx, total) {
   return `(${idx + 1}/${total}) ${chunk}`;
 }
 
-async function saveToSheet(role, category, content) {
+async function saveToSheet(role, category, content, sourceMeta) {
   // 청크 분할 적용 (긴 항목은 자동 다중 행 저장)
+  // v19: sourceMeta가 있으면 모든 청크에 동일하게 전달 (같은 출처 보존)
   const chunks = splitContentIntoChunks(content);
   if (chunks.length === 1) {
-    return saveToSheetSingle(role, category, content);
+    return saveToSheetSingle(role, category, content, sourceMeta);
   }
   // 다중 청크 저장 — 직렬 처리 (Apps Script 일괄 호출 회피)
   let ok = true;
   for (let i = 0; i < chunks.length; i++) {
     const labeled = applyChunkLabel(chunks[i], i, chunks.length);
-    const r = await saveToSheetSingle(role, category, labeled);
+    const r = await saveToSheetSingle(role, category, labeled, sourceMeta);
     if (!r) ok = false;
   }
   return ok;
 }
 
-async function saveToSheetSingle(role, category, content) {
+async function saveToSheetSingle(role, category, content, sourceMeta) {
   try {
+    // v19: sourceMeta는 선택적 (Apps Script v9가 없으면 빈 칸으로 처리, 하위 호환)
+    const payload = { action: "save_knowledge", role, category, content };
+    if (sourceMeta) payload.sourceMeta = sourceMeta;
     await fetch(APPS_SCRIPT_URL, {
       method: "POST",
       mode: "no-cors",
       headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ action: "save_knowledge", role, category, content }),
+      body: JSON.stringify(payload),
     });
     invalidateCache(role); // Step 7-12: 쓰기 후 캐시 무효화
     return true;
@@ -603,13 +731,16 @@ async function markFileProcessed(role, fileId, filename) {
 }
 
 // 공통 학습 데이터 저장 (Common_Knowledge 시트)
-async function saveCommonKnowledge(category, content) {
+// v19: sourceMeta 인자 추가 (saveToSheetSingle과 동일 패턴, 하위 호환)
+async function saveCommonKnowledge(category, content, sourceMeta) {
   try {
+    const payload = { action: "save_common_knowledge", category, content };
+    if (sourceMeta) payload.sourceMeta = sourceMeta;
     await fetch(APPS_SCRIPT_URL, {
       method: "POST",
       mode: "no-cors",
       headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ action: "save_common_knowledge", category, content }),
+      body: JSON.stringify(payload),
     });
     return true;
   } catch { return false; }
@@ -2150,6 +2281,16 @@ function TabDocument({ role, roleInfo }) {
   const [pdfPageCount, setPdfPageCount] = useState(0); // 페이지 수
   const [pdfMode, setPdfMode] = useState("text");      // "text" | "vision"
   const [pdfImageUrls, setPdfImageUrls] = useState([]); // 페이지별 드라이브 URL
+  // v19: PDF Vision 모드 페이지별 분석 결과 (카드 UI용)
+  //   각 원소: { pageNum, content, section, summary, imageUrl, isError, errorMsg }
+  //   - content: 4블록 응답 전체 텍스트 (사용자 편집 가능)
+  //   - section: 챕터/섹션 (목차 우선, Vision fallback, 직전 페이지 상속)
+  //   - summary: [핵심 정보] 블록 한 줄 (카드 헤더에 표시)
+  const [pdfPageResults, setPdfPageResults] = useState([]);
+  // v19: 카드별 펼침 상태 (페이지 번호 → boolean)
+  const [pageExpanded, setPageExpanded] = useState({});
+  // v19: PDF Vision 모드 페이지별 저장 진행률
+  const [saveProgress, setSaveProgress] = useState({ current: 0, total: 0 });
   const [loading, setLoading] = useState(false);
   const [analyzeStep, setAnalyzeStep] = useState(""); // 분석 진행 단계 표시
   const [saving, setSaving] = useState(false);
@@ -2188,6 +2329,10 @@ function TabDocument({ role, roleInfo }) {
     setPdfPageCount(0);
     setPdfImageUrls([]);
     setPdfMode("text");
+    // v19: 페이지별 결과·펼침 상태·저장 진행률 초기화
+    setPdfPageResults([]);
+    setPageExpanded({});
+    setSaveProgress({ current: 0, total: 0 });
 
     if (f.type.startsWith("image/")) {
       const url = URL.createObjectURL(f);
@@ -2262,6 +2407,9 @@ JSON으로만 답하세요. 다른 설명 없이.
     setImageType("");
     setRecommendedCategory("");
     setUploadedImageUrl("");
+    // v19: PDF Vision 모드 재분석 시 이전 페이지 결과 초기화
+    setPdfPageResults([]);
+    setPageExpanded({});
 
     try {
       let result = "";
@@ -2288,12 +2436,12 @@ JSON으로만 답하세요. 다른 설명 없이.
         setAnalyzeStep(`${detectedType} 분석 중...`);
         const specificPrompt = getTypeSpecificPrompt(detectedType);
 
-        // 시각 메타데이터 + 추출 텍스트 + 메타데이터를 한꺼번에 요청 (Step 7-10B)
+        // 시각 메타데이터 + 추출 텍스트 + 메타데이터 + 챕터/섹션을 한꺼번에 요청 (v19: 4블록)
         const analysisPrompt = `${specificPrompt}
 
 이미지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출하세요. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 항목명·대수·사양·비고 등 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
 
-다음 3블록 형식으로 한국어 답변:
+다음 4블록 형식으로 한국어 답변:
 [추출 텍스트]
 (이미지에서 읽거나 추론한 정보. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
 
@@ -2301,7 +2449,10 @@ JSON으로만 답하세요. 다른 설명 없이.
 (이 이미지가 다루는 공정·설비·이슈 — 한 문장)
 
 [메타데이터]
-(문서 제목, Rev, 작성일, 페이지 번호 등이 보이면 기재. 없으면 생략)`;
+(문서 제목, Rev, 작성일, 페이지 번호 등이 보이면 기재. 없으면 생략)
+
+[챕터/섹션]
+(이미지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 예: "2. 안전 인터록", "§4.3 도어 인터록". 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)`;
 
         result = await callClaudeVision(
           analysisPrompt,
@@ -2339,18 +2490,38 @@ JSON으로만 답하세요. 다른 설명 없이.
           }
 
           setAnalyzeStep("AI 분석 중...");
+          // v19: 텍스트 추출 모드도 4블록 형식 (챕터 정보 추출 위해)
           const sys = `${roleInfo.label}(${role}) AI입니다. PDF에서 추출한 텍스트입니다.
 카테고리: ${category}
-한국어로 핵심 내용만 간결하게 정리. 500자 이내.
-표/구조가 있으면 살려서 정리하세요.`;
+한국어로 핵심 내용만 정리하되, 학습 가치 있는 구체 정보(수치·부품명·단계 등)는 빠뜨리지 마세요.
+표/구조가 있으면 살려서 정리하세요.
+
+다음 4블록 형식으로 한국어 답변:
+[추출 텍스트]
+(원문에서 학습 가치 있는 내용. 1000자 이내 권장)
+
+[핵심 정보]
+(이 문서가 다루는 공정·설비·이슈 — 한 문장)
+
+[메타데이터]
+(문서 제목, Rev, 작성일이 보이면 기재. 없으면 생략)
+
+[챕터/섹션]
+(이 문서의 주요 챕터/섹션 제목. 예: "2. 안전 인터록". 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)`;
           const truncated = fullText.slice(0, 12000); // 너무 길면 자르기
           result = await callClaude(sys, `다음 PDF 내용에서 핵심을 추출하세요:\n\n${truncated}`);
 
           result = `[PDF: ${file.name} - 텍스트 추출, ${pdfPageCount}페이지]\n${result}`;
         } else {
-          // 그림 분석 모드 - 페이지별 이미지 변환 후 Vision API
-          const allResults = [];
+        } else {
+          // v19: 그림 분석 모드 — 페이지별 카드 + 페이지별 row 저장 (종합 요약 없음)
+          // 1) 목차 파싱 (성공하면 페이지→챕터 매핑)
+          setAnalyzeStep("PDF 목차 파싱 중...");
+          const outlineMap = await extractPdfOutline(pdfDoc);
+
+          const pageResults = []; // 페이지별 결과 누적
           const pageUrls = [];
+          let lastSection = ""; // 직전 페이지 챕터 상속용
 
           for (let pageNum = 1; pageNum <= pdfPageCount; pageNum++) {
             setAnalyzeStep(`페이지 ${pageNum}/${pdfPageCount} 분석 중...`);
@@ -2371,44 +2542,65 @@ JSON으로만 답하세요. 다른 설명 없이.
             }
             pageUrls.push(pageUrl);
 
-            // 3단계: Vision API로 분석 (Step 7-10B)
+            // 3단계: Vision API로 분석 (v19: 4블록)
             const pagePrompt = `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pdfPageCount} 분석.
 카테고리: ${category}
 
 페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출하세요. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 항목명·대수·사양·비고 등 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
 
-다음 3블록 형식:
+다음 4블록 형식:
 [추출 텍스트] (페이지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
 [핵심 정보] (이 페이지가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재. 없으면 생략)`;
+[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재. 없으면 생략)
+[챕터/섹션] (페이지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 예: "2. 안전 인터록". 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)`;
 
+            let pageContent = "";
+            let isError = false;
+            let errorMsg = "";
             try {
-              const pageResult = await callClaudeVision(
+              pageContent = await callClaudeVision(
                 pagePrompt,
                 `이 PDF 페이지를 분석하세요.`,
                 pageBase64,
                 "image/jpeg"
               );
-              allResults.push(`━━ 페이지 ${pageNum} ━━\n${pageResult}`);
             } catch (e) {
-              allResults.push(`━━ 페이지 ${pageNum} ━━\n(분석 실패: ${e.message})`);
+              isError = true;
+              errorMsg = e.message || "분석 실패";
+              pageContent = `(분석 실패: ${errorMsg})`;
             }
+
+            // 챕터 결정: 목차 → Vision 응답 → 직전 페이지 상속 → 빈 칸
+            let section = outlineMap[pageNum] || "";
+            if (!section && !isError) {
+              section = parseChapterFromAnalysis(pageContent);
+            }
+            if (!section) section = lastSection; // 직전 페이지 상속
+            if (section) lastSection = section;
+
+            // 핵심 정보 추출 (카드 헤더에 한 줄 표시용)
+            let summary = "";
+            const summaryMatch = pageContent.match(/\[핵심 정보\]\s*\n?([^\n\[]*)/);
+            if (summaryMatch) summary = (summaryMatch[1] || "").trim();
+
+            pageResults.push({
+              pageNum,
+              content: pageContent,
+              section,
+              summary,
+              imageUrl: pageUrl,
+              isError,
+              errorMsg,
+            });
           }
 
           setPdfImageUrls(pageUrls);
+          setPdfPageResults(pageResults);
+          // 첫 페이지만 펼치고 나머지는 접힘
+          setPageExpanded({ 1: true });
 
-          // 4단계: 페이지별 결과를 하나로 종합
-          setAnalyzeStep("종합 분석 중...");
-          const combinedText = allResults.join("\n\n");
-          const sumSys = `위 페이지별 분석 결과들을 종합해서 PDF 전체의 핵심을 ${roleInfo.label}(${role}) 관점에서 한국어 500자 이내로 정리하세요.`;
-          const summary = await callClaude(sumSys, combinedText);
-
-          // URL 목록 라인
-          const urlLines = pageUrls
-            .map((u, i) => u ? `[페이지${i+1}URL] ${u}` : `[페이지${i+1}URL] (업로드 실패)`)
-            .join("\n");
-
-          result = `[PDF: ${file.name} - 그림 분석, ${pdfPageCount}페이지]\n${urlLines}\n\n[종합 요약]\n${summary}\n\n[페이지별 상세]\n${combinedText}`;
+          // analyzed에는 카드 UI 모드 식별용 더미 값 (실제 결과는 pdfPageResults에 있음)
+          result = `[PDF: ${file.name} - 그림 분석, ${pdfPageCount}페이지] (페이지별 카드 보기)`;
         }
       } else {
         // 텍스트 파일 처리 (Step 7-10B 적용)
@@ -2487,15 +2679,101 @@ ${dataText.slice(0, 8000)}
   const save = async () => {
     if (!analyzed) return;
     setSaving(true);
+
+    // 정상 저장 완료 후 입력 초기화 헬퍼
+    const resetInputs = () => {
+      if (preview) URL.revokeObjectURL(preview);
+      setFile(null);
+      setPreview("");
+      setAnalyzed("");
+      setImageType("");
+      setRecommendedCategory("");
+      setUploadedImageUrl("");
+      setPdfDoc(null);
+      setPdfPageCount(0);
+      setPdfImageUrls([]);
+      setPdfMode("text");
+      setPdfPageResults([]);
+      setPageExpanded({});
+      setError("");
+      setSaveProgress({ current: 0, total: 0 });
+      if (fileRef.current) fileRef.current.value = "";
+    };
+
     try {
+      // ─── 분기 1: PDF Vision 모드 — 페이지별 N개 row 저장 (v19) ───
+      if (isPDF && pdfMode === "vision" && pdfPageResults.length > 0) {
+        const valid = pdfPageResults.filter(p => !p.isError && p.content && p.content.trim());
+        if (valid.length === 0) {
+          setError("저장 가능한 페이지가 없습니다 (모두 분석 실패)");
+          setSaving(false);
+          return;
+        }
+
+        setSaveProgress({ current: 0, total: valid.length });
+
+        // 페이지별 충돌 검사는 일괄 학습 흐름과 일관 — 건너뛰고 모두 저장
+        // (자동 점검에서 사후 감지됨, Common 패턴)
+        let okCount = 0;
+        let failCount = 0;
+        for (let i = 0; i < valid.length; i++) {
+          const p = valid[i];
+          setSaveProgress({ current: i + 1, total: valid.length });
+
+          const contentTagged = `[파일: ${file.name}] [PDF 페이지 ${p.pageNum}/${pdfPageCount}]\n${p.content}`;
+          const sourceMeta = buildSourceMeta(
+            file.name,
+            String(p.pageNum),
+            p.section,
+            p.imageUrl  // 직접 업로드는 PDF 자체 URL 없으므로 페이지별 이미지 URL 사용
+          );
+
+          try {
+            const ok = await saveToSheet(role, category, contentTagged, sourceMeta);
+            if (ok) okCount++; else failCount++;
+          } catch (e) {
+            failCount++;
+            console.error(`페이지 ${p.pageNum} 저장 실패:`, e);
+          }
+        }
+
+        if (okCount > 0 && failCount === 0) {
+          resetInputs();
+        } else if (okCount > 0) {
+          alert(`${okCount}개 페이지 저장됨 / ${failCount}개 실패`);
+          resetInputs();
+        } else {
+          setError("페이지 저장 실패");
+          return;
+        }
+
+        setSaved(true);
+        setTimeout(() => setSaved(false), 3000);
+        return;
+      }
+
+      // ─── 분기 2: 단일 이미지 / PDF 텍스트 모드 / 텍스트 파일 — 1 row 저장 (v18 흐름 + v19 sourceMeta) ───
       const contentToSave = `[파일: ${file.name}] ${analyzed}`;
+
+      // 단일 row의 sourceMeta 빌드 (v19)
+      // - 이미지: page 빈 칸 / section은 Vision 응답에서 추출 / url은 Drive 업로드 URL
+      // - PDF 텍스트 모드: page 빈 칸(전체) / section은 응답에서 추출 / url 빈 칸 (직접 업로드 PDF는 Drive에 없음)
+      // - 텍스트 파일: meta 모두 빈 칸 (sourceMeta=null)
+      let sourceMeta = null;
+      if (isImage) {
+        const section = parseChapterFromAnalysis(analyzed);
+        sourceMeta = buildSourceMeta(file.name, "", section, uploadedImageUrl);
+      } else if (isPDF && pdfMode === "text") {
+        const section = parseChapterFromAnalysis(analyzed);
+        sourceMeta = buildSourceMeta(file.name, "", section, "");
+      }
 
       // 충돌 검사
       const conflict = await checkConflict(role, category, contentToSave);
       if (conflict) {
-        setConflictQueue([{ category, content: contentToSave, conflict }]);
+        setConflictQueue([{ category, content: contentToSave, conflict, sourceMeta }]);
       } else {
-        await saveToSheet(role, category, contentToSave);
+        await saveToSheet(role, category, contentToSave, sourceMeta);
 
         // 불량 사진이고 누적 임계 도달 시 패턴 추출 (백그라운드)
         if (imageType === "불량 사진") {
@@ -2506,21 +2784,7 @@ ${dataText.slice(0, 8000)}
           setDefectInfo({ ...defectInfo, count: newCount });
         }
 
-        // 정상 저장 완료 → 다음 파일 업로드를 위해 모든 입력 초기화
-        // (충돌 분기로 들어간 경우는 사용자가 충돌 해결 후 결정해야 하므로 초기화하지 않음)
-        if (preview) URL.revokeObjectURL(preview); // 메모리 누수 방지
-        setFile(null);
-        setPreview("");
-        setAnalyzed("");
-        setImageType("");
-        setRecommendedCategory("");
-        setUploadedImageUrl("");
-        setPdfDoc(null);
-        setPdfPageCount(0);
-        setPdfImageUrls([]);
-        setPdfMode("text");
-        setError("");
-        if (fileRef.current) fileRef.current.value = "";  // 같은 파일 재업로드 가능하게 input 초기화
+        resetInputs();
       }
 
       setSaved(true);
@@ -2769,59 +3033,192 @@ ${dataText.slice(0, 8000)}
       {/* 분석 결과 */}
       {analyzed && (
         <div style={{ marginBottom:14 }}>
-          <div style={{
-            background:`${roleInfo.color}06`, border:`1px solid ${roleInfo.color}25`,
-            borderRadius:10, padding:"13px 15px", marginBottom:10,
-          }}>
-            <div style={{ fontSize:10, color:roleInfo.color, fontWeight:800, marginBottom:7 }}>
-              🤖 AI 분석 결과 ({category})
-            </div>
-            <textarea
-              value={analyzed}
-              onChange={e => setAnalyzed(e.target.value)}
-              rows={4}
-              style={{
-                width:"100%", background:"transparent",
-                border:"none", color:"#dde4f0",
-                fontSize:12.5, lineHeight:1.75, outline:"none",
-                resize:"vertical", fontFamily:"inherit",
-                boxSizing:"border-box",
-              }}
-            />
-            <div style={{ fontSize:9, color:"#374151", marginTop:4 }}>
-              내용을 직접 수정할 수 있어요
-            </div>
-          </div>
+          {/* v19: PDF Vision 모드면 페이지별 카드 UI, 그 외는 기존 textarea */}
+          {(isPDF && pdfMode === "vision" && pdfPageResults.length > 0) ? (
+            <>
+              <div style={{ fontSize:10, color:roleInfo.color, fontWeight:800, marginBottom:8 }}>
+                🤖 페이지별 분석 결과 ({pdfPageResults.length}페이지 · 저장 카테고리: {category})
+              </div>
+              <div style={{
+                fontSize:10, color:"#64748b", marginBottom:10, padding:"6px 10px",
+                background:"rgba(15,23,42,0.5)", borderRadius:6,
+                border:"1px solid rgba(51,65,85,0.3)", lineHeight:1.5,
+              }}>
+                💡 각 페이지는 시트에 별도 행으로 저장됩니다. 카드를 클릭해 펼치면 내용 검토·편집 가능.
+                저장 시 분석 실패 페이지는 자동 건너뜁니다.
+              </div>
 
-          {/* 드라이브 업로드 상태 (이미지인 경우만) */}
-          {isImage && (
-            <div style={{
-              background: uploadedImageUrl ? "rgba(52,211,153,0.06)" : "rgba(239,68,68,0.06)",
-              border: `1px solid ${uploadedImageUrl ? "rgba(52,211,153,0.3)" : "rgba(239,68,68,0.25)"}`,
-              borderRadius:8, padding:"9px 13px", marginBottom:10,
-              fontSize:11, lineHeight:1.6,
-            }}>
-              {uploadedImageUrl ? (
-                <>
-                  <span style={{ color:"#34d399", fontWeight:700 }}>✅ 드라이브에 저장됨</span>
-                  <a href={uploadedImageUrl} target="_blank" rel="noopener noreferrer" style={{
-                    color:"#93c5fd", marginLeft:8, fontSize:10.5, textDecoration:"underline",
+              {pdfPageResults.map(p => {
+                const isOpen = !!pageExpanded[p.pageNum];
+                const borderColor = p.isError ? "rgba(239,68,68,0.35)" : `${roleInfo.color}30`;
+                return (
+                  <div key={p.pageNum} style={{
+                    background:"rgba(15,23,42,0.55)",
+                    border:`1px solid ${borderColor}`,
+                    borderRadius:8, marginBottom:6, overflow:"hidden",
                   }}>
-                    🔗 원본 이미지 보기
-                  </a>
-                </>
-              ) : (
-                <>
-                  <span style={{ color:"#fca5a5", fontWeight:700 }}>⚠️ 드라이브 업로드 실패</span>
-                  <span style={{ color:"#94a3b8", marginLeft:6, fontSize:10.5 }}>
-                    (분석 결과는 그대로 저장되며, URL만 누락됨)
-                  </span>
-                </>
-              )}
-            </div>
-          )}
+                    {/* 카드 헤더 */}
+                    <div
+                      onClick={() => setPageExpanded(pe => ({ ...pe, [p.pageNum]: !pe[p.pageNum] }))}
+                      style={{
+                        padding:"9px 12px", cursor:"pointer",
+                        display:"flex", alignItems:"center", gap:8,
+                        background: isOpen ? "rgba(30,41,59,0.5)" : "transparent",
+                        transition:"background 0.15s",
+                      }}
+                    >
+                      <span style={{
+                        fontSize:11, fontWeight:800, color:roleInfo.color,
+                        minWidth:55,
+                      }}>📄 p.{p.pageNum}</span>
+                      {p.section && (
+                        <span style={{
+                          fontSize:10, padding:"1px 7px",
+                          background:`${roleInfo.color}15`, color:roleInfo.color,
+                          borderRadius:4, fontWeight:700,
+                          whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                          maxWidth:150,
+                        }} title={p.section}>📑 {p.section}</span>
+                      )}
+                      <span style={{
+                        flex:1, fontSize:11, color:"#94a3b8",
+                        overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap",
+                      }}>
+                        {p.isError ? <span style={{ color:"#f87171" }}>⚠️ {p.errorMsg}</span> : (p.summary || "(핵심 정보 미추출)")}
+                      </span>
+                      <span style={{
+                        fontSize:10, color:"#64748b",
+                        transform: isOpen ? "rotate(180deg)" : "rotate(0)",
+                        transition:"transform 0.2s",
+                      }}>▼</span>
+                    </div>
 
-          <SaveBtn onClick={save} saving={saving} saved={saved}/>
+                    {/* 카드 본문 (펼친 상태) */}
+                    {isOpen && (
+                      <div style={{
+                        padding:"4px 12px 10px",
+                        borderTop:"1px solid rgba(51,65,85,0.4)",
+                      }}>
+                        <textarea
+                          value={p.content}
+                          onChange={e => {
+                            const newContent = e.target.value;
+                            setPdfPageResults(arr => arr.map(item =>
+                              item.pageNum === p.pageNum ? { ...item, content: newContent } : item
+                            ));
+                          }}
+                          rows={10}
+                          style={{
+                            width:"100%", background:"rgba(8,14,26,0.7)",
+                            border:"1px solid rgba(51,65,85,0.4)",
+                            borderRadius:6, color:"#dde4f0",
+                            padding:"8px 10px", fontSize:11.5, lineHeight:1.65,
+                            outline:"none", resize:"vertical", marginTop:6,
+                            fontFamily:"inherit", boxSizing:"border-box",
+                            maxHeight:400,
+                          }}
+                        />
+                        <div style={{
+                          display:"flex", alignItems:"center", justifyContent:"space-between",
+                          marginTop:6, fontSize:10, color:"#64748b",
+                        }}>
+                          <span>{(p.content || "").length}자 · 시트 1행으로 저장됨</span>
+                          {p.imageUrl && (
+                            <a href={p.imageUrl} target="_blank" rel="noopener noreferrer" style={{
+                              color:"#93c5fd", fontSize:10, textDecoration:"underline",
+                            }}>🔗 페이지 이미지</a>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+
+              {/* 진행률 표시 (저장 중일 때) */}
+              {saving && saveProgress.total > 0 && (
+                <div style={{
+                  margin:"10px 0",
+                  background:"rgba(15,23,42,0.6)",
+                  border:`1px solid ${roleInfo.color}40`,
+                  borderRadius:8, padding:"10px 12px",
+                }}>
+                  <div style={{ fontSize:11, color:"#cbd5e1", marginBottom:6 }}>
+                    저장 중... {saveProgress.current}/{saveProgress.total} 페이지
+                  </div>
+                  <div style={{
+                    height:6, background:"rgba(51,65,85,0.5)", borderRadius:3, overflow:"hidden",
+                  }}>
+                    <div style={{
+                      height:"100%",
+                      width: saveProgress.total > 0
+                        ? `${(saveProgress.current/saveProgress.total)*100}%` : "0%",
+                      background:`linear-gradient(90deg,${roleInfo.color},${roleInfo.color}99)`,
+                      transition:"width 0.3s",
+                    }}/>
+                  </div>
+                </div>
+              )}
+
+              <SaveBtn onClick={save} saving={saving} saved={saved}/>
+            </>
+          ) : (
+            <>
+              <div style={{
+                background:`${roleInfo.color}06`, border:`1px solid ${roleInfo.color}25`,
+                borderRadius:10, padding:"13px 15px", marginBottom:10,
+              }}>
+                <div style={{ fontSize:10, color:roleInfo.color, fontWeight:800, marginBottom:7 }}>
+                  🤖 AI 분석 결과 ({category})
+                </div>
+                <textarea
+                  value={analyzed}
+                  onChange={e => setAnalyzed(e.target.value)}
+                  rows={4}
+                  style={{
+                    width:"100%", background:"transparent",
+                    border:"none", color:"#dde4f0",
+                    fontSize:12.5, lineHeight:1.75, outline:"none",
+                    resize:"vertical", fontFamily:"inherit",
+                    boxSizing:"border-box",
+                  }}
+                />
+                <div style={{ fontSize:9, color:"#374151", marginTop:4 }}>
+                  내용을 직접 수정할 수 있어요
+                </div>
+              </div>
+
+              {/* 드라이브 업로드 상태 (이미지인 경우만) */}
+              {isImage && (
+                <div style={{
+                  background: uploadedImageUrl ? "rgba(52,211,153,0.06)" : "rgba(239,68,68,0.06)",
+                  border: `1px solid ${uploadedImageUrl ? "rgba(52,211,153,0.3)" : "rgba(239,68,68,0.25)"}`,
+                  borderRadius:8, padding:"9px 13px", marginBottom:10,
+                  fontSize:11, lineHeight:1.6,
+                }}>
+                  {uploadedImageUrl ? (
+                    <>
+                      <span style={{ color:"#34d399", fontWeight:700 }}>✅ 드라이브에 저장됨</span>
+                      <a href={uploadedImageUrl} target="_blank" rel="noopener noreferrer" style={{
+                        color:"#93c5fd", marginLeft:8, fontSize:10.5, textDecoration:"underline",
+                      }}>
+                        🔗 원본 이미지 보기
+                      </a>
+                    </>
+                  ) : (
+                    <>
+                      <span style={{ color:"#fca5a5", fontWeight:700 }}>⚠️ 드라이브 업로드 실패</span>
+                      <span style={{ color:"#94a3b8", marginLeft:6, fontSize:10.5 }}>
+                        (분석 결과는 그대로 저장되며, URL만 누락됨)
+                      </span>
+                    </>
+                  )}
+                </div>
+              )}
+
+              <SaveBtn onClick={save} saving={saving} saved={saved}/>
+            </>
+          )}
         </div>
       )}
 
@@ -4568,37 +4965,45 @@ export default function App() {
         const isPdfFile = (fileData.mimetype || "").includes("pdf") ||
                           (file.filename || "").toLowerCase().endsWith(".pdf");
 
-        let newContent = null;
-        let category = weakItem.category || "공장정보"; // 기존 카테고리 유지 기본
+        // v19: 저장할 row 배열 — 이미지는 1개, PDF Vision은 페이지 수만큼
+        //   각 원소: { content, sourceMeta }
+        let rowsToSave = [];
+        let category = weakItem.category || "공장정보"; // 기존 카테고리 유지
 
         if (isImageFile) {
-          // 단일 이미지 재학습 (v10 프롬프트 사용)
+          // 단일 이미지 재학습 (v19: 5블록 + sourceMeta)
           const folderHint = file.subPath ? `\n폴더 경로: ${file.subPath}` : "";
           const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
 이 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.${folderHint}
 
 이미지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계·수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
 
-다음 4블록 형식:
+다음 5블록 형식:
 [추출 텍스트] (이미지의 실제 내용. 구체값 빠뜨리지 말 것)
 [핵심 정보] (이 이미지가 다루는 공정·설비·이슈 — 한 문장)
 [메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
+[챕터/섹션] (이미지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)
 [추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
           const analyzed = await callClaudeVision(sys, "이 이미지를 분석하세요.", fileData.base64, fileData.mimetype);
           const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
           if (catMatch && ["공장정보","업무역할","판단기준","협업방식","교정사례"].includes(catMatch[1])) {
             category = catMatch[1];
           }
-          newContent = `[파일: ${file.filename}] ${analyzed}`;
+          const newContent = `[파일: ${file.filename}] ${analyzed}`;
+          const section = parseChapterFromAnalysis(analyzed);
+          const sourceMeta = buildSourceMeta(file.filename, "", section, file.url);
+          rowsToSave.push({ content: newContent, sourceMeta });
         } else if (isPdfFile) {
-          // PDF 재학습: 페이지별 분석 후 종합 (단순화: 텍스트 추출 우선, 부족하면 Vision)
-          // pdf.js로 페이지별 처리
+          // PDF 재학습 (v19): 목차 파싱 → 페이지별 4블록 → 페이지별 row N개 저장
+          // - 카테고리는 기존 weakItem.category 유지 (재학습이므로)
           if (!window.pdfjsLib) {
             await loadPdfjs();
           }
           const pdf = await window.pdfjsLib.getDocument({ data: base64ToUint8Array(fileData.base64) }).promise;
           const pageCount = pdf.numPages;
-          const pageResults = [];
+          const outlineMap = await extractPdfOutline(pdf);
+          let lastSection = "";
+
           for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
             if (relearnCancelRef.current) break;
             const pageBase64 = await pdfPageToBase64(pdf, pageNum);
@@ -4607,25 +5012,45 @@ export default function App() {
 
 페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 항목명·대수·사양·비고 등 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
 
-다음 3블록 형식:
+다음 4블록 형식:
 [추출 텍스트] (페이지의 실제 내용. 구체값 빠뜨리지 말 것)
 [핵심 정보] (이 페이지가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일, 페이지 번호 등이 보이면 기재)`;
+[메타데이터] (문서 제목, Rev, 작성일, 페이지 번호 등이 보이면 기재)
+[챕터/섹션] (페이지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)`;
+
+            let pageRes = "";
+            let isError = false;
             try {
-              const pageRes = await callClaudeVision(pagePrompt, "이 PDF 페이지를 분석하세요.", pageBase64, "image/jpeg");
-              pageResults.push(`━━ 페이지 ${pageNum} ━━\n${pageRes}`);
+              pageRes = await callClaudeVision(pagePrompt, "이 PDF 페이지를 분석하세요.", pageBase64, "image/jpeg");
             } catch (e) {
-              pageResults.push(`━━ 페이지 ${pageNum} ━━\n(분석 실패)`);
+              isError = true;
+              pageRes = `(분석 실패: ${e.message || "알 수 없는 오류"})`;
             }
+
+            if (isError) continue; // 분석 실패 페이지는 row 만들지 않음
+
+            // 챕터 결정: 목차 → Vision → 직전 페이지 상속 → 빈 칸
+            let section = outlineMap[pageNum] || "";
+            if (!section) section = parseChapterFromAnalysis(pageRes);
+            if (!section) section = lastSection;
+            if (section) lastSection = section;
+
+            const pageContent = `[파일: ${file.filename}] [PDF 페이지 ${pageNum}/${pageCount}]\n${pageRes}`;
+            const sourceMeta = buildSourceMeta(
+              file.filename,
+              String(pageNum),
+              section,
+              file.url ? `${file.url}#page=${pageNum}` : ""
+            );
+            rowsToSave.push({ content: pageContent, sourceMeta });
           }
-          newContent = `[파일: ${file.filename}] [PDF: ${file.filename} - 그림 분석, ${pageCount}페이지]\n\n${pageResults.join("\n\n")}`;
         } else {
           failCount++;
           errors.push(`${file.filename}: 지원 안 되는 형식`);
           continue;
         }
 
-        if (!newContent) {
+        if (rowsToSave.length === 0) {
           failCount++;
           errors.push(`${file.filename}: 분석 결과 없음`);
           continue;
@@ -4634,12 +5059,11 @@ export default function App() {
         // 2. 기존 빈약 항목 + 같은 파일의 동료 row 모두 삭제 (v14)
         //    한 파일이 시트에 여러 row로 분리 저장된 구조 반영
         //    - 메타 row, [종합 요약] row, [페이지N] row 등 동료들 모두 정리
-        //    - 식별: 같은 파일명이 content에 포함된 모든 row
+        //    - 식별: 같은 파일명이 content에 포함된 모든 row (백워드 호환)
         try {
           await deleteKnowledge(role, weakItem.category, weakItem.content);
 
-          // 같은 파일의 동료 row들도 삭제 (메타 row 외에)
-          // 현재 knowledge에서 fname이 포함된 다른 row 찾기
+          // 같은 파일의 동료 row들도 삭제
           const companionRows = knowledge.filter(k => {
             if (!k.content || k.content === weakItem.content) return false;
             return k.content.includes(file.filename);
@@ -4656,9 +5080,22 @@ export default function App() {
           console.warn("[재학습] 기존 항목 삭제 실패 (계속 진행):", delErr);
         }
 
-        // 3. 새 학습 결과 저장 (청크 분할 자동 적용)
-        await saveToSheet(role, category, newContent);
-        successCount++;
+        // 3. 새 학습 결과 저장 (v19: 페이지별 N개 row + sourceMeta)
+        let rowOkCount = 0;
+        for (const row of rowsToSave) {
+          try {
+            const ok = await saveToSheet(role, category, row.content, row.sourceMeta);
+            if (ok) rowOkCount++;
+          } catch (saveErr) {
+            console.error(`[재학습] row 저장 실패:`, saveErr);
+          }
+        }
+        if (rowOkCount > 0) {
+          successCount++;
+        } else {
+          failCount++;
+          errors.push(`${file.filename}: 모든 row 저장 실패`);
+        }
 
       } catch (e) {
         failCount++;
@@ -4890,17 +5327,18 @@ export default function App() {
         const isPdfFile = (fileData.mimetype || "").includes("pdf") || (f.filename || "").toLowerCase().endsWith(".pdf");
 
         if (isImageFile) {
-          // ─── 이미지 처리 (Step 7-10B 적용) ───
+          // ─── 이미지 처리 (v19: 5블록 + sourceMeta) ───
           const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
           const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
 이 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.${folderHint}
 
 이미지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계·수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
 
-다음 4블록 형식:
+다음 5블록 형식:
 [추출 텍스트] (이미지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
 [핵심 정보] (이 이미지가 다루는 공정·설비·이슈 — 한 문장)
 [메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
+[챕터/섹션] (이미지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)
 [추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
 
           const analyzed = await callClaudeVision(sys, "이 이미지를 분석하세요.", fileData.base64, fileData.mimetype);
@@ -4908,10 +5346,13 @@ export default function App() {
           const recommendedCat = catMatch ? catMatch[1] : "판단기준";
           const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
           const content = `${sourceTag} [이미지URL] ${f.url}\n${analyzed}`;
+          // v19: sourceMeta (file/page=빈칸/section/url=Drive 이미지 URL)
+          const section = parseChapterFromAnalysis(analyzed);
+          const sourceMeta = buildSourceMeta(f.filename, "", section, f.url);
           if (f.source === "common") {
-            await saveCommonKnowledge(recommendedCat, content);
+            await saveCommonKnowledge(recommendedCat, content, sourceMeta);
           } else {
-            await saveToSheet(role, recommendedCat, content);
+            await saveToSheet(role, recommendedCat, content, sourceMeta);
           }
           await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
           successCount++;
@@ -4939,12 +5380,18 @@ export default function App() {
             const fullText = await extractPdfText(pdf);
 
             if (fullText && fullText.trim().length >= 50) {
-              // 텍스트 추출 성공
+              // 텍스트 추출 성공 (v19: 5블록 형식)
               const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트)` : "";
               const sys = `${roleInfo.label}(${role}) AI입니다. PDF에서 추출한 텍스트입니다.${folderHint}
-한국어로 핵심 내용만 간결하게 정리. 500자 이내.
+한국어로 핵심 내용만 정리하되, 학습 가치 있는 구체 정보(수치·부품명·단계 등)는 빠뜨리지 마세요.
 표/구조가 있으면 살려서 정리하세요.
-마지막 줄에 [추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나로 분류.`;
+
+다음 5블록 형식:
+[추출 텍스트] (원문에서 학습 가치 있는 내용. 1000자 이내 권장)
+[핵심 정보] (이 문서가 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
+[챕터/섹션] (이 문서의 주요 챕터/섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)
+[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
               const truncated = fullText.slice(0, 12000);
               pdfResult = await callClaude(sys, `다음 PDF 내용에서 핵심을 추출하세요:\n\n${truncated}`);
               pdfResult = `[PDF: ${f.filename} - 텍스트 추출, ${pageCount}페이지]\n${pdfResult}`;
@@ -4956,10 +5403,16 @@ export default function App() {
             }
           }
 
-          // 그림 분석 모드 (또는 폴백)
+          // 그림 분석 모드 (또는 폴백) — v19: 페이지별 N개 row 저장 + 챕터 보존
           if (syncPdfMode === "vision" || usedMode === "vision_fallback") {
-            const allResults = [];
+            // 1) 목차 파싱
+            const outlineMap = await extractPdfOutline(pdf);
+
+            // 2) 페이지별 분석
+            const pagePayloads = []; // { pageNum, pageContent, section, isError, imageUrl }
             const pageUrls = [];
+            let lastSection = "";
+            let firstPageRecommendedCat = ""; // 첫 페이지에서 추출 (PDF 전체 카테고리)
 
             for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
               setSyncProgress({
@@ -4978,54 +5431,110 @@ export default function App() {
               } catch (e) { /* 업로드 실패해도 분석은 계속 */ }
               pageUrls.push(pageUrl);
 
-              // Vision 분석 (Step 7-10B)
+              // Vision 분석 (v19: 4블록, 첫 페이지만 [추천 카테고리]까지 5블록)
               const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath}` : "";
-              const pagePrompt = `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pageCount} 분석.${folderHint}
+              const isFirstPage = pageNum === 1;
+              const pagePrompt = isFirstPage
+                ? `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pageCount} 분석.${folderHint}
 
-페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 항목명·대수·사양·비고 등 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
+페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출.**
 
-다음 3블록 형식:
+다음 5블록 형식:
 [추출 텍스트] (페이지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
 [핵심 정보] (이 페이지가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일, 페이지 번호 등이 보이면 기재)`;
+[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
+[챕터/섹션] (페이지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)
+[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나 (PDF 전체 카테고리)`
+                : `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pageCount} 분석.${folderHint}
 
+페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출.**
+
+다음 4블록 형식:
+[추출 텍스트] (페이지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
+[핵심 정보] (이 페이지가 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
+[챕터/섹션] (페이지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)`;
+
+              let pageContent = "";
+              let isError = false;
               try {
-                const pageRes = await callClaudeVision(pagePrompt, "이 PDF 페이지를 분석하세요.", pageBase64, "image/jpeg");
-                allResults.push(`━━ 페이지 ${pageNum} ━━\n${pageRes}`);
+                pageContent = await callClaudeVision(pagePrompt, "이 PDF 페이지를 분석하세요.", pageBase64, "image/jpeg");
               } catch (e) {
-                allResults.push(`━━ 페이지 ${pageNum} ━━\n(분석 실패)`);
+                isError = true;
+                pageContent = `(분석 실패: ${e.message || "알 수 없는 오류"})`;
+              }
+
+              // 첫 페이지: 카테고리 추출 (PDF 전체 카테고리로 사용)
+              if (isFirstPage && !isError) {
+                const catMatch = pageContent.match(/\[추천 카테고리\]\s*([가-힣]+)/);
+                if (catMatch && ["공장정보","업무역할","판단기준","협업방식","교정사례"].includes(catMatch[1])) {
+                  firstPageRecommendedCat = catMatch[1];
+                }
+              }
+
+              // 챕터 결정: 목차 → Vision 응답 → 직전 페이지 상속 → 빈 칸
+              let section = outlineMap[pageNum] || "";
+              if (!section && !isError) {
+                section = parseChapterFromAnalysis(pageContent);
+              }
+              if (!section) section = lastSection;
+              if (section) lastSection = section;
+
+              pagePayloads.push({ pageNum, pageContent, section, isError, imageUrl: pageUrl });
+            }
+
+            // 3) PDF 전체 카테고리 결정 (첫 페이지 추천, 폴백: 판단기준)
+            const recommendedCat = firstPageRecommendedCat || "판단기준";
+
+            // 4) 페이지별 row 저장 (각 페이지 = 1 row)
+            const fallbackTag = usedMode === "vision_fallback" ? " (텍스트 부족으로 자동 전환)" : "";
+            const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
+            let pageOkCount = 0;
+            for (const p of pagePayloads) {
+              if (p.isError) continue; // 분석 실패 페이지 건너뜀
+              const pageContent = `${sourceTag} [PDF 페이지 ${p.pageNum}/${pageCount}${fallbackTag}]\n${p.pageContent}`;
+              const sourceMeta = buildSourceMeta(
+                f.filename,
+                String(p.pageNum),
+                p.section,
+                f.url ? `${f.url}#page=${p.pageNum}` : ""
+              );
+              try {
+                if (f.source === "common") {
+                  await saveCommonKnowledge(recommendedCat, pageContent, sourceMeta);
+                } else {
+                  await saveToSheet(role, recommendedCat, pageContent, sourceMeta);
+                }
+                pageOkCount++;
+              } catch (saveErr) {
+                console.error(`[Sync] 페이지 ${p.pageNum} 저장 실패:`, saveErr);
               }
             }
 
-            // 종합 요약
-            setSyncProgress({
-              current: i + 1, total: allFiles.length,
-              currentFile: `${displayName} (종합 분석 중...)`,
-            });
-            const combined = allResults.join("\n\n");
-            const sumSys = `위 페이지별 분석 결과들을 종합해서 PDF 전체의 핵심을 ${roleInfo.label}(${role}) 관점에서 한국어 500자 이내로 정리하세요.
-마지막 줄에 [추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나로 분류.`;
-            const summary = await callClaude(sumSys, combined);
-
-            const urlLines = pageUrls
-              .map((u, idx) => u ? `[페이지${idx+1}URL] ${u}` : `[페이지${idx+1}URL] (업로드 실패)`)
-              .join("\n");
-
-            const fallbackTag = usedMode === "vision_fallback" ? " (텍스트 부족으로 자동 전환)" : "";
-            pdfResult = `[PDF: ${f.filename} - 그림 분석${fallbackTag}, ${pageCount}페이지]\n${urlLines}\n\n[종합 요약]\n${summary}\n\n[페이지별 상세]\n${combined}`;
+            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
             pdfVisionCount++;
+            if (pageOkCount > 0) {
+              successCount++;
+            } else {
+              failCount++;
+              errors.push(`${displayName}: 모든 페이지 저장 실패`);
+            }
+            continue; // Vision 모드 처리 완료 — 아래 텍스트 모드 저장 분기 건너뜀
           }
 
-          // 카테고리 추출
+          // 텍스트 모드 저장 (Vision 모드는 위에서 continue로 빠짐)
+          // v19: sourceMeta 추가 (page 빈 칸, section은 응답에서 추출, url=f.url)
           const catMatch = pdfResult.match(/\[추천 카테고리\]\s*([가-힣]+)/);
           const recommendedCat = catMatch ? catMatch[1] : "판단기준";
           const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
           const content = `${sourceTag}\n${pdfResult}`;
+          const section = parseChapterFromAnalysis(pdfResult);
+          const sourceMeta = buildSourceMeta(f.filename, "", section, f.url);
 
           if (f.source === "common") {
-            await saveCommonKnowledge(recommendedCat, content);
+            await saveCommonKnowledge(recommendedCat, content, sourceMeta);
           } else {
-            await saveToSheet(role, recommendedCat, content);
+            await saveToSheet(role, recommendedCat, content, sourceMeta);
           }
           await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
           successCount++;
