@@ -1,3 +1,18 @@
+// App_Step7_v20.jsx
+// 트랙 1 단계 8 — 채팅 응답에 출처 표시
+//
+// 주요 변경 (v19 → v20):
+//   - 채팅 컨텍스트 구성 시 row마다 [SRC:N] 번호 부여 + sourceMap 누적 (메타 + content)
+//   - 시스템 프롬프트: 사실 조회 답변일 때 끝줄에 [USED_SOURCES] N,N,N 형식으로 사용한 row 번호 첨부 지시
+//   - 답변 파싱: [USED_SOURCES] 라인 분리 → 본문에서 제거 + 사용된 row의 sourceMeta 추출
+//   - 청크 row 중복 제거 (file+page+url 키 기준 → 같은 파일 같은 페이지는 1개 카드)
+//   - content fallback: sourceMeta 비어있어도 content에 [파일: xxx] 태그 있으면 파일명 카드 표시 ((ㄷ))
+//   - 메시지 객체에 sources 배열 첨부 (Apps Script로 저장될 때는 보존, 화면에는 접힌 카드 UI)
+//   - 답변 메시지 하단 접힌 카드 UI: "📑 출처 N개 보기 ▼" 클릭 시 펼침 → 각 카드 클릭 시 Drive URL 새 탭
+//   - 적용 범위: detail 모드 + 사실 조회만 (isFactualQuery)
+//
+// 호환성: 기존 채팅 흐름 동일, 사실 조회 아닌 답변에는 출처 카드 없음 (노이즈 방지)
+
 // App_Step7_v19.jsx
 // 트랙 1 단계 3·4: PDF 학습에 출처 메타 보존 추가
 //
@@ -1212,6 +1227,63 @@ function ProgressBar({ label, value, color }) {
   );
 }
 
+// v20: 채팅 답변 하단 출처 카드 (접힌 형태 → 클릭 시 펼침 → 각 카드 클릭 시 Drive URL 새 탭)
+function SourcesCard({ sources, roleColor }) {
+  const [open, setOpen] = useState(false);
+  if (!sources || sources.length === 0) return null;
+  return (
+    <div style={{ marginTop:10, paddingTop:8, borderTop:`1px dashed rgba(148,163,184,0.2)` }}>
+      <div
+        onClick={() => setOpen(o => !o)}
+        style={{
+          fontSize:11, color:roleColor, fontWeight:700, cursor:"pointer",
+          display:"flex", alignItems:"center", gap:5, userSelect:"none",
+        }}
+      >
+        📑 출처 {sources.length}개 {open ? "▼" : "▶"}
+      </div>
+      {open && (
+        <div style={{ marginTop:6, display:"flex", flexDirection:"column", gap:4 }}>
+          {sources.map((s, i) => {
+            const isClickable = !!s.url;
+            const card = (
+              <div style={{
+                padding:"6px 9px",
+                background:"rgba(8,14,26,0.55)",
+                border:`1px solid rgba(51,65,85,0.5)`,
+                borderRadius:6,
+                fontSize:11, lineHeight:1.5,
+                cursor: isClickable ? "pointer" : "default",
+                transition:"border-color 0.15s",
+              }}
+              onMouseEnter={isClickable ? (e) => e.currentTarget.style.borderColor = `${roleColor}66` : undefined}
+              onMouseLeave={isClickable ? (e) => e.currentTarget.style.borderColor = "rgba(51,65,85,0.5)" : undefined}>
+                <div style={{ color:"#cbd5e1", fontWeight:600 }}>
+                  📄 {s.file}
+                  {s.page && <span style={{ color:"#94a3b8", fontWeight:400 }}> · p.{s.page}</span>}
+                </div>
+                {s.section && (
+                  <div style={{ color:"#94a3b8", fontSize:10, marginTop:1 }}>
+                    📑 {s.section}
+                  </div>
+                )}
+                {isClickable && (
+                  <div style={{ color:"#93c5fd", fontSize:10, marginTop:2 }}>
+                    🔗 원본 열기
+                  </div>
+                )}
+              </div>
+            );
+            return isClickable
+              ? <a key={i} href={s.url} target="_blank" rel="noopener noreferrer" style={{ textDecoration:"none" }}>{card}</a>
+              : <div key={i}>{card}</div>;
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SaveBtn({ onClick, saving, saved }) {
   return (
     <button onClick={onClick} disabled={saving} style={{
@@ -1393,6 +1465,8 @@ ${summaryData.content}
       let detailContext = "";
       let usedScoring = false;
       let topMatchCount = 0;
+      // v20: 출처 매핑용 — sourceMap[srcIdx-1] = knowledge row 객체
+      const sourceMap = [];
 
       if (isDetailMode) {
         const allKnowledge = await loadFromSheet(role);
@@ -1451,6 +1525,7 @@ ${summaryData.content}
           // 우선순위 항목 (점수 매칭) → 6000자 cap까지 채우기 (Step 7-10C)
           // - 한 항목이 너무 크면 다른 매칭 항목이 못 들어감 → 항목당 3000자 cap
           // - 청크 분할(7-10A)로 대부분 안 걸리지만, 외부에서 들어온 큰 항목 안전망
+          // v20: 각 row에 [SRC:N] 번호 부여 + sourceMap 누적 (답변 후 출처 표시용)
           const selected = [];
           let usedChars = 0;
           const HARD_CAP = 6000;
@@ -1461,9 +1536,11 @@ ${summaryData.content}
           };
           for (const s of matched) {
             const truncatedContent = truncateForContext(s.item.content || "");
-            const formatted = `[${s.item.category}] ${truncatedContent}`;
+            const srcIdx = selected.length + 1; // 1-based 번호
+            const formatted = `[SRC:${srcIdx}] [${s.item.category}] ${truncatedContent}`;
             if (usedChars + formatted.length > HARD_CAP) break;
             selected.push(formatted);
+            sourceMap.push(s.item); // index = srcIdx - 1
             usedChars += formatted.length + 1; // \n 포함
           }
 
@@ -1475,9 +1552,11 @@ ${summaryData.content}
               .reverse();
             for (const s of unmatchedRecent) {
               const truncatedContent = truncateForContext(s.item.content || "");
-              const formatted = `[${s.item.category}] ${truncatedContent}`;
+              const srcIdx = selected.length + 1;
+              const formatted = `[SRC:${srcIdx}] [${s.item.category}] ${truncatedContent}`;
               if (usedChars + formatted.length > HARD_CAP) break;
               selected.push(formatted);
+              sourceMap.push(s.item);
               usedChars += formatted.length + 1;
             }
           }
@@ -1486,7 +1565,7 @@ ${summaryData.content}
             const header = usedScoring
               ? `[참고 - 원본 학습 데이터 (질문 관련 ${matched.length}건 중 상위 ${selected.length}건)]`
               : `[참고 - 원본 학습 데이터 (최근 ${selected.length}건)]`;
-            detailContext = `\n\n${header}\n${selected.join("\n")}\n\n위 원본 데이터에서 정확한 정보를 찾아 답변하세요. 학습된 내용에 관한 질문이면 반드시 위 데이터를 근거로 답하고, 데이터에 없는 정보만 모른다고 답하세요. 데이터에 라인·수치·날짜 같은 구체 정보가 있으면 빠뜨리지 말고 답에 포함하세요. 항목 끝에 "[잘림: ...]" 표시가 있으면 그 항목엔 더 많은 정보가 있다는 의미입니다 — 사용자가 그 부분을 묻거나 "더 알려줘"라고 하면 "이 항목은 일부만 표시되었습니다. '(2/3) 또는 (3/3)' 같은 후속 청크가 있는지 보관함에서 확인해주세요"라고 안내하거나, 잘린 부분과 관련된 구체적 후속 질문을 안내하세요.`;
+            detailContext = `\n\n${header}\n${selected.join("\n")}\n\n위 원본 데이터에서 정확한 정보를 찾아 답변하세요. 각 항목 앞 [SRC:N]은 데이터 식별 번호이니 본문에 노출하지 마세요. 학습된 내용에 관한 질문이면 반드시 위 데이터를 근거로 답하고, 데이터에 없는 정보만 모른다고 답하세요. 데이터에 라인·수치·날짜 같은 구체 정보가 있으면 빠뜨리지 말고 답에 포함하세요. 항목 끝에 "[잘림: ...]" 표시가 있으면 그 항목엔 더 많은 정보가 있다는 의미입니다 — 사용자가 그 부분을 묻거나 "더 알려줘"라고 하면 "이 항목은 일부만 표시되었습니다. '(2/3) 또는 (3/3)' 같은 후속 청크가 있는지 보관함에서 확인해주세요"라고 안내하거나, 잘린 부분과 관련된 구체적 후속 질문을 안내하세요.`;
           }
         }
       }
@@ -1514,13 +1593,64 @@ ${summaryData.content}
         ? "300자 이내로 답하되, 학습된 사실(라인·수치·날짜·부품명 등)은 빠뜨리지 말고 모두 포함하세요. 사용자에게 되묻기보다 데이터에서 찾아 답하는 것을 우선하세요."
         : "150자 이내로 간결하게 한국어로 답하세요.";
 
+      // v20: 사실 조회일 때만 출처 매핑 요청 (잡담엔 노이즈)
+      const sourceGuide = (isFactualQuery && sourceMap.length > 0)
+        ? `\n\n답변 작성 후 반드시 마지막 줄에 다음 형식 추가 (다른 텍스트 절대 추가 금지):
+[USED_SOURCES] 1,3,5
+여기서 1,3,5는 답변의 근거로 실제 사용한 데이터의 [SRC:N] 번호입니다. 사용한 게 없으면 [USED_SOURCES] none 으로 표기. 인사·잡담·모름 답변은 [USED_SOURCES] none 으로 표기.`
+        : "";
+
       const system = `당신은 ${roleInfo.label} AI로 훈련 중입니다.
 사용자가 공장 상황과 ${role} 업무를 알려주면 자연스럽게 대화하며 더 깊이 파악하세요.
 모르는 부분은 추가 질문하고, 중요한 내용은 확인하세요.
 수율/KPI 수치보다 실제 업무 흐름, 협업 방식, 현장 문제에 집중하세요.
-${lengthGuide}${summaryContext}${commonContext}${detailContext}`;
-      const reply = await callClaude(system, msg);
-      setMsgs(m => [...m, { role:"assistant", content:reply }]);
+${lengthGuide}${summaryContext}${commonContext}${detailContext}${sourceGuide}`;
+      const rawReply = await callClaude(system, msg);
+
+      // v20: 답변에서 [USED_SOURCES] 라인 분리 → 본문에서 제거 + 사용된 row의 sourceMeta 추출
+      let cleanReply = rawReply;
+      let usedSources = [];
+      if (isFactualQuery && sourceMap.length > 0) {
+        const usedMatch = rawReply.match(/\[USED_SOURCES\][^\n]*/);
+        if (usedMatch) {
+          cleanReply = rawReply.replace(usedMatch[0], "").trim();
+          const inside = usedMatch[0].replace("[USED_SOURCES]", "").trim();
+          if (inside && inside.toLowerCase() !== "none") {
+            const indices = inside.split(/[,\s]+/)
+              .map(s => parseInt(s.trim(), 10))
+              .filter(n => !isNaN(n) && n >= 1 && n <= sourceMap.length);
+            // 사용된 row → sourceMeta 추출 + content fallback + 중복 제거
+            const seen = new Set();
+            for (const idx of indices) {
+              const row = sourceMap[idx - 1];
+              if (!row) continue;
+              // 출처 카드 데이터 구축
+              let file = row.source_file || "";
+              const page = row.source_page || "";
+              const section = row.source_section || "";
+              const url = row.source_url || "";
+              // (ㄷ) fallback: sourceMeta 비어있으면 content의 [파일: xxx] 태그에서 파일명 추출
+              if (!file && row.content) {
+                const tagMatch = row.content.match(/\[파일:\s*([^\]]+?)\]/);
+                if (tagMatch) file = tagMatch[1].trim();
+              }
+              // 카드 생성 불가능 (파일명도 없음) → 스킵
+              if (!file) continue;
+              // 중복 키 (file + page + url) — 청크 row 통합
+              const key = `${file}|${page}|${url}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              usedSources.push({ file, page, section, url, category: row.category || "" });
+            }
+          }
+        }
+      }
+
+      setMsgs(m => [...m, {
+        role: "assistant",
+        content: cleanReply,
+        sources: usedSources.length > 0 ? usedSources : undefined,
+      }]);
     } catch {
       setMsgs(m => [...m, { role:"assistant", content:"⚠️ 오류 발생. 다시 시도해주세요." }]);
     } finally { setLoading(false); }
@@ -1750,7 +1880,13 @@ ${dataText.slice(0, 8000)}
               borderRadius:m.role==="user"?"12px 3px 12px 12px":"3px 12px 12px 12px",
               padding:"8px 12px", fontSize:12.5, color:"#dde4f0",
               lineHeight:1.7, whiteSpace:"pre-wrap",
-            }}>{m.content}</div>
+            }}>
+              {m.content}
+              {/* v20: 출처 카드 (사실 조회 답변에 출처 있을 때만) */}
+              {m.sources && m.sources.length > 0 && (
+                <SourcesCard sources={m.sources} roleColor={roleInfo.color}/>
+              )}
+            </div>
           </div>
         ))}
         {loading && (
