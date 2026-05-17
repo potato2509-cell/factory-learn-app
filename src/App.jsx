@@ -1,3 +1,30 @@
+// App_Step7_v24.jsx
+// 트랙 1+ — 자동 점검 강화 + 직접 업로드 UI 안내문구 통일
+//
+// 주요 변경 (v23 → v24):
+//
+// [자동 점검 강화]
+//   1. isWeakAutoItem (빈약 감지) 전면 개선
+//      - 파일 형식 인식 확장: pdf|png|jpg|jpeg + pptx|ppt|xlsx|xls|csv|txt|md (v22/v23 신규 형식 반영)
+//      - v19 페이지별 row 구조 반영: 메타 row 개념 폐기, 각 row 단위로 빈약 판정
+//      - 분석 실패 row 자동 감지: "(분석 실패: ...)", "(이미지 없음)" 등 텍스트 포함 시 빈약 분류
+//      - 빈약 기준 단순화: 짧음 + 의미 있는 내용 부족
+//
+//   2. checkConflict (충돌 감지) 강화
+//      - (A) source_file 기준 같은 원본 row끼리는 충돌 검사 제외 (페이지별 row false positive 방지)
+//      - (B) 비교 대상 20건 → 50건 확대
+//      - (C) 수치/날짜 차이 강조 (프롬프트에 명시: 정량 데이터 불일치는 강한 충돌)
+//      - (D) 카테고리 교차 검사 (다른 카테고리 항목과도 비교, ~2배 비용 증가)
+//
+// [직접 업로드 UI 안내문구 통일]
+//   - 직접 업로드 accept: 기존 (.pdf,.txt,.csv,.md,.jpg,.jpeg,.png) 그대로
+//   - PPT/XLSX는 자동학습 폴더로 안내 (변환 흐름 신설하지 않음 — Q5-가)
+//   - 상단 안내 + 지원 형식 태그 + 하단 안내 박스 모두 일관 업데이트:
+//     · "PDF, 사진(JPG/PNG), 텍스트(TXT/CSV/MD) 직접 업로드 가능"
+//     · "📊 PPT/Excel은 학습자료 폴더에 올려주세요 (자동학습이 PDF 변환·청크 분석으로 처리)"
+//
+// 호환성: 기존 학습 데이터 영향 없음. 자동 점검 강화는 새 점검 시작 시 적용.
+
 // App_Step7_v23.jsx
 // 트랙 1 단계 7 — 자동학습에서 CSV/TXT/MD 파일 지원
 //
@@ -1015,28 +1042,72 @@ async function uploadImageToDrive(role, filename, base64, mimetype) {
   }
 }
 
-// 신규 항목 vs 기존 카테고리 항목들 AI 충돌 검사
+// 신규 항목 vs 기존 항목들 AI 충돌 검사 (v24 강화)
 // 반환: null (충돌 없음) | { conflictWith: {category, content}, type: "duplicate"|"conflict", reason: string }
-async function checkConflict(role, category, newContent) {
-  // 같은 카테고리 기존 데이터 로드
-  const existing = await loadCategoryItems(role, category);
-  if (existing.length === 0) return null; // 비교 대상 없음
+//
+// v24 변경:
+//   (A) source_file 기준 같은 원본 row끼리는 충돌 검사 제외 (페이지별 row false positive 방지)
+//   (B) 비교 대상 최근 20건 → 50건 확대
+//   (C) 수치/날짜 차이 강조 (프롬프트 명시)
+//   (D) 카테고리 교차 검사 (같은 카테고리 + 다른 카테고리도 비교 대상)
+//
+// 인자:
+//   - role: 에이전트 키 (예: Cell_PE)
+//   - category: 신규 항목 카테고리
+//   - newContent: 신규 항목 content
+//   - newSourceFile: (선택) 신규 항목의 source_file (false positive 제외용)
+async function checkConflict(role, category, newContent, newSourceFile) {
+  // v24-D: 카테고리 교차 검사 — 전체 knowledge 로드 후 모든 카테고리 비교
+  //   기존 v23: 같은 카테고리만 로드 → 다른 카테고리 충돌 누락
+  //   v24: loadFromSheet (전체 knowledge) → 같은 카테고리 + 다른 카테고리 모두 비교
+  const allKnowledge = await loadFromSheet(role);
+  if (!allKnowledge || allKnowledge.length === 0) return null;
 
-  // 너무 많으면 최근 20건까지만
-  const targets = existing.slice(-20);
-  const targetsText = targets.map((it, i) => `${i + 1}. ${it.content}`).join("\n");
+  // v24-A: source_file 기준 같은 원본 row 제외 (페이지별 row false positive 방지)
+  //   - 같은 PDF의 페이지 1과 페이지 2는 다른 내용이지만 같은 원본 → 충돌 아님
+  //   - newSourceFile이 있으면 그 파일과 같은 source_file의 row는 비교 대상에서 제외
+  let candidates = allKnowledge;
+  if (newSourceFile && newSourceFile.trim().length > 0) {
+    candidates = allKnowledge.filter(it => {
+      // source_file 메타가 같으면 같은 원본 → 제외
+      if (it.source_file && it.source_file === newSourceFile) return false;
+      // 메타 없을 때는 content의 [파일: ...] 태그 비교 (백워드 호환)
+      const tagMatch = (it.content || "").match(/\[파일:\s*([^\]]+?)\]/);
+      if (tagMatch && tagMatch[1].trim() === newSourceFile) return false;
+      return true;
+    });
+  }
 
+  if (candidates.length === 0) return null;
+
+  // v24-B: 비교 대상 50건으로 확대 (v23: 20건)
+  //   - 같은 카테고리 우선 + 다른 카테고리 채우기
+  const sameCategoryItems = candidates.filter(it => it.category === category);
+  const otherCategoryItems = candidates.filter(it => it.category !== category);
+  const targets = [
+    ...sameCategoryItems.slice(-30),  // 같은 카테고리 최근 30건
+    ...otherCategoryItems.slice(-20), // 다른 카테고리 최근 20건 (v24-D)
+  ];
+  if (targets.length === 0) return null;
+
+  const targetsText = targets
+    .map((it, i) => `${i + 1}. [${it.category}] ${it.content}`)
+    .join("\n");
+
+  // v24-C: 수치/날짜 차이 강조 + (D) 카테고리 교차 명시
   const sys = `당신은 학습 데이터 검증자입니다. 신규 항목이 기존 데이터와 중복되거나 충돌하는지 판단하세요.
 
-[기존 ${category} 항목들]
+[기존 항목들 — 같은/다른 카테고리 혼합]
 ${targetsText}
 
 [신규 항목]
-${newContent}
+[${category}] ${newContent}
 
 [판단 기준]
 - duplicate: 기존 항목 중 하나와 같은 의미 (표현만 다름)
-- conflict: 기존 항목 중 하나와 같은 주제이지만 내용이 다름 (수치 다름, 절차 다름 등)
+- conflict: 기존 항목 중 하나와 같은 주제이지만 내용이 다름
+   ★ 특히 정량 데이터(수치·날짜·치수·시간·횟수 등)가 다르면 강한 충돌로 판단
+   ★ 카테고리가 달라도 같은 사실에 대해 모순되면 충돌로 판단
 - none: 충돌 없음 (다른 주제이거나 보완 정보)
 
 JSON으로만 답하세요. 다른 설명 없이.
@@ -1077,51 +1148,51 @@ function safeJSON(raw) {
   }
 }
 
-// ─── 빈약 자동학습 항목 감지 (Step 7-11 v4) ─────────────────────────────────
-// v14 변경: 메타 row만 대상으로 — 같은 파일이 여러 row로 분리 저장되는 구조 반영
-//   - 시트는 한 파일 = 메타 row(파일명+URL) + 종합요약 row + 페이지별 row
-//   - 종합요약·페이지별 row를 빈약으로 잡으면 파일명 추출 실패 → "Drive 파일 없음"
-//   - 메타 row만 트리거로 잡고, 재학습 시 같은 파일 다른 row도 함께 정리
+// ─── 빈약 자동학습 항목 감지 (v24 전면 개선) ──────────────────────────────
+// v24 변경:
+//   - 파일 형식 인식 확장: pdf|png|jpg|jpeg + pptx|ppt|xlsx|xls|csv|txt|md (v22/v23 신규 형식 반영)
+//   - v19 페이지별 row 구조 반영: 메타 row 개념 폐기. 각 row가 독립 학습 단위 → row 단위 판정
+//   - 분석 실패 row 자동 감지: "(분석 실패: ...)", "(이미지 없음)" 등
+//   - 빈약 기준 단순화: 짧음 + 의미 있는 내용 부족
 //
-// 메타 row 식별: 자동학습 prefix 시작 + 페이지 URL 다수 또는 [PDF: ...] 메타 형식
-// 신호:
-//   (1) [시각 설명] 블록 존재 → v10 이전 학습 (옛 프롬프트). 가장 강한 신호
-//   (2) 분량 < 500자 + 자동학습 prefix → 짧은 빈약
-//   (3) 페이지당 평균 매우 낮음 (페이지 3+ + 평균 <100자)
+// 학습앱이 만든 row 식별 (v19 이후):
+//   - [자동학습-...] : 폴더 동기화 자동학습
+//   - [파일: xxx.{pdf|png|jpg|jpeg|pptx|ppt|xlsx|xls|csv|txt|md}] : 직접 업로드
+//
+// 빈약 신호 (하나라도 해당하면 빈약):
+//   (1) 분석 실패 텍스트 포함 ("분석 실패", "(이미지 없음)", "(빈 응답)")
+//   (2) 분량 < 300자 (페이지별/청크별 row이므로 v23 이전 500자보다 낮춤)
+//   (3) [추출 텍스트] 블록 내용이 매우 짧음 (50자 미만)
+//   (4) v10 이전 옛 프롬프트 표지 ([시각 설명] 블록 존재)
 function isWeakAutoItem(content) {
   if (!content) return false;
 
-  // 학습앱 자동학습이 만든 row만 대상 (v15)
-  // - [자동학습-...] : 학습앱이 폴더 동기화로 만든 row
-  // - [파일: xxx.pdf/png/jpg/jpeg] : 학습앱이 만든 메타 row
-  // 그 외 (docx, 외부학습 v12, 채팅학습 등)는 원본 재학습 불가능하므로 제외
+  // 학습앱이 만든 row만 대상 (v24 확장)
   const isLearningAppRow =
     /^\[자동학습-/i.test(content) ||
-    /^\[파일:\s*[^\]]+\.(?:pdf|png|jpg|jpeg)\s*\]/i.test(content);
+    /^\[파일:\s*[^\]]+\.(?:pdf|png|jpg|jpeg|pptx|ppt|xlsx|xls|csv|txt|md)\s*\]/i.test(content);
   if (!isLearningAppRow) return false;
 
-  // 신호 1: v10 이전 프롬프트 표지 (가장 신뢰)
-  const hasOldPromptMarker = /\[시각 설명\]|## \[시각 설명\]/.test(content);
-  if (hasOldPromptMarker) return true;
+  // 신호 1: 분석 실패 텍스트 (가장 신뢰)
+  // - PDF Vision: "(분석 실패: ...)" / Claude 호출 실패: "(빈 응답)" / 빈 이미지: "(이미지 없음)"
+  if (/\(분석 실패/.test(content)) return true;
+  if (/\(이미지 없음\)/.test(content)) return true;
+  if (/\(빈 응답\)/.test(content)) return true;
 
-  // 신호 2: 짧음
-  if (content.length < 500) return true;
+  // 신호 2: v10 이전 옛 프롬프트 표지 (있으면 재학습 권장)
+  if (/\[시각 설명\]/.test(content)) return true;
 
-  // 신호 3: 정보 밀도 매우 낮음 — 페이지 3개 이상 + 페이지당 평균 < 100자
-  const pageMatches = content.match(/━━ 페이지 \d+ ━━|# PDF 페이지 분석 \(\d+\/\d+\)/g);
-  if (pageMatches && pageMatches.length >= 3) {
-    const avgPerPage = content.length / pageMatches.length;
-    if (avgPerPage < 100) return true;
-  }
+  // 신호 3: 분량 매우 적음
+  // 페이지별 row 구조 반영하여 300자로 낮춤 (v23 이전 500자에서 조정)
+  if (content.length < 300) return true;
 
-  // 신호 4 (v14 신규): 메타 row인데 URL 다수 + 본문 적음 → 빈약 메타 row
-  // 페이지 URL이 5개 이상인데 분량이 작으면 본문이 비어 있다는 뜻
-  const urlMatches = (content.match(/\[페이지\d+URL\]/g) || []).length;
-  if (urlMatches >= 5) {
-    // URL이 차지하는 글자 수 추정 (페이지당 약 100자: "[페이지N URL] https://...")
-    const estimatedUrlChars = urlMatches * 100;
-    const bodyChars = content.length - estimatedUrlChars;
-    if (bodyChars < 200) return true; // 본문 200자 미만이면 빈약
+  // 신호 4: [추출 텍스트] 블록 내용이 거의 없음
+  // 4블록 형식 row에서 추출 텍스트 부분이 비어있거나 매우 짧으면 학습 가치 낮음
+  const extractMatch = content.match(/\[추출 텍스트\]\s*\n?([\s\S]*?)(?:\n\[(?:핵심 정보|메타데이터|챕터\/섹션|추천 카테고리)\]|$)/);
+  if (extractMatch) {
+    const extractText = (extractMatch[1] || "").trim();
+    // 50자 미만 + "(분석 실패..." 같은 단서까지 포함하면 매우 짧음
+    if (extractText.length < 50) return true;
   }
 
   return false;
@@ -3115,8 +3186,8 @@ ${dataText.slice(0, 8000)}
         sourceMeta = buildSourceMeta(file.name, "", section, "");
       }
 
-      // 충돌 검사
-      const conflict = await checkConflict(role, category, contentToSave);
+      // 충돌 검사 (v24: 같은 source_file row 제외)
+      const conflict = await checkConflict(role, category, contentToSave, sourceMeta ? sourceMeta.file : "");
       if (conflict) {
         setConflictQueue([{ category, content: contentToSave, conflict, sourceMeta }]);
       } else {
@@ -3145,16 +3216,16 @@ ${dataText.slice(0, 8000)}
       <div style={{ marginBottom:16 }}>
         <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📄 문서·사진 학습</div>
         <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
-          PDF, Word, Excel, 사진 파일을 업로드하면 AI가 핵심 내용을 추출해요
+          PDF, 사진, 텍스트 파일을 업로드하면 AI가 핵심 내용을 추출해요
         </div>
       </div>
 
-      {/* 지원 형식 */}
+      {/* 지원 형식 (v24: 자동학습과 통일된 안내 — 직접 업로드 가능한 형식만 표시) */}
       <div style={{ display:"flex", gap:6, marginBottom:8, flexWrap:"wrap" }}>
         {[
           { label:"PDF", color:"#ef4444" },
           { label:"JPG/PNG", color:"#f97316" },
-          { label:"TXT/CSV", color:"#a78bfa" },
+          { label:"TXT/CSV/MD", color:"#a78bfa" },
         ].map(t => (
           <span key={t.label} style={{
             background:`${t.color}15`, border:`1px solid ${t.color}30`,
@@ -3164,13 +3235,13 @@ ${dataText.slice(0, 8000)}
         ))}
       </div>
 
-      {/* Word/Excel 미지원 안내 */}
+      {/* PPT/Excel 안내 (v24: PDF 변환 권장 → 자동학습 폴더 안내로 변경) */}
       <div style={{
         fontSize:10, color:"#64748b", marginBottom:14, lineHeight:1.5,
         padding:"6px 10px", background:"rgba(15,23,42,0.5)",
         border:"1px solid rgba(51,65,85,0.3)", borderRadius:6,
       }}>
-        💡 Word/Excel은 PDF로 변환 후 업로드해주세요 (파일 → 다른 이름으로 저장 → PDF)
+        💡 PPT·Excel 파일은 <b>학습자료 폴더에 올려주세요</b> — 자동학습이 PDF 변환·청크 분석으로 처리합니다
       </div>
 
       {/* 파일 업로드 */}
@@ -3200,7 +3271,7 @@ ${dataText.slice(0, 8000)}
         ) : (
           <>
             <div style={{ fontSize:13, color:"#94a3b8" }}>클릭하여 파일 선택</div>
-            <div style={{ fontSize:10, color:"#475569", marginTop:2 }}>PDF, Word, Excel, 사진</div>
+            <div style={{ fontSize:10, color:"#475569", marginTop:2 }}>PDF, 사진, TXT/CSV/MD</div>
           </>
         )}
       </div>
