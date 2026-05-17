@@ -1,3 +1,18 @@
+// App_Step7_v21.jsx
+// 트랙 1 단계 5 — 자동학습에서 PPT 파일 지원 (Apps Script v11 자동 변환 활용)
+//
+// 주요 변경 (v20 → v21):
+//   - 자동학습 fetch_drive_file 응답에 converted_from_pptx 플래그 감지
+//     → 백엔드가 이미 PDF로 자동 변환 + 원본 PPT 휴지통 이동 처리됨
+//     → 클라이언트는 PDF로 인식하고 기존 PDF Vision 흐름 그대로 활용
+//   - markFileProcessedMany 헬퍼 추가 — PPT의 fileId + 변환된 PDF의 fileId 둘 다 processed 표시
+//     → 다음 폴더 스캔에서 변환된 PDF가 또 학습 대상으로 잡히는 중복 학습 방지
+//   - PPT 출처 메타: source_page = "슬라이드 N" 형식, source_url = 변환된 PDF URL #page=N
+//   - 자동학습 결과 화면에 PPT 변환 카운트 표시 (pptConvertedCount)
+//   - 변환된 PDF는 자체 page=N 매핑 가능 (목차/Vision 챕터 결정 흐름 동일)
+//
+// 호환성: PDF는 v19 흐름과 동일, PPT만 추가 흐름 (v21에서 처음 지원)
+
 // App_Step7_v20.jsx
 // 트랙 1 단계 8 — 채팅 응답에 출처 표시
 //
@@ -743,6 +758,20 @@ async function markFileProcessed(role, fileId, filename) {
     });
     return true;
   } catch { return false; }
+}
+
+// v21: 여러 fileId를 한번에 processed 표시 (PPT → PDF 변환 시 두 ID 모두 표시용)
+//   - entries: [{ fileId, filename }, ...]
+//   - markFileProcessed를 순차 호출 (Apps Script 호출 부담 최소화 + 직렬 안전성)
+async function markFileProcessedMany(role, entries) {
+  if (!entries || entries.length === 0) return true;
+  let allOk = true;
+  for (const entry of entries) {
+    if (!entry || !entry.fileId) continue;
+    const ok = await markFileProcessed(role, entry.fileId, entry.filename || "");
+    if (!ok) allOk = false;
+  }
+  return allOk;
 }
 
 // 공통 학습 데이터 저장 (Common_Knowledge 시트)
@@ -5439,6 +5468,7 @@ export default function App() {
     let failCount = 0;
     let pdfTextCount = 0;
     let pdfVisionCount = 0;
+    let pptConvertedCount = 0; // v21: PPT → PDF 자동 변환된 건수
     const errors = [];
 
     for (let i = 0; i < allFiles.length; i++) {
@@ -5448,7 +5478,7 @@ export default function App() {
       setSyncProgress({ current: i + 1, total: allFiles.length, currentFile: displayName });
 
       try {
-        // 1. 파일 다운로드
+        // 1. 파일 다운로드 (v21: Apps Script v11이 PPT를 자동으로 PDF 변환해서 반환)
         const fetchResult = await fetchDriveFile(f.fileId);
         if (!fetchResult.success) {
           failCount++;
@@ -5457,6 +5487,24 @@ export default function App() {
           continue;
         }
         const fileData = fetchResult.data;
+
+        // v21: PPT가 PDF로 변환된 경우 추적
+        //   - converted_from_pptx === true 면 fileData.mimetype은 "application/pdf"
+        //   - fileData.url은 변환된 PDF의 URL (원본 PPT URL이 아님)
+        //   - 학습 성공 후 PPT(f.fileId) + PDF(converted_pdf_file_id) 둘 다 processed 표시
+        const wasPptxConverted = !!fileData.converted_from_pptx;
+        const convertedPdfFileId = fileData.converted_pdf_file_id || null;
+        // 출처 표시·로깅용 원본 PPT 파일명 (변환 후 fileData.filename은 .pdf로 바뀌므로)
+        const originalPptxName = wasPptxConverted ? f.filename : null;
+        if (wasPptxConverted) {
+          pptConvertedCount++;
+          console.log(`[v21 PPT변환 활용] ${originalPptxName} → ${fileData.filename}`);
+        }
+        // processed 표시용 entries (학습 성공 후에만 호출)
+        const processedEntries = [{ fileId: f.fileId, filename: f.filename }];
+        if (wasPptxConverted && convertedPdfFileId) {
+          processedEntries.push({ fileId: convertedPdfFileId, filename: fileData.filename });
+        }
 
         const isImageFile = (fileData.mimetype || "").startsWith("image/");
         const isPdfFile = (fileData.mimetype || "").includes("pdf") || (f.filename || "").toLowerCase().endsWith(".pdf");
@@ -5489,7 +5537,8 @@ export default function App() {
           } else {
             await saveToSheet(role, recommendedCat, content, sourceMeta);
           }
-          await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+          // v21: PPT 변환 케이스는 이미지로 안 옴, processedEntries로 일관 처리
+          await markFileProcessedMany(f.source === "common" ? "_COMMON_" : role, processedEntries);
           successCount++;
         } else if (isPdfFile) {
           // ─── PDF 처리 (학습앱 직접 업로드와 동일 로직) ───
@@ -5622,17 +5671,25 @@ export default function App() {
             const recommendedCat = firstPageRecommendedCat || "판단기준";
 
             // 4) 페이지별 row 저장 (각 페이지 = 1 row)
+            // v21: PPT 변환 케이스 → 라벨/메타 분기
+            //   - sourceTag: 원본 PPT 파일명 유지 (사용자 시점에서 PPT 파일을 학습한 것)
+            //   - 라벨: "슬라이드 N/M" 형식
+            //   - sourceMeta.page: "슬라이드 N"
+            //   - sourceMeta.url: 변환된 PDF URL (fileData.url) + #page=N
             const fallbackTag = usedMode === "vision_fallback" ? " (텍스트 부족으로 자동 전환)" : "";
-            const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
+            const displayFileName = wasPptxConverted ? originalPptxName : f.filename;
+            const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${displayFileName}]` : `[자동학습-${displayFileName}]`;
+            const unitLabel = wasPptxConverted ? "슬라이드" : "PDF 페이지"; // 라벨
+            const pageBaseUrl = wasPptxConverted ? fileData.url : f.url; // 클릭 가능한 PDF URL
             let pageOkCount = 0;
             for (const p of pagePayloads) {
               if (p.isError) continue; // 분석 실패 페이지 건너뜀
-              const pageContent = `${sourceTag} [PDF 페이지 ${p.pageNum}/${pageCount}${fallbackTag}]\n${p.pageContent}`;
+              const pageContent = `${sourceTag} [${unitLabel} ${p.pageNum}/${pageCount}${fallbackTag}]\n${p.pageContent}`;
               const sourceMeta = buildSourceMeta(
-                f.filename,
-                String(p.pageNum),
+                displayFileName,
+                wasPptxConverted ? `슬라이드 ${p.pageNum}` : String(p.pageNum),
                 p.section,
-                f.url ? `${f.url}#page=${p.pageNum}` : ""
+                pageBaseUrl ? `${pageBaseUrl}#page=${p.pageNum}` : ""
               );
               try {
                 if (f.source === "common") {
@@ -5642,11 +5699,12 @@ export default function App() {
                 }
                 pageOkCount++;
               } catch (saveErr) {
-                console.error(`[Sync] 페이지 ${p.pageNum} 저장 실패:`, saveErr);
+                console.error(`[Sync] ${unitLabel} ${p.pageNum} 저장 실패:`, saveErr);
               }
             }
 
-            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+            // v21: PPT 변환 시 PPT + PDF 두 fileId 모두 processed 표시 (중복 학습 방지)
+            await markFileProcessedMany(f.source === "common" ? "_COMMON_" : role, processedEntries);
             pdfVisionCount++;
             if (pageOkCount > 0) {
               successCount++;
@@ -5659,19 +5717,24 @@ export default function App() {
 
           // 텍스트 모드 저장 (Vision 모드는 위에서 continue로 빠짐)
           // v19: sourceMeta 추가 (page 빈 칸, section은 응답에서 추출, url=f.url)
+          // v21: PPT 변환 케이스 → displayFileName(원본 PPT명), url은 변환된 PDF URL
           const catMatch = pdfResult.match(/\[추천 카테고리\]\s*([가-힣]+)/);
           const recommendedCat = catMatch ? catMatch[1] : "판단기준";
-          const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
+          const displayFileName = wasPptxConverted ? originalPptxName : f.filename;
+          const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${displayFileName}]` : `[자동학습-${displayFileName}]`;
           const content = `${sourceTag}\n${pdfResult}`;
           const section = parseChapterFromAnalysis(pdfResult);
-          const sourceMeta = buildSourceMeta(f.filename, "", section, f.url);
+          // 텍스트 모드는 페이지 단위가 아닌 PDF 전체 1 row → page 빈 칸, url은 PDF URL (앵커 없음)
+          const sourceUrl = wasPptxConverted ? fileData.url : f.url;
+          const sourceMeta = buildSourceMeta(displayFileName, "", section, sourceUrl);
 
           if (f.source === "common") {
             await saveCommonKnowledge(recommendedCat, content, sourceMeta);
           } else {
             await saveToSheet(role, recommendedCat, content, sourceMeta);
           }
-          await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+          // v21: PPT 변환 시 PPT + PDF 두 fileId 모두 processed 표시 (중복 학습 방지)
+          await markFileProcessedMany(f.source === "common" ? "_COMMON_" : role, processedEntries);
           successCount++;
         } else {
           // 그 외 파일 (Word/Excel 등) - 미지원
@@ -5686,7 +5749,7 @@ export default function App() {
       }
     }
 
-    setSyncResult({ successCount, failCount, errors, pdfTextCount, pdfVisionCount });
+    setSyncResult({ successCount, failCount, errors, pdfTextCount, pdfVisionCount, pptConvertedCount });
     setSyncingFiles(false);
     await doFolderScan();
     await loadKB();
@@ -6058,6 +6121,11 @@ export default function App() {
                     <div style={{ fontSize:10, color:"#94a3b8", marginTop:4, marginBottom:4 }}>
                       {syncResult.pdfTextCount > 0 && `📝 PDF 텍스트 추출: ${syncResult.pdfTextCount}개  `}
                       {syncResult.pdfVisionCount > 0 && `🖼️ PDF 그림 분석: ${syncResult.pdfVisionCount}개`}
+                    </div>
+                  )}
+                  {syncResult.pptConvertedCount > 0 && (
+                    <div style={{ fontSize:10, color:"#fbbf24", marginTop:2, marginBottom:4 }}>
+                      📊 PPT → PDF 자동 변환: {syncResult.pptConvertedCount}개 (원본 PPT는 휴지통으로 이동)
                     </div>
                   )}
                   {syncResult.failCount > 0 && (
