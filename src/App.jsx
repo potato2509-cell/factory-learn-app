@@ -1,3 +1,29 @@
+// App_Step7_v22.jsx
+// 트랙 1 단계 6 — 자동학습에서 XLSX/XLS 파일 지원
+//
+// 주요 변경 (v21 → v22):
+//   - SheetJS(xlsx) 라이브러리 CDN 동적 로딩 (loadSheetJS 헬퍼)
+//   - XLSX 파싱 헬퍼:
+//     · extractXlsxSheets: 모든 시트를 행 배열로 추출 (빈 시트 자동 스킵)
+//     · sheetRowsToMarkdownTable: 행 배열 → Markdown 표 변환
+//     · chunkSheetRows: 큰 시트를 N행씩 청크 분할 (헤더 매 청크 포함)
+//   - 자동학습 흐름에 XLSX 분기 추가 (isImageFile/isPdfFile 다음 isXlsxFile)
+//   - 청크 단위 처리: 시트당 1+ 청크, 각 청크 Claude 호출 → 청크별 row 저장
+//     · source_file: xxx.xlsx
+//     · source_page: "시트: 검사기준 (1/3)" 형식 (청크 1개면 "(1/1)" 생략)
+//     · source_section: Claude 응답에서 [챕터/섹션] 추출
+//     · source_url: XLSX 원본 Drive URL (앵커 없음)
+//   - 청크 크기: 200행씩 (헤더 1행은 매 청크 반복 포함하여 컨텍스트 보존)
+//   - 자동학습 결과 UI에 XLSX 시트 카운트 추가 (xlsxSheetCount)
+//   - 원본 XLSX는 변환·삭제 없이 그대로 보관 (PDF 변환 미수행)
+//
+// 호환성: PDF/PPT/이미지 흐름 v21과 동일, XLSX 분기만 신규 추가
+//
+// 누락 없는 분석 목표:
+//   PLC 자료(IO 리스트/태그 리스트/검사 기준서)의 모든 행이 빠짐없이 학습됨.
+//   1000행 시트 → 5청크 (각 200행) → 5회 Claude 호출 → 5 row 저장
+//   기존 saveToSheet의 자동 청크 분할(긴 응답 자동 잘림)과 직교하여 동작.
+
 // App_Step7_v21.jsx
 // 트랙 1 단계 5 — 자동학습에서 PPT 파일 지원 (Apps Script v11 자동 변환 활용)
 //
@@ -244,6 +270,103 @@ async function loadPdfDocument(file) {
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
   return pdf; // pdf.numPages, pdf.getPage(n)
+}
+
+// ─── 트랙 1 단계 6: XLSX 처리 헬퍼 (v22) ─────────────────────────────────
+// SheetJS(xlsx) CDN 동적 로딩
+let _xlsxLib = null;
+async function loadSheetJS() {
+  if (_xlsxLib) return _xlsxLib;
+  if (window.XLSX) {
+    _xlsxLib = window.XLSX;
+    return _xlsxLib;
+  }
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+    script.onload = () => {
+      _xlsxLib = window.XLSX;
+      resolve(_xlsxLib);
+    };
+    script.onerror = () => reject(new Error("SheetJS 로드 실패"));
+    document.head.appendChild(script);
+  });
+}
+
+// XLSX 파일(base64) → 시트별 행 배열로 파싱
+//   반환: [{ sheetName, rows: [[cell,cell,...], ...] }, ...]
+//   - 빈 시트 (또는 모든 셀이 빈 칸인 시트) 자동 스킵 (Q3)
+//   - 모든 셀을 포맷된 문자열로 (숫자·날짜 자동 포맷)
+async function extractXlsxSheets(base64) {
+  const XLSX = await loadSheetJS();
+  const byteChars = atob(base64);
+  const byteNumbers = new Array(byteChars.length);
+  for (let i = 0; i < byteChars.length; i++) {
+    byteNumbers[i] = byteChars.charCodeAt(i);
+  }
+  const byteArray = new Uint8Array(byteNumbers);
+  const workbook = XLSX.read(byteArray, { type: "array", cellDates: true });
+
+  const result = [];
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    if (!sheet) continue;
+    const rows = XLSX.utils.sheet_to_json(sheet, {
+      header: 1, defval: "", blankrows: false, raw: false,
+    });
+    const cleaned = rows.filter(row =>
+      Array.isArray(row) && row.some(cell => String(cell || "").trim().length > 0)
+    );
+    if (cleaned.length === 0) continue; // 빈 시트 스킵
+    result.push({ sheetName, rows: cleaned });
+  }
+  return result;
+}
+
+// 행 배열 → Markdown 표 텍스트 (Q2: Markdown 표 형식)
+function sheetRowsToMarkdownTable(rows) {
+  if (!rows || rows.length === 0) return "";
+  const escapeCell = (v) => String(v || "").replace(/\|/g, "\\|").replace(/\n/g, " ").trim();
+  let maxCols = 0;
+  for (const row of rows) maxCols = Math.max(maxCols, row.length);
+  if (maxCols === 0) return "";
+  const headerCells = (rows[0] || []).map(escapeCell);
+  while (headerCells.length < maxCols) headerCells.push("");
+  const lines = [];
+  lines.push("| " + headerCells.join(" | ") + " |");
+  lines.push("|" + " --- |".repeat(maxCols));
+  for (let i = 1; i < rows.length; i++) {
+    const cells = (rows[i] || []).map(escapeCell);
+    while (cells.length < maxCols) cells.push("");
+    lines.push("| " + cells.join(" | ") + " |");
+  }
+  return lines.join("\n");
+}
+
+// 시트를 N행씩 청크 분할 (헤더 매 청크 포함 - 컨텍스트 보존)
+//   반환: [{ chunkIdx, totalChunks, rows, startRow, endRow }, ...]
+//   - dataRowsPerChunk: 청크당 데이터 행 수 (헤더 제외)
+function chunkSheetRows(rows, dataRowsPerChunk) {
+  if (!rows || rows.length === 0) return [];
+  const header = rows[0];
+  const dataRows = rows.slice(1);
+  if (dataRows.length === 0) {
+    return [{ chunkIdx: 1, totalChunks: 1, rows: [header], startRow: 0, endRow: 0 }];
+  }
+  const totalChunks = Math.max(1, Math.ceil(dataRows.length / dataRowsPerChunk));
+  const chunks = [];
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * dataRowsPerChunk;
+    const end = Math.min(start + dataRowsPerChunk, dataRows.length);
+    chunks.push({
+      chunkIdx: i + 1,
+      totalChunks,
+      rows: [header, ...dataRows.slice(start, end)],
+      startRow: start + 1,
+      endRow: end,
+    });
+  }
+  return chunks;
 }
 
 // PDF에서 모든 페이지 텍스트 추출
@@ -5469,6 +5592,8 @@ export default function App() {
     let pdfTextCount = 0;
     let pdfVisionCount = 0;
     let pptConvertedCount = 0; // v21: PPT → PDF 자동 변환된 건수
+    let xlsxSheetCount = 0;    // v22: 학습된 XLSX 시트 수 (시트 단위)
+    let xlsxChunkCount = 0;    // v22: 학습된 XLSX 청크 수 (200행 단위)
     const errors = [];
 
     for (let i = 0; i < allFiles.length; i++) {
@@ -5508,6 +5633,14 @@ export default function App() {
 
         const isImageFile = (fileData.mimetype || "").startsWith("image/");
         const isPdfFile = (fileData.mimetype || "").includes("pdf") || (f.filename || "").toLowerCase().endsWith(".pdf");
+        // v22: XLSX/XLS 감지 (mimetype 또는 확장자)
+        //   - mimetype: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet (xlsx)
+        //              application/vnd.ms-excel (xls)
+        const filenameLower = (f.filename || "").toLowerCase();
+        const isXlsxFile = (fileData.mimetype || "").includes("spreadsheetml")
+                        || (fileData.mimetype || "").includes("ms-excel")
+                        || filenameLower.endsWith(".xlsx")
+                        || filenameLower.endsWith(".xls");
 
         if (isImageFile) {
           // ─── 이미지 처리 (v19: 5블록 + sourceMeta) ───
@@ -5736,8 +5869,126 @@ export default function App() {
           // v21: PPT 변환 시 PPT + PDF 두 fileId 모두 processed 표시 (중복 학습 방지)
           await markFileProcessedMany(f.source === "common" ? "_COMMON_" : role, processedEntries);
           successCount++;
+        } else if (isXlsxFile) {
+          // ─── XLSX/XLS 처리 (v22) ───
+          // - 모든 시트 파싱 (빈 시트 자동 스킵)
+          // - 시트당 200행씩 청크 분할 → 청크별 Claude 호출 → 청크별 row 저장
+          // - source_file: 원본 XLSX 파일명 / source_page: "시트: xxx (N/M)" / source_url: XLSX URL (앵커 없음)
+          let xlsxSheets;
+          try {
+            xlsxSheets = await extractXlsxSheets(fileData.base64);
+          } catch (xlsxErr) {
+            failCount++;
+            errors.push(`${displayName}: XLSX 파싱 실패 - ${xlsxErr.message}`);
+            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+            continue;
+          }
+
+          if (xlsxSheets.length === 0) {
+            failCount++;
+            errors.push(`${displayName}: 데이터 있는 시트가 없음 (모든 시트 비어있음)`);
+            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+            continue;
+          }
+
+          const DATA_ROWS_PER_CHUNK = 200; // Q4-D: 200행씩 청크 분할
+          const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
+          let totalChunkOk = 0;
+          let totalChunkAttempt = 0;
+          let firstChunkRecommendedCat = ""; // 첫 청크에서 카테고리 결정 (XLSX 전체 카테고리)
+
+          for (const sheet of xlsxSheets) {
+            const chunks = chunkSheetRows(sheet.rows, DATA_ROWS_PER_CHUNK);
+            for (const chunk of chunks) {
+              totalChunkAttempt++;
+              const chunkLabel = chunk.totalChunks > 1
+                ? ` (${chunk.chunkIdx}/${chunk.totalChunks}, 행 ${chunk.startRow}~${chunk.endRow})`
+                : "";
+              setSyncProgress({
+                current: i + 1, total: allFiles.length,
+                currentFile: `${displayName} (시트: ${sheet.sheetName}${chunkLabel} 분석 중...)`,
+              });
+
+              const markdownTable = sheetRowsToMarkdownTable(chunk.rows);
+              const isFirstChunk = (firstChunkRecommendedCat === "");
+              // 첫 청크: 5블록 (추천 카테고리 포함) / 이후 청크: 4블록
+              const sys = isFirstChunk
+                ? `${roleInfo.label}(${role}) AI입니다. XLSX 시트 데이터 분석.${folderHint}
+파일: ${f.filename} / 시트: ${sheet.sheetName}${chunkLabel}
+
+표 데이터에서 학습 가치 있는 모든 정보(헤더·수치·항목명·단위·기준 등)를 빠짐없이 한국어로 정리하세요. 글자수 제한 없음 — 정보가 많으면 길게 쓰세요. **표의 모든 행과 열을 빠뜨리지 말고 학습 가치 있게 풀어쓰세요. 단순 나열이 아니라 의미 단위로 묶어 설명하세요.**
+
+다음 5블록 형식:
+[추출 텍스트] (시트의 실제 내용. 헤더, 카테고리별 항목, 수치·단위·기준 등 구체값 빠뜨리지 말 것)
+[핵심 정보] (이 시트가 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (시트명, 작성자, Rev, 작성일이 보이면 기재)
+[챕터/섹션] (이 시트가 속하는 주제·섹션. 예: "Stack Vision 파라미터", "Self Inspection 기준". 명확하지 않으면 빈 칸)
+[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나 (XLSX 전체 카테고리)`
+                : `${roleInfo.label}(${role}) AI입니다. XLSX 시트 데이터 분석 (이어지는 청크).${folderHint}
+파일: ${f.filename} / 시트: ${sheet.sheetName}${chunkLabel}
+
+표 데이터에서 학습 가치 있는 모든 정보(헤더·수치·항목명·단위·기준 등)를 빠짐없이 한국어로 정리하세요. 글자수 제한 없음. **표의 모든 행과 열을 빠뜨리지 말고 학습 가치 있게 풀어쓰세요. 단순 나열이 아니라 의미 단위로 묶어 설명하세요.**
+
+다음 4블록 형식:
+[추출 텍스트] (시트의 실제 내용. 헤더, 카테고리별 항목, 수치·단위·기준 등 구체값 빠뜨리지 말 것)
+[핵심 정보] (이 청크가 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (시트명·청크 범위 외 추가 메타가 있으면 기재)
+[챕터/섹션] (이 청크가 속하는 주제·섹션. 명확하지 않으면 빈 칸)`;
+
+              let analyzed = "";
+              try {
+                analyzed = await callClaude(sys, `다음 시트 데이터에서 핵심을 추출하세요:\n\n${markdownTable}`);
+              } catch (cErr) {
+                console.error(`[Sync XLSX] Claude 호출 실패 시트=${sheet.sheetName} 청크=${chunk.chunkIdx}/${chunk.totalChunks}:`, cErr);
+                continue; // 이 청크만 스킵
+              }
+
+              // 첫 청크: 카테고리 추출 → XLSX 전체 카테고리로 사용
+              if (isFirstChunk) {
+                const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
+                if (catMatch && ["공장정보","업무역할","판단기준","협업방식","교정사례"].includes(catMatch[1])) {
+                  firstChunkRecommendedCat = catMatch[1];
+                } else {
+                  firstChunkRecommendedCat = "판단기준"; // 폴백
+                }
+              }
+
+              const section = parseChapterFromAnalysis(analyzed);
+              const sourceTag = f.subPath
+                ? `[자동학습-${f.subPath}/${f.filename}]`
+                : `[자동학습-${f.filename}]`;
+              const content = `${sourceTag} [시트: ${sheet.sheetName}${chunkLabel}]\n${analyzed}`;
+              const sourceMeta = buildSourceMeta(
+                f.filename,
+                `시트: ${sheet.sheetName}${chunkLabel}`, // 예: "시트: 검사기준 (1/3, 행 1~200)"
+                section,
+                f.url || "" // Q5-가: XLSX 원본 URL (앵커 없음)
+              );
+
+              try {
+                if (f.source === "common") {
+                  await saveCommonKnowledge(firstChunkRecommendedCat, content, sourceMeta);
+                } else {
+                  await saveToSheet(role, firstChunkRecommendedCat, content, sourceMeta);
+                }
+                totalChunkOk++;
+              } catch (saveErr) {
+                console.error(`[Sync XLSX] 저장 실패 시트=${sheet.sheetName} 청크=${chunk.chunkIdx}:`, saveErr);
+              }
+            }
+          }
+
+          await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+          xlsxSheetCount += xlsxSheets.length;
+          xlsxChunkCount += totalChunkAttempt;
+          if (totalChunkOk > 0) {
+            successCount++;
+          } else {
+            failCount++;
+            errors.push(`${displayName}: 모든 청크 저장 실패 (${totalChunkAttempt}개 시도)`);
+          }
         } else {
-          // 그 외 파일 (Word/Excel 등) - 미지원
+          // 그 외 파일 (Word 등) - 미지원
           failCount++;
           errors.push(`${displayName}: 미지원 파일 형식 (${fileData.mimetype}) - PDF로 변환 권장`);
           await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
@@ -5749,7 +6000,7 @@ export default function App() {
       }
     }
 
-    setSyncResult({ successCount, failCount, errors, pdfTextCount, pdfVisionCount, pptConvertedCount });
+    setSyncResult({ successCount, failCount, errors, pdfTextCount, pdfVisionCount, pptConvertedCount, xlsxSheetCount, xlsxChunkCount });
     setSyncingFiles(false);
     await doFolderScan();
     await loadKB();
@@ -6126,6 +6377,11 @@ export default function App() {
                   {syncResult.pptConvertedCount > 0 && (
                     <div style={{ fontSize:10, color:"#fbbf24", marginTop:2, marginBottom:4 }}>
                       📊 PPT → PDF 자동 변환: {syncResult.pptConvertedCount}개 (원본 PPT는 휴지통으로 이동)
+                    </div>
+                  )}
+                  {syncResult.xlsxSheetCount > 0 && (
+                    <div style={{ fontSize:10, color:"#22d3ee", marginTop:2, marginBottom:4 }}>
+                      📑 XLSX 시트 학습: {syncResult.xlsxSheetCount}개 시트 (청크 {syncResult.xlsxChunkCount}개, 200행 단위)
                     </div>
                   )}
                   {syncResult.failCount > 0 && (
