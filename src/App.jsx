@@ -1,3 +1,19 @@
+// App_Step7_v23.jsx
+// 트랙 1 단계 7 — 자동학습에서 CSV/TXT/MD 파일 지원
+//
+// 주요 변경 (v22 → v23):
+//   - CSV: SheetJS로 파싱 → XLSX와 동일한 청크 분할 흐름 재사용 (200행 단위)
+//     · source_file: xxx.csv / source_page: "(N/M, 행 X~Y)" 형식 (단일 시트라 시트명 prefix 없음)
+//     · PLC IO 리스트·태그 리스트 등 큰 CSV도 모든 행 누락 없이 학습
+//   - TXT/MD: 단순 텍스트 디코딩 → 4블록 Claude 분석 → 1 row (12000자 cap)
+//     · source_file: xxx.txt|md / source_page: 빈 칸 / source_section: Claude 응답에서 추출
+//   - 자동학습 흐름에 신규 분기 isCsvFile / isTextFile 추가
+//   - 자동학습 결과 UI에 신규 카운트:
+//     · csvChunkCount: CSV 청크 학습 수
+//     · textFileCount: TXT/MD 학습 수
+//
+// 호환성: 기존 PDF/PPT/XLSX/이미지 흐름 v22와 동일, CSV/TXT/MD 분기만 신규 추가
+
 // App_Step7_v22.jsx
 // 트랙 1 단계 6 — 자동학습에서 XLSX/XLS 파일 지원
 //
@@ -367,6 +383,50 @@ function chunkSheetRows(rows, dataRowsPerChunk) {
     });
   }
   return chunks;
+}
+
+// ─── 트랙 1 단계 7: CSV/TXT/MD 처리 헬퍼 (v23) ──────────────────────────
+// CSV 파일(base64) → 행 배열 (SheetJS로 파싱)
+//   반환: [[cell,cell,...], ...] — XLSX 단일 시트와 같은 형식
+//   - 빈 행 자동 제거
+//   - 인코딩: UTF-8 우선, 실패 시 그대로
+async function extractCsvRows(base64) {
+  const XLSX = await loadSheetJS();
+  // base64 → Uint8Array
+  const byteChars = atob(base64);
+  const byteNumbers = new Array(byteChars.length);
+  for (let i = 0; i < byteChars.length; i++) {
+    byteNumbers[i] = byteChars.charCodeAt(i);
+  }
+  const byteArray = new Uint8Array(byteNumbers);
+  // SheetJS는 CSV를 type:"array"로 받을 수 있음 (자동 감지)
+  const workbook = XLSX.read(byteArray, { type: "array", cellDates: true, raw: false });
+  if (!workbook.SheetNames || workbook.SheetNames.length === 0) return [];
+  const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+  if (!firstSheet) return [];
+  const rows = XLSX.utils.sheet_to_json(firstSheet, {
+    header: 1, defval: "", blankrows: false, raw: false,
+  });
+  return rows.filter(row =>
+    Array.isArray(row) && row.some(cell => String(cell || "").trim().length > 0)
+  );
+}
+
+// base64 → UTF-8 텍스트 디코딩 (TXT/MD용)
+//   - 잘못된 UTF-8 바이트는 fffd로 치환
+function base64ToUtf8Text(base64) {
+  try {
+    const byteChars = atob(base64);
+    const byteNumbers = new Uint8Array(byteChars.length);
+    for (let i = 0; i < byteChars.length; i++) {
+      byteNumbers[i] = byteChars.charCodeAt(i);
+    }
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    return decoder.decode(byteNumbers);
+  } catch (e) {
+    console.warn("[base64ToUtf8Text] 디코딩 실패:", e.message);
+    return "";
+  }
 }
 
 // PDF에서 모든 페이지 텍스트 추출
@@ -5594,6 +5654,8 @@ export default function App() {
     let pptConvertedCount = 0; // v21: PPT → PDF 자동 변환된 건수
     let xlsxSheetCount = 0;    // v22: 학습된 XLSX 시트 수 (시트 단위)
     let xlsxChunkCount = 0;    // v22: 학습된 XLSX 청크 수 (200행 단위)
+    let csvChunkCount = 0;     // v23: 학습된 CSV 청크 수 (200행 단위)
+    let textFileCount = 0;     // v23: 학습된 TXT/MD 파일 수
     const errors = [];
 
     for (let i = 0; i < allFiles.length; i++) {
@@ -5641,6 +5703,14 @@ export default function App() {
                         || (fileData.mimetype || "").includes("ms-excel")
                         || filenameLower.endsWith(".xlsx")
                         || filenameLower.endsWith(".xls");
+        // v23: CSV / TXT / MD 감지
+        const isCsvFile = (fileData.mimetype || "").includes("csv")
+                       || filenameLower.endsWith(".csv");
+        const isTextFile = !isCsvFile && (
+          (fileData.mimetype || "").startsWith("text/")
+          || filenameLower.endsWith(".txt")
+          || filenameLower.endsWith(".md")
+        );
 
         if (isImageFile) {
           // ─── 이미지 처리 (v19: 5블록 + sourceMeta) ───
@@ -5987,6 +6057,175 @@ export default function App() {
             failCount++;
             errors.push(`${displayName}: 모든 청크 저장 실패 (${totalChunkAttempt}개 시도)`);
           }
+        } else if (isCsvFile) {
+          // ─── CSV 처리 (v23) ───
+          // - SheetJS로 파싱 → XLSX 청크 분할 흐름 재사용 (200행 단위)
+          // - source_file: 원본 CSV 파일명 / source_page: "(N/M, 행 X~Y)" 형식 (시트명 없음)
+          let csvRows;
+          try {
+            csvRows = await extractCsvRows(fileData.base64);
+          } catch (csvErr) {
+            failCount++;
+            errors.push(`${displayName}: CSV 파싱 실패 - ${csvErr.message}`);
+            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+            continue;
+          }
+
+          if (csvRows.length === 0) {
+            failCount++;
+            errors.push(`${displayName}: CSV에 데이터 없음 (모든 행 비어있음)`);
+            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+            continue;
+          }
+
+          const DATA_ROWS_PER_CHUNK_CSV = 200;
+          const chunks = chunkSheetRows(csvRows, DATA_ROWS_PER_CHUNK_CSV);
+          const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
+          let totalChunkOk = 0;
+          let totalChunkAttempt = 0;
+          let firstChunkRecommendedCat = "";
+
+          for (const chunk of chunks) {
+            totalChunkAttempt++;
+            const chunkLabel = chunk.totalChunks > 1
+              ? ` (${chunk.chunkIdx}/${chunk.totalChunks}, 행 ${chunk.startRow}~${chunk.endRow})`
+              : "";
+            setSyncProgress({
+              current: i + 1, total: allFiles.length,
+              currentFile: `${displayName}${chunkLabel} 분석 중...`,
+            });
+
+            const markdownTable = sheetRowsToMarkdownTable(chunk.rows);
+            const isFirstChunk = (firstChunkRecommendedCat === "");
+            const sys = isFirstChunk
+              ? `${roleInfo.label}(${role}) AI입니다. CSV 데이터 분석.${folderHint}
+파일: ${f.filename}${chunkLabel}
+
+표 데이터에서 학습 가치 있는 모든 정보(헤더·수치·항목명·단위·기준 등)를 빠짐없이 한국어로 정리하세요. 글자수 제한 없음 — 정보가 많으면 길게 쓰세요. **표의 모든 행과 열을 빠뜨리지 말고 학습 가치 있게 풀어쓰세요. 단순 나열이 아니라 의미 단위로 묶어 설명하세요.**
+
+다음 5블록 형식:
+[추출 텍스트] (CSV의 실제 내용. 헤더, 카테고리별 항목, 수치·단위·기준 등 구체값 빠뜨리지 말 것)
+[핵심 정보] (이 CSV가 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (작성자, Rev, 작성일이 보이면 기재)
+[챕터/섹션] (이 CSV가 속하는 주제·섹션. 명확하지 않으면 빈 칸)
+[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나 (CSV 전체 카테고리)`
+              : `${roleInfo.label}(${role}) AI입니다. CSV 데이터 분석 (이어지는 청크).${folderHint}
+파일: ${f.filename}${chunkLabel}
+
+표 데이터에서 학습 가치 있는 모든 정보(헤더·수치·항목명·단위·기준 등)를 빠짐없이 한국어로 정리하세요. 글자수 제한 없음. **표의 모든 행과 열을 빠뜨리지 말고 학습 가치 있게 풀어쓰세요. 단순 나열이 아니라 의미 단위로 묶어 설명하세요.**
+
+다음 4블록 형식:
+[추출 텍스트] (CSV의 실제 내용. 헤더, 카테고리별 항목, 수치·단위·기준 등 구체값 빠뜨리지 말 것)
+[핵심 정보] (이 청크가 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (청크 범위 외 추가 메타가 있으면 기재)
+[챕터/섹션] (이 청크가 속하는 주제·섹션. 명확하지 않으면 빈 칸)`;
+
+            let analyzed = "";
+            try {
+              analyzed = await callClaude(sys, `다음 CSV 데이터에서 핵심을 추출하세요:\n\n${markdownTable}`);
+            } catch (cErr) {
+              console.error(`[Sync CSV] Claude 호출 실패 청크=${chunk.chunkIdx}/${chunk.totalChunks}:`, cErr);
+              continue;
+            }
+
+            if (isFirstChunk) {
+              const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
+              if (catMatch && ["공장정보","업무역할","판단기준","협업방식","교정사례"].includes(catMatch[1])) {
+                firstChunkRecommendedCat = catMatch[1];
+              } else {
+                firstChunkRecommendedCat = "판단기준";
+              }
+            }
+
+            const section = parseChapterFromAnalysis(analyzed);
+            const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
+            const content = `${sourceTag}${chunkLabel}\n${analyzed}`;
+            const sourceMeta = buildSourceMeta(
+              f.filename,
+              chunkLabel ? chunkLabel.trim().replace(/^\(/, "").replace(/\)$/, "") : "", // "1/3, 행 1~200" 형식 또는 빈 칸 (단일 청크)
+              section,
+              f.url || ""
+            );
+
+            try {
+              if (f.source === "common") {
+                await saveCommonKnowledge(firstChunkRecommendedCat, content, sourceMeta);
+              } else {
+                await saveToSheet(role, firstChunkRecommendedCat, content, sourceMeta);
+              }
+              totalChunkOk++;
+            } catch (saveErr) {
+              console.error(`[Sync CSV] 저장 실패 청크=${chunk.chunkIdx}:`, saveErr);
+            }
+          }
+
+          await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+          csvChunkCount += totalChunkAttempt;
+          if (totalChunkOk > 0) {
+            successCount++;
+          } else {
+            failCount++;
+            errors.push(`${displayName}: 모든 청크 저장 실패 (${totalChunkAttempt}개 시도)`);
+          }
+        } else if (isTextFile) {
+          // ─── TXT/MD 처리 (v23) ───
+          // - base64 → UTF-8 텍스트 디코딩
+          // - 4블록 Claude 분석 (12000자 cap, PDF 텍스트 모드와 동일 정책)
+          // - 1 row + sourceMeta (source_page 빈 칸, source_url = Drive URL)
+          const textContent = base64ToUtf8Text(fileData.base64);
+          if (!textContent || textContent.trim().length < 10) {
+            failCount++;
+            errors.push(`${displayName}: 텍스트 추출 실패 또는 내용 없음`);
+            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+            continue;
+          }
+
+          const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
+          const sys = `${roleInfo.label}(${role}) AI입니다. 텍스트 파일 분석.${folderHint}
+파일: ${f.filename}
+
+원문에서 학습 가치 있는 구체 정보(수치·부품명·단계 등)는 빠뜨리지 마세요.
+구조가 있으면 살려서 정리하세요.
+
+다음 5블록 형식:
+[추출 텍스트] (원문에서 학습 가치 있는 내용. 1000자 이내 권장)
+[핵심 정보] (이 파일이 다루는 공정·설비·이슈 — 한 문장)
+[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
+[챕터/섹션] (이 파일의 주요 챕터/섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)
+[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
+          const truncated = textContent.slice(0, 12000);
+
+          let analyzed = "";
+          try {
+            analyzed = await callClaude(sys, `다음 텍스트 내용에서 핵심을 추출하세요:\n\n${truncated}`);
+          } catch (cErr) {
+            failCount++;
+            errors.push(`${displayName}: Claude 호출 실패 - ${cErr.message}`);
+            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+            continue;
+          }
+
+          const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
+          const recommendedCat = (catMatch && ["공장정보","업무역할","판단기준","협업방식","교정사례"].includes(catMatch[1]))
+            ? catMatch[1] : "판단기준";
+          const section = parseChapterFromAnalysis(analyzed);
+          const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
+          const content = `${sourceTag}\n${analyzed}`;
+          const sourceMeta = buildSourceMeta(f.filename, "", section, f.url || "");
+
+          try {
+            if (f.source === "common") {
+              await saveCommonKnowledge(recommendedCat, content, sourceMeta);
+            } else {
+              await saveToSheet(role, recommendedCat, content, sourceMeta);
+            }
+            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
+            textFileCount++;
+            successCount++;
+          } catch (saveErr) {
+            failCount++;
+            errors.push(`${displayName}: 저장 실패 - ${saveErr.message}`);
+          }
         } else {
           // 그 외 파일 (Word 등) - 미지원
           failCount++;
@@ -6000,7 +6239,7 @@ export default function App() {
       }
     }
 
-    setSyncResult({ successCount, failCount, errors, pdfTextCount, pdfVisionCount, pptConvertedCount, xlsxSheetCount, xlsxChunkCount });
+    setSyncResult({ successCount, failCount, errors, pdfTextCount, pdfVisionCount, pptConvertedCount, xlsxSheetCount, xlsxChunkCount, csvChunkCount, textFileCount });
     setSyncingFiles(false);
     await doFolderScan();
     await loadKB();
@@ -6382,6 +6621,16 @@ export default function App() {
                   {syncResult.xlsxSheetCount > 0 && (
                     <div style={{ fontSize:10, color:"#22d3ee", marginTop:2, marginBottom:4 }}>
                       📑 XLSX 시트 학습: {syncResult.xlsxSheetCount}개 시트 (청크 {syncResult.xlsxChunkCount}개, 200행 단위)
+                    </div>
+                  )}
+                  {syncResult.csvChunkCount > 0 && (
+                    <div style={{ fontSize:10, color:"#22d3ee", marginTop:2, marginBottom:4 }}>
+                      📊 CSV 학습: 청크 {syncResult.csvChunkCount}개 (200행 단위)
+                    </div>
+                  )}
+                  {syncResult.textFileCount > 0 && (
+                    <div style={{ fontSize:10, color:"#a3e635", marginTop:2, marginBottom:4 }}>
+                      📝 TXT/MD 학습: {syncResult.textFileCount}개 파일
                     </div>
                   )}
                   {syncResult.failCount > 0 && (
