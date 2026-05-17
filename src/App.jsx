@@ -116,7 +116,11 @@
 import { useState, useRef, useEffect, useMemo } from "react";
 
 // ─── 설정 ─────────────────────────────────────────────────────────────────────
-const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXpt3UjWjfgDljEiGodgbunj_UnXYc-1RlrXgNiDzAiikXoEP4g9_E/exec";
+// 백엔드 URL (Phase 1에서 FastAPI 주소로 한 줄만 교체)
+const API_BASE_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXpt3UjWjfgDljEiGodgbunj_UnXYc-1RlrXgNiDzAiikXoEP4g9_E/exec";
+
+// LLM 호출 base (Phase 3에서 FastAPI /llm 경로로 통합 예정)
+const LLM_BASE_URL = "/.netlify/functions";
 
 const ROLE_CONFIG = {
   Cell_PE: { label: "생산 엔지니어", line: "Cell", color: "#3b82f6", bg: "rgba(59,130,246,0.12)", icon: "🔵",
@@ -186,29 +190,99 @@ function getRole() {
 }
 
 // ─── API ──────────────────────────────────────────────────────────────────────
+// API 호출 추상화 레이어 (Phase 1/3 이전 대비)
+// - 백엔드 교체 시 API_BASE_URL / LLM_BASE_URL 한 줄만 바꾸면 모든 도우미가 따라옴
+// - 응답 shape은 { ok, data, error } 형태로 normalize
+// - 도우미 함수 시그니처는 그대로 유지 (호출처 0건 변경)
+const api = {
+  // GET 액션 — Apps Script doGet 라우터로 전송
+  // params: { key: value, ... } 형태 — URLSearchParams으로 자동 직렬화·인코딩
+  // 반환: { ok: true, data: ... } 또는 { ok: false, error: "..." }
+  // 참고: data.data 가 없으면 전체 JSON을 data로 노출 (scan_learning_folder_all 처럼 응답 shape이 다른 액션 대응)
+  async get(action, params = {}) {
+    try {
+      const qs = new URLSearchParams({ action, ...params }).toString();
+      const res = await fetch(`${API_BASE_URL}?${qs}`);
+      if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+      const data = await res.json();
+      if (data.success) return { ok: true, data: data.data !== undefined ? data.data : data };
+      return { ok: false, error: data.error || "응답 success=false" };
+    } catch (e) {
+      return { ok: false, error: `네트워크 오류: ${e.message}` };
+    }
+  },
+
+  // POST 액션 — Apps Script doPost 라우터로 전송
+  // 기본: no-cors fire-and-forget (응답 본문 못 받음, boolean 반환)
+  // opts.needResponse=true: cors 모드, 응답 받음 ({ ok, data, error } 반환)
+  async call(action, payload = {}, opts = {}) {
+    const body = JSON.stringify({ action, ...payload });
+    if (opts.needResponse) {
+      try {
+        const res = await fetch(API_BASE_URL, {
+          method: "POST",
+          mode: "cors",
+          headers: { "Content-Type": "text/plain" },
+          body,
+        });
+        if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+        const data = await res.json();
+        if (data.success) return { ok: true, data: data.data !== undefined ? data.data : data };
+        return { ok: false, error: data.error || "응답 success=false" };
+      } catch (e) {
+        return { ok: false, error: `네트워크 오류: ${e.message}` };
+      }
+    }
+    // 기본: no-cors fire-and-forget
+    try {
+      await fetch(API_BASE_URL, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "text/plain" },
+        body,
+      });
+      return true;
+    } catch { return false; }
+  },
+
+  // LLM 호출 (Phase 3에서 Qwen으로 전환 시 LLM_BASE_URL 한 줄 + 내부 경로만 변경)
+  llm: {
+    // 텍스트 채팅 — 반환: string (실패 시 throw)
+    async chat(system, userMsg, opts = {}) {
+      const max_tokens = opts.max_tokens ?? 1000;
+      const res = await fetch(`${LLM_BASE_URL}/claude`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ system, userMsg, max_tokens }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      return (data.content || []).map(i => i.text || "").join("").trim();
+    },
+
+    // 이미지 분석 — 반환: string (실패 시 throw)
+    async vision(system, userMsg, imageBase64, mediaType) {
+      const res = await fetch(`${LLM_BASE_URL}/claude-vision`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ system, userMsg, imageBase64, mediaType }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      return (data.content || []).map(i => i.text || "").join("").trim();
+    },
+  },
+};
+
 async function callClaude(system, userMsg) {
-  const res = await fetch("/.netlify/functions/claude", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ system, userMsg, max_tokens: 1000 }),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  return (data.content || []).map(i => i.text || "").join("").trim();
+  return await api.llm.chat(system, userMsg);
 }
 
 // Vision API 호출
 async function callClaudeVision(system, userMsg, imageBase64, mediaType) {
-  const res = await fetch("/.netlify/functions/claude-vision", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ system, userMsg, imageBase64, mediaType }),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  return (data.content || []).map(i => i.text || "").join("").trim();
+  return await api.llm.vision(system, userMsg, imageBase64, mediaType);
 }
 
 // 파일을 Base64로 변환 (이미지인 경우 자동 압축)
@@ -721,19 +795,12 @@ async function saveToSheet(role, category, content, sourceMeta) {
 }
 
 async function saveToSheetSingle(role, category, content, sourceMeta) {
-  try {
-    // v19: sourceMeta는 선택적 (Apps Script v9가 없으면 빈 칸으로 처리, 하위 호환)
-    const payload = { action: "save_knowledge", role, category, content };
-    if (sourceMeta) payload.sourceMeta = sourceMeta;
-    await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify(payload),
-    });
-    invalidateCache(role); // Step 7-12: 쓰기 후 캐시 무효화
-    return true;
-  } catch { return false; }
+  // v19: sourceMeta는 선택적 (Apps Script v9가 없으면 빈 칸으로 처리, 하위 호환)
+  const payload = { role, category, content };
+  if (sourceMeta) payload.sourceMeta = sourceMeta;
+  const ok = await api.call("save_knowledge", payload);
+  if (ok) invalidateCache(role); // Step 7-12: 쓰기 후 캐시 무효화
+  return ok;
 }
 
 // ─── 캐시 시스템 (Step 7-12) ────────────────────────────────────────────
@@ -793,11 +860,8 @@ function invalidateCache(role) {
 
 // 신선한 데이터 직접 가져오기 (캐시 우회)
 async function fetchKnowledgeFromSheet(role) {
-  try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_knowledge&role=${role}`);
-    const data = await res.json();
-    return data.success ? data.data : [];
-  } catch { return []; }
+  const r = await api.get("get_knowledge", { role });
+  return r.ok ? r.data : [];
 }
 
 // loadFromSheet — 캐시 우선 (Step 7-12)
@@ -821,110 +885,62 @@ async function loadFromSheetFresh(role) {
 
 // 대시보드 - 전체 8개 에이전트 진행률 로드
 async function loadAllProgress() {
-  try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_all_progress`);
-    const data = await res.json();
-    return data.success ? data.data : [];
-  } catch { return []; }
+  const r = await api.get("get_all_progress");
+  return r.ok ? r.data : [];
 }
 
 // 요약본 로드 (없으면 null)
 async function loadSummary(role) {
-  try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_summary&role=${role}`);
-    const data = await res.json();
-    return data.success ? data.data : null;
-  } catch { return null; }
+  const r = await api.get("get_summary", { role });
+  return r.ok ? r.data : null;
 }
 
 // 요약본 저장 (기존 _요약 행 삭제 후 새로 1건 저장)
 async function saveSummaryToSheet(role, summary) {
-  try {
-    await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ action: "save_summary", role, summary }),
-    });
-    return true;
-  } catch { return false; }
+  return await api.call("save_summary", { role, summary });
 }
 
 // 마지막 요약 이후 추가된 row 수 (요약 갱신 트리거 판단용)
 async function loadSummaryCount(role) {
-  try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=count_since_summary&role=${role}`);
-    const data = await res.json();
-    return data.success ? data.data : { count: 0, hasSummary: false };
-  } catch { return { count: 0, hasSummary: false }; }
+  const r = await api.get("count_since_summary", { role });
+  return r.ok ? r.data : { count: 0, hasSummary: false };
 }
 
 // 특정 카테고리의 항목들만 로드 (자동 충돌 검사용)
 async function loadCategoryItems(role, category) {
-  try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_category_items&role=${role}&category=${encodeURIComponent(category)}`);
-    const data = await res.json();
-    return data.success ? data.data : [];
-  } catch { return []; }
+  const r = await api.get("get_category_items", { role, category });
+  return r.ok ? r.data : [];
 }
 
 // 기존 row 교체 (신규로 교체 옵션)
 async function replaceKnowledge(role, category, oldContent, newContent) {
-  try {
-    await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ action: "replace_knowledge", role, category, oldContent, newContent }),
-    });
-    invalidateCache(role); // Step 7-12
-    return true;
-  } catch { return false; }
+  const ok = await api.call("replace_knowledge", { role, category, oldContent, newContent });
+  if (ok) invalidateCache(role); // Step 7-12
+  return ok;
 }
 
 // 특정 row 삭제
 async function deleteKnowledge(role, category, content) {
-  try {
-    await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ action: "delete_knowledge", role, category, content }),
-    });
-    invalidateCache(role); // Step 7-12
-    return true;
-  } catch { return false; }
+  const ok = await api.call("delete_knowledge", { role, category, content });
+  if (ok) invalidateCache(role); // Step 7-12
+  return ok;
 }
 
 // 불량 사진 누적 카운트 + 패턴 존재 여부
 async function loadDefectImageCount(role) {
-  try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=count_defect_images&role=${role}`);
-    const data = await res.json();
-    return data.success ? data.data : { count: 0, hasPattern: false };
-  } catch { return { count: 0, hasPattern: false }; }
+  const r = await api.get("count_defect_images", { role });
+  return r.ok ? r.data : { count: 0, hasPattern: false };
 }
 
 // 불량 사진 학습 데이터 모두 로드 (패턴 추출 시 사용)
 async function loadDefectImageData(role) {
-  try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_defect_image_data&role=${role}`);
-    const data = await res.json();
-    return data.success ? data.data : [];
-  } catch { return []; }
+  const r = await api.get("get_defect_image_data", { role });
+  return r.ok ? r.data : [];
 }
 
 // 불량 패턴 저장 (category="_불량패턴", 항상 1건만 유지)
 async function saveDefectPattern(role, pattern) {
-  try {
-    await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ action: "save_defect_pattern", role, pattern }),
-    });
-    return true;
-  } catch { return false; }
+  return await api.call("save_defect_pattern", { role, pattern });
 }
 
 // ─── 학습자료 폴더 동기화 (Step 5-C) ──────────────────────────────────────────
@@ -932,42 +948,36 @@ async function saveDefectPattern(role, pattern) {
 // 학습자료 폴더 스캔 (특정 role + _공통)
 // 반환: { roleFiles: [...], commonFiles: [...] }
 async function scanLearningFolder(role) {
-  try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=scan_learning_folder&role=${role}`);
-    const data = await res.json();
-    return data.success ? data.data : { roleFiles: [], commonFiles: [] };
-  } catch { return { roleFiles: [], commonFiles: [] }; }
+  const r = await api.get("scan_learning_folder", { role });
+  return r.ok ? r.data : { roleFiles: [], commonFiles: [] };
+}
+
+// 재학습용 폴더 스캔 (Processed_Files 필터링 없이 전체)
+// scan_learning_folder는 이미 처리된 파일을 제외하지만,
+// 재학습은 정작 그 파일들이 필요하므로 _all 액션 사용
+// 응답 shape이 다름 — Apps Script가 data 래핑 없이 roleFiles/commonFiles 직접 반환
+// (api.get은 data.data가 없으면 전체 JSON을 data로 노출하므로 r.data.roleFiles 접근 가능)
+async function scanLearningFolderAll(role) {
+  const r = await api.get("scan_learning_folder_all", { role });
+  if (r.ok) {
+    return { roleFiles: r.data.roleFiles || [], commonFiles: r.data.commonFiles || [] };
+  }
+  console.error("[재학습] 폴더 스캔 실패:", r.error);
+  return { roleFiles: [], commonFiles: [] };
 }
 
 // 드라이브에서 파일 내용(base64) 가져오기
-// 실패 시 에러 메시지를 살려서 반환 (디버깅용)
+// 호출처 시그니처 보존을 위해 { success, data, error } 형태로 변환
 async function fetchDriveFile(fileId) {
-  try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_drive_file&fileId=${fileId}`);
-    if (!res.ok) {
-      return { success: false, error: `HTTP ${res.status}` };
-    }
-    const data = await res.json();
-    if (data.success) {
-      return { success: true, data: data.data };
-    }
-    return { success: false, error: data.error || "Apps Script 응답 success=false" };
-  } catch (e) {
-    return { success: false, error: `네트워크 오류: ${e.message}` };
-  }
+  const r = await api.get("get_drive_file", { fileId });
+  return r.ok
+    ? { success: true, data: r.data }
+    : { success: false, error: r.error };
 }
 
 // 파일 처리 완료로 마크
 async function markFileProcessed(role, fileId, filename) {
-  try {
-    await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ action: "mark_file_processed", role, fileId, filename }),
-    });
-    return true;
-  } catch { return false; }
+  return await api.call("mark_file_processed", { role, fileId, filename });
 }
 
 // v21: 여러 fileId를 한번에 processed 표시 (PPT → PDF 변환 시 두 ID 모두 표시용)
@@ -987,59 +997,27 @@ async function markFileProcessedMany(role, entries) {
 // 공통 학습 데이터 저장 (Common_Knowledge 시트)
 // v19: sourceMeta 인자 추가 (saveToSheetSingle과 동일 패턴, 하위 호환)
 async function saveCommonKnowledge(category, content, sourceMeta) {
-  try {
-    const payload = { action: "save_common_knowledge", category, content };
-    if (sourceMeta) payload.sourceMeta = sourceMeta;
-    await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify(payload),
-    });
-    return true;
-  } catch { return false; }
+  const payload = { category, content };
+  if (sourceMeta) payload.sourceMeta = sourceMeta;
+  return await api.call("save_common_knowledge", payload);
 }
 
 // 공통 학습 데이터 조회
 async function loadCommonKnowledge() {
-  try {
-    const res = await fetch(`${APPS_SCRIPT_URL}?action=get_common_knowledge`);
-    const data = await res.json();
-    return data.success ? data.data : [];
-  } catch { return []; }
+  const r = await api.get("get_common_knowledge");
+  return r.ok ? r.data : [];
 }
 
 // 이미지를 드라이브에 업로드 (Apps Script 직접 호출)
-// Content-Type: text/plain으로 CORS preflight 회피
-// 응답: { success, data: { url, fileId, filename } } 또는 null
+// CORS 모드 — 응답 필요 (url/fileId/filename 반환)
+// 응답: { url, fileId, filename } 또는 null
 async function uploadImageToDrive(role, filename, base64, mimetype) {
-  try {
-    const res = await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      mode: "cors",
-      headers: { "Content-Type": "text/plain" },  // text/plain으로 preflight 회피
-      body: JSON.stringify({
-        action: "upload_image",
-        role,
-        filename,
-        base64,
-        mimetype,
-      }),
-    });
-    if (!res.ok) {
-      console.error(`드라이브 업로드 HTTP ${res.status}`);
-      return null;
-    }
-    const data = await res.json();
-    if (!data.success) {
-      console.error("드라이브 업로드 실패:", data.error);
-      return null;
-    }
-    return data.data; // { url, fileId, filename }
-  } catch (e) {
-    console.error("드라이브 업로드 에러:", e);
+  const r = await api.call("upload_image", { role, filename, base64, mimetype }, { needResponse: true });
+  if (!r.ok) {
+    console.error("드라이브 업로드 실패:", r.error);
     return null;
   }
+  return r.data; // { url, fileId, filename }
 }
 
 // 신규 항목 vs 기존 항목들 AI 충돌 검사 (v24 강화)
@@ -5325,18 +5303,7 @@ export default function App() {
     // - scan_learning_folder는 Processed_Files 필터링으로 이미 학습된 파일을 제외함
     // - 재학습은 정작 그 파일들이 필요하므로 _all 액션 사용
     // - 기존 folderScan state(학습 화면용)는 무시하고 항상 새로 스캔
-    let scan = { roleFiles: [], commonFiles: [] };
-    try {
-      const res = await fetch(`${APPS_SCRIPT_URL}?action=scan_learning_folder_all&role=${role}`);
-      const data = await res.json();
-      if (data.success) {
-        scan = { roleFiles: data.roleFiles || [], commonFiles: data.commonFiles || [] };
-      } else {
-        console.error("[재학습] 폴더 스캔 실패:", data.error);
-      }
-    } catch (e) {
-      console.error("[재학습] 폴더 스캔 오류:", e);
-    }
+    const scan = await scanLearningFolderAll(role);
     const allFolderFiles = [...(scan.roleFiles || []), ...(scan.commonFiles || [])];
 
     // 빈약 항목별 매칭 (v13: basename 비교 — subPath/대소문자 영향 없도록)
