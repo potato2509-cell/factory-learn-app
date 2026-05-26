@@ -5244,6 +5244,9 @@ export default function App() {
   const [syncResult, setSyncResult] = useState(null);
   const [showPdfModeDialog, setShowPdfModeDialog] = useState(false); // PDF 모드 선택 모달
   const [syncPdfMode, setSyncPdfMode] = useState("auto"); // "auto" | "vision"
+  // v26: 백그라운드 학습 (수준 A-2) — Wake Lock(화면 꺼짐 방지) + 이탈 경고
+  const wakeLockRef = useRef(null);                              // 현재 보유한 WakeLockSentinel
+  const [wakeLockUnsupported, setWakeLockUnsupported] = useState(false); // 브라우저 미지원 안내용
 
   // ─── 일관성 자동 점검 (Step 7-4) ───
   // autoConflicts: 자동 감지된 충돌/중복 (세션 메모리에만 보관, 브라우저 재시작 시 초기화)
@@ -5657,6 +5660,55 @@ export default function App() {
 
   useEffect(() => { loadKB(); }, [role]);
   useEffect(() => { doFolderScan(); }, [role]);
+
+  // ─── v26: 백그라운드 학습 (수준 A-2) ───────────────────────────────
+  // 화면 잠금/절전 시 브라우저가 탭을 멈추는 것을 Wake Lock으로 방지.
+  // 메뉴 이동은 SPA(tab state) 구조라 이미 학습이 끊기지 않음(App 컴포넌트 유지).
+  const requestWakeLock = async () => {
+    try {
+      if ("wakeLock" in navigator && navigator.wakeLock) {
+        wakeLockRef.current = await navigator.wakeLock.request("screen");
+        // OS가 자동 해제(탭 백그라운드 등)하면 ref 비움 → visibilitychange에서 재요청
+        wakeLockRef.current.addEventListener("release", () => { wakeLockRef.current = null; });
+      } else {
+        setWakeLockUnsupported(true);
+      }
+    } catch (e) {
+      // 권한 거부 등으로 요청 실패 — 학습은 계속 진행, 화면만 사용자가 켜두면 됨
+      console.warn("[v26 WakeLock] 요청 실패:", e && e.message);
+    }
+  };
+  const releaseWakeLock = async () => {
+    try {
+      if (wakeLockRef.current) { await wakeLockRef.current.release(); wakeLockRef.current = null; }
+    } catch (e) { /* 무시 */ }
+  };
+
+  // 학습 시작/종료에 맞춰 Wake Lock 자동 획득/해제 (startSync 본체는 안 건드림)
+  useEffect(() => {
+    if (syncingFiles) requestWakeLock();
+    else releaseWakeLock();
+  }, [syncingFiles]);
+
+  // 탭이 백그라운드 갔다 다시 보일 때 Wake Lock 재요청 (학습 중일 때만)
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === "visible" && syncingFiles && !wakeLockRef.current) {
+        requestWakeLock();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [syncingFiles]);
+
+  // 학습 중 탭 닫기/새로고침 시 이탈 경고 (학습 중에만 활성)
+  useEffect(() => {
+    if (!syncingFiles) return;
+    const onBeforeUnload = (e) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [syncingFiles]);
+  // ──────────────────────────────────────────────────────────────────
 
   // 새 파일 일괄 학습
   // PDF가 포함되어 있으면 먼저 모달로 처리 방식 선택받은 후 진행
@@ -6630,6 +6682,17 @@ export default function App() {
                 <div style={{ fontSize:10, color:"#64748b", marginTop:14, textAlign:"center" }}>
                   파일 분석 중입니다. 잠시만 기다려주세요...
                 </div>
+                {wakeLockUnsupported ? (
+                  <div style={{ fontSize:10, color:"#fbbf24", marginTop:8, textAlign:"center", lineHeight:1.5 }}>
+                    ⚠️ 이 브라우저는 화면 꺼짐 방지(Wake Lock)를 지원하지 않습니다.<br/>
+                    학습이 끝날 때까지 화면을 켜두세요. (다른 메뉴로 이동해도 학습은 계속됩니다)
+                  </div>
+                ) : (
+                  <div style={{ fontSize:10, color:"#64748b", marginTop:8, textAlign:"center", lineHeight:1.5 }}>
+                    🔒 화면이 꺼지지 않도록 설정됐습니다. 다른 메뉴로 이동해도 학습은 계속됩니다.<br/>
+                    탭을 닫지만 마세요.
+                  </div>
+                )}
               </>
             )}
 
