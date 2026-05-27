@@ -285,6 +285,29 @@ async function callClaudeVision(system, userMsg, imageBase64, mediaType) {
   return await api.llm.vision(system, userMsg, imageBase64, mediaType);
 }
 
+// v27: Vision 호출 자동 재시도 (일시 실패 복구)
+//   - 즉시 시도 → 실패 시 2초 대기 후 재시도 → 또 실패 시 4초 대기 후 재시도 (총 3번)
+//   - 3번 다 실패하면 마지막 에러를 throw (호출 측에서 isError 처리)
+async function callClaudeVisionWithRetry(system, userMsg, imageBase64, mediaType) {
+  const delays = [0, 2000, 4000]; // ms — 즉시 / 2초 / 4초
+  let lastErr;
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    if (delays[attempt] > 0) {
+      await new Promise(r => setTimeout(r, delays[attempt]));
+    }
+    try {
+      return await callClaudeVision(system, userMsg, imageBase64, mediaType);
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[v27 Vision retry] 시도 ${attempt + 1}/${delays.length} 실패: ${e && e.message ? e.message : e}`);
+    }
+  }
+  throw lastErr;
+}
+
+// v27: 학습앱 파일 크기 한계 (Apps Script blob ~50MB 제한). 안전선 45MB.
+const MAX_LEARN_FILE_SIZE = 45 * 1024 * 1024; // 45MB
+
 // 파일을 Base64로 변환 (이미지인 경우 자동 압축)
 // 긴 변이 1600px 넘으면 비율 유지하며 축소, JPEG 90% 품질로 재인코딩
 function fileToBase64(file) {
@@ -5731,10 +5754,27 @@ export default function App() {
     setShowPdfModeDialog(false);
     setSyncingFiles(true);
     setSyncResult(null);
-    const allFiles = [
+    const allFilesRaw = [
       ...folderScan.roleFiles.map(f => ({ ...f, source: "role" })),
       ...folderScan.commonFiles.map(f => ({ ...f, source: "common" })),
     ];
+    // v27: 큰 파일 사전 차단 (학습앱 다운로드 한계 ~50MB, 안전선 45MB)
+    //   - oversized: 한계 초과 → 학습 안 함 (사용자에게 안내, errors push는 아래에서)
+    //   - allFiles: 한계 이하만 실제 학습 대상
+    const oversized = allFilesRaw.filter(f => f.size && f.size > MAX_LEARN_FILE_SIZE);
+    const allFiles = allFilesRaw.filter(f => !f.size || f.size <= MAX_LEARN_FILE_SIZE);
+
+    // v27: 최신 KB 직접 로드 — 이어서 학습 시 이미 처리된 페이지 매칭용
+    //   (state는 비동기 갱신이라 학습 함수 내에서는 freshKnowledge 변수로 직접 참조)
+    let freshKnowledge = [];
+    try {
+      freshKnowledge = await loadFromSheetFresh(role);
+      setKnowledge(freshKnowledge); // 화면 표시용 state도 동기화
+    } catch (e) {
+      console.warn("[v27] 최신 KB 로드 실패 — 캐시된 knowledge로 폴백:", e && e.message);
+      freshKnowledge = knowledge || [];
+    }
+
     setSyncProgress({ current: 0, total: allFiles.length, currentFile: "" });
 
     let successCount = 0;
@@ -5747,6 +5787,12 @@ export default function App() {
     let csvChunkCount = 0;     // v23: 학습된 CSV 청크 수 (200행 단위)
     let textFileCount = 0;     // v23: 학습된 TXT/MD 파일 수
     const errors = [];
+
+    // v27: 큰 파일 사전 안내 (실제 학습은 안 함, syncResult에 표시)
+    for (const big of oversized) {
+      const mb = (big.size / 1024 / 1024).toFixed(1);
+      errors.push(`${big.filename}: 파일 크기 ${mb}MB가 학습 한계(45MB)를 초과합니다. PDF는 페이지 분할, 텍스트형은 .txt로 변환 후 다시 올려주세요.`);
+    }
 
     for (let i = 0; i < allFiles.length; i++) {
       const f = allFiles[i];
@@ -5891,10 +5937,32 @@ export default function App() {
             let lastSection = "";
             let firstPageRecommendedCat = ""; // 첫 페이지에서 추출 (PDF 전체 카테고리)
 
+            // v27: 이어서 학습 — 이미 KB에 row가 있는 페이지는 스킵 (페이지 단위 재개)
+            //   매칭: source_file(파일명) + source_page("N" 또는 "슬라이드 N")
+            //   학습 중간에 실패해도 다음 실행 시 안 된 페이지부터 자동 이어감
+            const currentFileNameForResume = wasPptxConverted ? originalPptxName : f.filename;
+            const processedPages = new Set(
+              freshKnowledge
+                .filter(k => k && k.source_file === currentFileNameForResume)
+                .map(k => k.source_page)
+                .filter(p => p)
+            );
+            let resumedSkipCount = 0; // 이번 학습에서 스킵된 페이지 수
+            if (processedPages.size > 0) {
+              console.log(`[v27 이어서학습] ${currentFileNameForResume}: 기존 ${processedPages.size}페이지 처리됨 → 신규만 학습`);
+            }
+
             for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
+              // v27: 이어서 학습 — 이미 처리된 페이지면 스킵 (pagePayloads에 안 들어가 저장도 자연 제외)
+              const resumeKey = wasPptxConverted ? `슬라이드 ${pageNum}` : String(pageNum);
+              if (processedPages.has(resumeKey)) {
+                resumedSkipCount++;
+                continue;
+              }
+
               setSyncProgress({
                 current: i + 1, total: allFiles.length,
-                currentFile: `${displayName} (페이지 ${pageNum}/${pageCount} 분석 중...)`,
+                currentFile: `${displayName} (페이지 ${pageNum}/${pageCount} 분석 중${processedPages.size > 0 ? `, 기존 ${processedPages.size}p 스킵` : ""}...)`,
               });
 
               const pageBase64 = await pdfPageToBase64(pdf, pageNum);
@@ -5935,10 +6003,12 @@ export default function App() {
               let pageContent = "";
               let isError = false;
               try {
-                pageContent = await callClaudeVision(pagePrompt, "이 PDF 페이지를 분석하세요.", pageBase64, "image/jpeg");
+                // v27: 자동 재시도(2초→4초, 총 3번 시도)로 일시적 Vision 실패 자동 복구
+                pageContent = await callClaudeVisionWithRetry(pagePrompt, "이 PDF 페이지를 분석하세요.", pageBase64, "image/jpeg");
               } catch (e) {
                 isError = true;
                 pageContent = `(분석 실패: ${e.message || "알 수 없는 오류"})`;
+                // v27: 실패 페이지는 KB row를 안 만들므로, 다음 학습 실행 시 자동으로 재시도됨 (이어서 학습)
               }
 
               // 첫 페이지: 카테고리 추출 (PDF 전체 카테고리로 사용)
@@ -6001,6 +6071,10 @@ export default function App() {
             pdfVisionCount++;
             if (pageOkCount > 0) {
               successCount++;
+            } else if (resumedSkipCount === pageCount && pageCount > 0) {
+              // v27: 모든 페이지가 이미 학습된 상태 (이어서 학습으로 추가할 게 없음)
+              successCount++;
+              console.log(`[v27] ${displayName}: 모든 페이지 이미 학습됨 — 스킵`);
             } else {
               failCount++;
               errors.push(`${displayName}: 모든 페이지 저장 실패`);
