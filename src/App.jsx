@@ -3022,9 +3022,10 @@ JSON으로만 답하세요. 다른 설명 없이.
           result = `[PDF: ${file.name} - 그림 분석, ${pdfPageCount}페이지] (페이지별 카드 보기)`;
         }
       } else {
-        // 텍스트 파일 처리 (Step 7-10B 적용)
-        setAnalyzeStep("파일 분석 중...");
-        const sys = `${roleInfo.label}(${role}) AI입니다. 카테고리: ${category}.
+        // v28: 텍스트 파일 처리 — 청크 분할 (큰 txt도 손실 없이 전체 학습)
+        //   기존 v27까지: text.slice(0, 2000)으로 앞 2000자만 학습 → 큰 파일은 나머지 손실
+        //   v28: 12000자 단위 청크 분할 → 청크별 Claude 분석 → 결과 합쳐서 1 row 저장 (검수 흐름 유지)
+        const sysBase = `${roleInfo.label}(${role}) AI입니다. 카테고리: ${category}.
 
 파일이 매뉴얼·작업 지시서·도면 텍스트면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게.
 
@@ -3034,8 +3035,32 @@ JSON으로만 답하세요. 다른 설명 없이.
 [메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)`;
         let text = await extractTextFromFile(file);
         if (!text || text.length < 10) text = `파일명: ${file.name}`;
-        const truncated = text.slice(0, 2000);
-        result = await callClaude(sys, `다음 내용에서 핵심을 추출하세요:\n${truncated}`);
+
+        const TXT_CHUNK_SIZE = 12000;
+        const chunks = [];
+        for (let pos = 0; pos < text.length; pos += TXT_CHUNK_SIZE) {
+          chunks.push(text.slice(pos, pos + TXT_CHUNK_SIZE));
+        }
+        const totalChunks = chunks.length;
+
+        if (totalChunks === 1) {
+          // 작은 파일 — 기존 흐름과 동일 (분할 라벨 없음)
+          setAnalyzeStep("파일 분석 중...");
+          result = await callClaude(sysBase, `다음 내용에서 핵심을 추출하세요:\n${chunks[0]}`);
+        } else {
+          // 큰 파일 — 청크별로 순차 분석 후 결과 합치기
+          const chunkResults = [];
+          for (let cIdx = 0; cIdx < totalChunks; cIdx++) {
+            setAnalyzeStep(`파일 분석 중... (${cIdx + 1}/${totalChunks} 청크)`);
+            const chunkLabel = ` [청크 ${cIdx + 1}/${totalChunks}, 약 ${cIdx * TXT_CHUNK_SIZE + 1}~${Math.min((cIdx + 1) * TXT_CHUNK_SIZE, text.length)}자]`;
+            const chunkResult = await callClaude(
+              sysBase,
+              `다음 내용에서 핵심을 추출하세요${chunkLabel}:\n${chunks[cIdx]}`
+            );
+            chunkResults.push(`━━━ 청크 ${cIdx + 1}/${totalChunks} ━━━\n${chunkResult}`);
+          }
+          result = chunkResults.join("\n\n");
+        }
       }
 
       setAnalyzed(result);
