@@ -247,9 +247,10 @@ const api = {
 
   // LLM 호출 (Phase 3에서 Qwen으로 전환 시 LLM_BASE_URL 한 줄 + 내부 경로만 변경)
   llm: {
-    // 텍스트 채팅 — 반환: string (실패 시 throw)
+    // v29: 텍스트 채팅 — 반환: { text, stopReason } (잘림 감지용)
+    //   기존 string 반환은 callClaude wrapper에서 호환 유지
     async chat(system, userMsg, opts = {}) {
-      const max_tokens = opts.max_tokens ?? 1000;
+      const max_tokens = opts.max_tokens ?? 4096; // v29: 1000 → 4096 (잘림 방지)
       const res = await fetch(`${LLM_BASE_URL}/claude`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -258,10 +259,13 @@ const api = {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (data.error) throw new Error(data.error);
-      return (data.content || []).map(i => i.text || "").join("").trim();
+      const text = (data.content || []).map(i => i.text || "").join("").trim();
+      // stop_reason: "end_turn"(정상) | "max_tokens"(잘림) | "stop_sequence" 등
+      const stopReason = data.stop_reason || "";
+      return { text, stopReason };
     },
 
-    // 이미지 분석 — 반환: string (실패 시 throw)
+    // 이미지 분석 — 반환: string (실패 시 throw). Vision은 응답이 짧아 잘림 위험 낮음, 기존 유지.
     async vision(system, userMsg, imageBase64, mediaType) {
       const res = await fetch(`${LLM_BASE_URL}/claude-vision`, {
         method: "POST",
@@ -276,8 +280,33 @@ const api = {
   },
 };
 
-async function callClaude(system, userMsg) {
-  return await api.llm.chat(system, userMsg);
+// v29: callClaude — 자동 이어쓰기 (max_tokens 한도로 응답이 잘리면 자동 재호출해 이어붙임)
+//   - 최대 3라운드 (안전 한도, 무한 루프 방지)
+//   - 기본: string 반환 (기존 호출처 호환)
+//   - opts.returnFull=true: { text, truncated } 반환 (handleFile에서 검수 UI ⚠️ 표시용)
+async function callClaude(system, userMsg, opts = {}) {
+  const maxRounds = opts.maxRounds ?? 3;
+  const chatOpts = { max_tokens: opts.max_tokens ?? 4096 };
+  let combined = "";
+  let lastStopReason = "";
+  let currentUserMsg = userMsg;
+
+  for (let round = 0; round < maxRounds; round++) {
+    if (round > 0) {
+      // 이어쓰기 — 직전 응답 끝 200자를 컨텍스트로 주고 자연스럽게 이어 작성 요청
+      const tail = combined.slice(-200);
+      currentUserMsg = `(이전 응답이 토큰 한도에서 잘렸습니다. 아래 마지막 부분 뒤에 자연스럽게 이어서 작성하세요. 같은 내용 중복 금지, 인사·메타설명 없이 본문만.)\n\n[직전 응답 끝부분]\n${tail}`;
+    }
+    const { text, stopReason } = await api.llm.chat(system, currentUserMsg, chatOpts);
+    combined += (round === 0 ? text : "\n" + text);
+    lastStopReason = stopReason;
+    if (stopReason !== "max_tokens") break; // 정상 종료
+    console.log(`[v29 callClaude] 라운드 ${round + 1}/${maxRounds}: max_tokens에서 잘림 → 자동 이어쓰기`);
+  }
+
+  const truncated = lastStopReason === "max_tokens"; // maxRounds 후에도 max_tokens면 진짜 잘림
+  if (opts.returnFull) return { text: combined.trim(), truncated };
+  return combined.trim();
 }
 
 // Vision API 호출
@@ -3046,20 +3075,32 @@ JSON으로만 답하세요. 다른 설명 없이.
         if (totalChunks === 1) {
           // 작은 파일 — 기존 흐름과 동일 (분할 라벨 없음)
           setAnalyzeStep("파일 분석 중...");
-          result = await callClaude(sysBase, `다음 내용에서 핵심을 추출하세요:\n${chunks[0]}`);
+          const r = await callClaude(sysBase, `다음 내용에서 핵심을 추출하세요:\n${chunks[0]}`, { returnFull: true });
+          result = r.text;
+          if (r.truncated) {
+            // v29: 자동 이어쓰기 3회 후에도 잘림 → 사용자에게 경고
+            result = "⚠️ [경고] 응답이 토큰 한도에서 잘렸을 수 있습니다. 일부 내용이 누락됐을 가능성 — 저장 전 검수 필수.\n\n" + result;
+          }
         } else {
           // 큰 파일 — 청크별로 순차 분석 후 결과 합치기
           const chunkResults = [];
+          let anyTruncated = false;
           for (let cIdx = 0; cIdx < totalChunks; cIdx++) {
             setAnalyzeStep(`파일 분석 중... (${cIdx + 1}/${totalChunks} 청크)`);
             const chunkLabel = ` [청크 ${cIdx + 1}/${totalChunks}, 약 ${cIdx * TXT_CHUNK_SIZE + 1}~${Math.min((cIdx + 1) * TXT_CHUNK_SIZE, text.length)}자]`;
-            const chunkResult = await callClaude(
+            const r = await callClaude(
               sysBase,
-              `다음 내용에서 핵심을 추출하세요${chunkLabel}:\n${chunks[cIdx]}`
+              `다음 내용에서 핵심을 추출하세요${chunkLabel}:\n${chunks[cIdx]}`,
+              { returnFull: true }
             );
-            chunkResults.push(`━━━ 청크 ${cIdx + 1}/${totalChunks} ━━━\n${chunkResult}`);
+            const tag = r.truncated ? "⚠️ " : "";
+            chunkResults.push(`━━━ ${tag}청크 ${cIdx + 1}/${totalChunks} ━━━\n${r.text}`);
+            if (r.truncated) anyTruncated = true;
           }
           result = chunkResults.join("\n\n");
+          if (anyTruncated) {
+            result = "⚠️ [경고] 일부 청크에서 응답이 토큰 한도에 닿아 잘렸을 수 있습니다 (위 ⚠️ 표시 청크). 저장 전 검수 필수.\n\n" + result;
+          }
         }
       }
 
@@ -6357,10 +6398,10 @@ export default function App() {
             errors.push(`${displayName}: 모든 청크 저장 실패 (${totalChunkAttempt}개 시도)`);
           }
         } else if (isTextFile) {
-          // ─── TXT/MD 처리 (v23) ───
-          // - base64 → UTF-8 텍스트 디코딩
-          // - 4블록 Claude 분석 (12000자 cap, PDF 텍스트 모드와 동일 정책)
-          // - 1 row + sourceMeta (source_page 빈 칸, source_url = Drive URL)
+          // ─── TXT/MD 처리 (v23 → v30 청크 분할) ───
+          // v23까지: 12000자 truncate (앞부분만 학습) → 큰 txt는 뒤가 손실
+          // v30: 12000자 단위 청크 분할 → 청크별 callClaude (v29 자동 이어쓰기와 결합되어 응답 잘림도 자동 처리)
+          //   → 큰 txt도 손실 없이 전체 학습. handleFile (v28)과 동일 패턴.
           const textContent = base64ToUtf8Text(fileData.base64);
           if (!textContent || textContent.trim().length < 10) {
             failCount++;
@@ -6382,11 +6423,33 @@ export default function App() {
 [메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
 [챕터/섹션] (이 파일의 주요 챕터/섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)
 [추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
-          const truncated = textContent.slice(0, 12000);
+
+          // v30: 청크 분할
+          const TXT_CHUNK_SIZE = 12000;
+          const chunks = [];
+          for (let pos = 0; pos < textContent.length; pos += TXT_CHUNK_SIZE) {
+            chunks.push(textContent.slice(pos, pos + TXT_CHUNK_SIZE));
+          }
+          const totalChunks = chunks.length;
 
           let analyzed = "";
           try {
-            analyzed = await callClaude(sys, `다음 텍스트 내용에서 핵심을 추출하세요:\n\n${truncated}`);
+            if (totalChunks === 1) {
+              // 작은 파일 — 기존 흐름과 동일
+              analyzed = await callClaude(sys, `다음 텍스트 내용에서 핵심을 추출하세요:\n\n${chunks[0]}`);
+            } else {
+              // 큰 파일 — 청크별 분석 후 결과 합치기
+              const chunkResults = [];
+              for (let cIdx = 0; cIdx < totalChunks; cIdx++) {
+                const chunkLabel = ` [청크 ${cIdx + 1}/${totalChunks}, 약 ${cIdx * TXT_CHUNK_SIZE + 1}~${Math.min((cIdx + 1) * TXT_CHUNK_SIZE, textContent.length)}자]`;
+                const chunkResult = await callClaude(
+                  sys,
+                  `다음 텍스트 내용에서 핵심을 추출하세요${chunkLabel}:\n\n${chunks[cIdx]}`
+                );
+                chunkResults.push(`━━━ 청크 ${cIdx + 1}/${totalChunks} ━━━\n${chunkResult}`);
+              }
+              analyzed = chunkResults.join("\n\n");
+            }
           } catch (cErr) {
             failCount++;
             errors.push(`${displayName}: Claude 호출 실패 - ${cErr.message}`);
