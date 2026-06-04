@@ -205,6 +205,7 @@ const api = {
       const res = await fetch(`${API_BASE_URL}?${qs}`);
       if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
       const data = await res.json();
+      if (data && data.success === false && data.error === "session_invalid") { handleSessionExpired(); return { ok: false, error: "session_invalid" }; }
       if (data.success) return { ok: true, data: data.data !== undefined ? data.data : data };
       return { ok: false, error: data.error || "응답 success=false" };
     } catch (e) {
@@ -227,6 +228,7 @@ const api = {
         });
         if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
         const data = await res.json();
+        if (data && data.success === false && data.error === "session_invalid") { handleSessionExpired(); return { ok: false, error: "session_invalid" }; }
         if (data.success) return { ok: true, data: data.data !== undefined ? data.data : data };
         return { ok: false, error: data.error || "응답 success=false" };
       } catch (e) {
@@ -5579,6 +5581,15 @@ function getCurrentUser() {
     const saved = sessionStorage.getItem(SESSION_STORAGE_KEY);
     return saved ? JSON.parse(saved) : null;
   } catch { return null; }
+}
+
+// ── 세션 만료 처리 (Step 3b-①) ────────────────────────────────────────
+// 게이트가 켜진 뒤 6시간 경과 등으로 세션이 만료되면 백엔드가 "session_invalid"를 반환.
+// 이때 로컬 세션을 비우고 페이지를 새로고침 → AuthGate가 로그인 화면을 다시 표시.
+function handleSessionExpired() {
+  setSessionToken(null);
+  try { sessionStorage.removeItem(SESSION_STORAGE_KEY); } catch {}
+  window.location.reload();
 }
 
 
