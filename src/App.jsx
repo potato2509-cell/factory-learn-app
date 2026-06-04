@@ -201,7 +201,7 @@ const api = {
   // 참고: data.data 가 없으면 전체 JSON을 data로 노출 (scan_learning_folder_all 처럼 응답 shape이 다른 액션 대응)
   async get(action, params = {}) {
     try {
-      const qs = new URLSearchParams({ action, ...params }).toString();
+      const qs = new URLSearchParams({ action, ...params, session_token: getSessionToken() || "" }).toString();
       const res = await fetch(`${API_BASE_URL}?${qs}`);
       if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
       const data = await res.json();
@@ -216,7 +216,7 @@ const api = {
   // 기본: no-cors fire-and-forget (응답 본문 못 받음, boolean 반환)
   // opts.needResponse=true: cors 모드, 응답 받음 ({ ok, data, error } 반환)
   async call(action, payload = {}, opts = {}) {
-    const body = JSON.stringify({ action, ...payload });
+    const body = JSON.stringify({ action, ...payload, session_token: getSessionToken() || "" });
     if (opts.needResponse) {
       try {
         const res = await fetch(API_BASE_URL, {
@@ -5316,7 +5316,273 @@ const TABS = [
   { id:5, icon:"🧠", label:"학습 현황" },
 ];
 
-export default function App() {
+// ════════════════════════════════════════════════════════════════════════════
+// ★ Step 3a 프론트 — 로그인 게이트 + 세션 토큰 흐름 (enforce·UI분기 없음)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 적용: 이 블록을 App_Step7 파일에서 "export default function App()" 바로 위에 붙여넣기.
+//       그리고 아래 "수정 3곳"을 적용 (api.get / api.call / App 함수 시그니처).
+//
+// 동작: 로그인 전엔 로그인 화면만. 로그인 → Google ID 토큰 → start_session →
+//       세션 토큰 수령 → 모든 api 호출에 자동 첨부 → 기존 앱 그대로 렌더.
+//       미등록/비활성은 안내 화면. (권한별 UI 숨김·백엔드 거부는 Step 3b)
+
+import { useState as _useStateAuth, useEffect as _useEffectAuth, useRef as _useRefAuth } from "react";
+
+// ── 상수 ──────────────────────────────────────────────────────────────
+const OAUTH_CLIENT_ID = "830951335500-mr71tivgr98at2ovvqcv16rdd8gvbi9n.apps.googleusercontent.com";
+const SESSION_STORAGE_KEY = "factory_kb_session_v1";
+
+// ── 모듈 레벨 세션 홀더 ────────────────────────────────────────────────
+// api.get / api.call이 이 값을 읽어 모든 요청에 session_token을 자동 첨부.
+// (호출처 수백 곳을 안 건드리기 위한 장치. AuthGate가 로그인 시 setSessionToken 호출)
+let _sessionToken = null;
+function setSessionToken(t) { _sessionToken = t || null; }
+function getSessionToken() { return _sessionToken; }
+
+// ── GIS(Google Identity Services) 동적 로드 ───────────────────────────
+let _gisPromise = null;
+function loadGIS() {
+  if (_gisPromise) return _gisPromise;
+  if (window.google && window.google.accounts && window.google.accounts.id) {
+    _gisPromise = Promise.resolve(window.google);
+    return _gisPromise;
+  }
+  _gisPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve(window.google);
+    script.onerror = () => reject(new Error("GIS 로드 실패 (accounts.google.com 차단 가능성)"));
+    document.head.appendChild(script);
+  });
+  return _gisPromise;
+}
+
+// ── start_session 전용 호출 ────────────────────────────────────────────
+// 응답 status(ok / not_registered / inactive / auth_failed)를 구분해야 해서
+// 일반 api.call(실패 시 에러 문자열만) 대신 직접 fetch로 전체 JSON을 읽음.
+// 이 시점엔 세션 토큰이 아직 없으므로 session_token 미첨부.
+async function startSession(idToken) {
+  try {
+    const res = await fetch(API_BASE_URL, {
+      method: "POST",
+      mode: "cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ action: "start_session", id_token: idToken }),
+    });
+    if (!res.ok) return { success: false, status: "http_error", error: `HTTP ${res.status}` };
+    return await res.json(); // { success, status, session_token, email, name, role, assigned_agents }
+  } catch (e) {
+    return { success: false, status: "network_error", error: e.message };
+  }
+}
+
+// ── 로그아웃 (세션 삭제 — 백엔드 + 로컬) ───────────────────────────────
+async function endSession() {
+  const token = getSessionToken();
+  if (token) {
+    try {
+      await fetch(API_BASE_URL, {
+        method: "POST", mode: "no-cors",
+        headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify({ action: "logout", session_token: token }),
+      });
+    } catch {}
+  }
+  setSessionToken(null);
+  try { sessionStorage.removeItem(SESSION_STORAGE_KEY); } catch {}
+}
+
+// ── 로그인 게이트 컴포넌트 ─────────────────────────────────────────────
+// 상태: loading(초기) → login(로그인 필요) → ok(통과, children 렌더)
+//        → not_registered / inactive (안내 화면)
+function AuthGate({ children }) {
+  const [phase, setPhase] = _useStateAuth("loading"); // loading|login|ok|not_registered|inactive|error
+  const [user, setUser] = _useStateAuth(null);         // { email, name, role, assigned_agents }
+  const [errorMsg, setErrorMsg] = _useStateAuth("");
+  const btnRef = _useRefAuth(null);
+  const gisReadyRef = _useRefAuth(false);
+
+  // 진입 시: 저장된 세션 있으면 바로 통과 (백엔드 만료는 3b 게이트가 처리)
+  _useEffectAuth(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const saved = sessionStorage.getItem(SESSION_STORAGE_KEY);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (parsed && parsed.session_token) {
+            setSessionToken(parsed.session_token);
+            if (!cancelled) { setUser(parsed); setPhase("ok"); }
+            return;
+          }
+        }
+      } catch {}
+      if (!cancelled) setPhase("login");
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // login 단계 진입 시 GIS 버튼 렌더
+  _useEffectAuth(() => {
+    if (phase !== "login") return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const google = await loadGIS();
+        if (cancelled) return;
+        if (!gisReadyRef.current) {
+          google.accounts.id.initialize({
+            client_id: OAUTH_CLIENT_ID,
+            callback: handleCredential,
+          });
+          gisReadyRef.current = true;
+        }
+        if (btnRef.current) {
+          btnRef.current.innerHTML = "";
+          google.accounts.id.renderButton(btnRef.current, {
+            theme: "filled_blue", size: "large", text: "signin_with",
+            shape: "pill", width: 260,
+          });
+        }
+      } catch (e) {
+        if (!cancelled) { setErrorMsg(e.message); setPhase("error"); }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [phase]);
+
+  const handleCredential = async (resp) => {
+    const idToken = resp && resp.credential;
+    if (!idToken) { setErrorMsg("ID 토큰을 받지 못했습니다."); setPhase("error"); return; }
+    setPhase("loading");
+    const r = await startSession(idToken);
+    if (r.success && r.status === "ok") {
+      const u = {
+        session_token: r.session_token, email: r.email,
+        name: r.name, role: r.role, assigned_agents: r.assigned_agents,
+      };
+      setSessionToken(r.session_token);
+      try { sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(u)); } catch {}
+      setUser(u);
+      setPhase("ok");
+    } else if (r.status === "not_registered") {
+      setUser({ email: r.email, name: r.name }); setPhase("not_registered");
+    } else if (r.status === "inactive") {
+      setUser({ email: r.email }); setPhase("inactive");
+    } else {
+      setErrorMsg(r.error || "로그인에 실패했습니다."); setPhase("error");
+    }
+  };
+
+  const retry = () => { setErrorMsg(""); setPhase("login"); };
+
+  // ── 화면 ──
+  const wrap = (inner) => (
+    <div style={{
+      minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center",
+      background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
+      fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif", padding:"24px 16px",
+    }}>
+      <div style={{
+        maxWidth:420, width:"100%", textAlign:"center",
+        background:"rgba(8,14,26,0.7)", border:"1px solid rgba(51,65,85,0.4)",
+        borderRadius:16, padding:"36px 28px",
+      }}>
+        <div style={{ fontSize:40, marginBottom:14 }}>🏭</div>
+        <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:6 }}>
+          Factory Engineer AI 학습
+        </div>
+        {inner}
+      </div>
+    </div>
+  );
+
+  if (phase === "ok") return children;
+
+  if (phase === "loading") {
+    return wrap(<div style={{ fontSize:13, color:"#64748b", marginTop:10 }}>확인 중...</div>);
+  }
+
+  if (phase === "login") {
+    return wrap(
+      <>
+        <div style={{ fontSize:13, color:"#64748b", marginBottom:22 }}>
+          로그인이 필요합니다
+        </div>
+        <div ref={btnRef} style={{ display:"flex", justifyContent:"center" }} />
+      </>
+    );
+  }
+
+  if (phase === "not_registered") {
+    return wrap(
+      <>
+        <div style={{ fontSize:14, fontWeight:700, color:"#fbbf24", marginTop:10, marginBottom:8 }}>
+          등록되지 않은 계정입니다
+        </div>
+        <div style={{ fontSize:12.5, color:"#94a3b8", lineHeight:1.7, marginBottom:18 }}>
+          <b style={{ color:"#cbd5e1" }}>{user?.email}</b><br/>
+          이 계정은 접근 권한이 없습니다.<br/>
+          관리자(Manager)에게 등록을 요청하세요.
+        </div>
+        <button onClick={async () => { await endSession(); retry(); }} style={authBtnStyle("#64748b")}>
+          다른 계정으로 로그인
+        </button>
+      </>
+    );
+  }
+
+  if (phase === "inactive") {
+    return wrap(
+      <>
+        <div style={{ fontSize:14, fontWeight:700, color:"#f87171", marginTop:10, marginBottom:8 }}>
+          비활성화된 계정입니다
+        </div>
+        <div style={{ fontSize:12.5, color:"#94a3b8", lineHeight:1.7, marginBottom:18 }}>
+          <b style={{ color:"#cbd5e1" }}>{user?.email}</b><br/>
+          관리자에게 활성화를 요청하세요.
+        </div>
+        <button onClick={async () => { await endSession(); retry(); }} style={authBtnStyle("#64748b")}>
+          다른 계정으로 로그인
+        </button>
+      </>
+    );
+  }
+
+  // error
+  return wrap(
+    <>
+      <div style={{ fontSize:14, fontWeight:700, color:"#f87171", marginTop:10, marginBottom:8 }}>
+        로그인 오류
+      </div>
+      <div style={{ fontSize:12, color:"#94a3b8", lineHeight:1.6, marginBottom:18 }}>
+        {errorMsg || "알 수 없는 오류"}
+      </div>
+      <button onClick={retry} style={authBtnStyle("#3b82f6")}>다시 시도</button>
+    </>
+  );
+}
+
+function authBtnStyle(color) {
+  return {
+    padding:"9px 18px", background:`${color}18`, border:`1px solid ${color}55`,
+    borderRadius:8, color, fontSize:12.5, fontWeight:700, cursor:"pointer",
+  };
+}
+
+// 헤더 등에서 쓸 현재 로그인 사용자 정보 (sessionStorage에서 읽기)
+function getCurrentUser() {
+  try {
+    const saved = sessionStorage.getItem(SESSION_STORAGE_KEY);
+    return saved ? JSON.parse(saved) : null;
+  } catch { return null; }
+}
+
+
+function MainApp() {
   const role = getRole();
   const roleInfo = role ? ROLE_CONFIG[role] : null;
   const [tab, setTab] = useState(0);
@@ -7253,5 +7519,12 @@ export default function App() {
         ::-webkit-scrollbar-thumb{background:rgba(59,130,246,0.2);border-radius:2px}
       `}</style>
     </div>
+  );
+}
+export default function App() {
+  return (
+    <AuthGate>
+      <MainApp />
+    </AuthGate>
   );
 }
