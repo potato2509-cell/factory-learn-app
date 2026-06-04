@@ -1615,7 +1615,7 @@ function SaveBtn({ onClick, saving, saved }) {
 }
 
 // ─── STEP 1: 채팅 학습 ────────────────────────────────────────────────────────
-function TabChat({ role, roleInfo }) {
+function TabChat({ role, roleInfo, canWrite = true, userRole = "" }) {
   const [msgs, setMsgs] = useState([{
     role:"assistant",
     content:`안녕하세요! 저는 ${roleInfo.label}(${role}) AI입니다.\n\n학습 데이터를 불러오는 중...`,
@@ -2234,7 +2234,9 @@ ${dataText.slice(0, 8000)}
         }}>전송</button>
       </div>
 
-      <SaveBtn onClick={saveChat} saving={saving} saved={saved}/>
+      {canWrite
+        ? <SaveBtn onClick={saveChat} saving={saving} saved={saved}/>
+        : <div style={{ fontSize:11, color:"#fbbf24" }}>🔒 조회 전용 — 대화는 가능하지만 저장 권한이 없습니다{userRole ? ` (${userRole})` : ""}.</div>}
 
       {currentConflict && (
         <ConflictDialog
@@ -2320,7 +2322,7 @@ const RULE_FIELDS = {
   ],
 };
 
-function TabRules({ role, roleInfo }) {
+function TabRules({ role, roleInfo, canWrite = true, userRole = "" }) {
   const fields = RULE_FIELDS[role] || RULE_FIELDS[Object.keys(RULE_FIELDS)[0]];
   const [values, setValues] = useState(Object.fromEntries(fields.map((_,i) => [i, ""])));
   const [loadingExisting, setLoadingExisting] = useState(true);  // 기존 입력 로드 중
@@ -2419,6 +2421,7 @@ function TabRules({ role, roleInfo }) {
 
   return (
     <div>
+      {!canWrite && <ReadOnlyBanner userRole={userRole}/>}
       <div style={{ marginBottom:16 }}>
         <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
           <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📋 업무 규칙 & 판단 기준</div>
@@ -2470,7 +2473,7 @@ function TabRules({ role, roleInfo }) {
         </div>
       ))}
 
-      <SaveBtn onClick={save} saving={saving} saved={saved}/>
+      {canWrite && <SaveBtn onClick={save} saving={saving} saved={saved}/>}
 
       {currentConflict && (
         <ConflictDialog
@@ -2487,7 +2490,7 @@ function TabRules({ role, roleInfo }) {
 }
 
 // ─── STEP 3: 상황 교정 ────────────────────────────────────────────────────────
-function TabCorrection({ role, roleInfo, knowledge }) {
+function TabCorrection({ role, roleInfo, knowledge, canWrite = true, userRole = "" }) {
   const [situation, setSituation] = useState("");
   const [aiAnswer, setAiAnswer] = useState("");
   const [correction, setCorrection] = useState("");
@@ -2605,6 +2608,7 @@ ${knowledgeText || "기본 역할 정의만 있음"}
 
   return (
     <div>
+      {!canWrite && <ReadOnlyBanner userRole={userRole}/>}
       <div style={{ marginBottom:16 }}>
         <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>🎯 상황 던지기 & 판단 교정</div>
         <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
@@ -2673,7 +2677,7 @@ ${knowledgeText || "기본 역할 정의만 있음"}
             }}
           />
 
-          <SaveBtn onClick={saveCase} saving={saving} saved={saved}/>
+          {canWrite && <SaveBtn onClick={saveCase} saving={saving} saved={saved}/>}
         </>
       )}
 
@@ -2718,7 +2722,7 @@ ${knowledgeText || "기본 역할 정의만 있음"}
 }
 
 // ─── STEP 4: 문서·사진 학습 ──────────────────────────────────────────────────
-function TabDocument({ role, roleInfo }) {
+function TabDocument({ role, roleInfo, canWrite = true, userRole = "" }) {
   const [file, setFile] = useState(null);
   const [preview, setPreview] = useState("");
   const [analyzed, setAnalyzed] = useState("");
@@ -3282,6 +3286,7 @@ ${dataText.slice(0, 8000)}
 
   return (
     <div>
+      {!canWrite && <ReadOnlyBanner userRole={userRole}/>}
       <div style={{ marginBottom:16 }}>
         <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📄 문서·사진 학습</div>
         <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
@@ -3497,6 +3502,7 @@ ${dataText.slice(0, 8000)}
       </div>
 
       {/* 분석 버튼 */}
+      {canWrite && (
       <button onClick={analyze} disabled={!file || loading} style={{
         padding:"10px 18px", marginBottom:14,
         background: file&&!loading ? `linear-gradient(135deg,${roleInfo.color},${roleInfo.color}99)` : "rgba(51,65,85,0.3)",
@@ -3508,6 +3514,7 @@ ${dataText.slice(0, 8000)}
       }}>
         {loading ? <><Spinner/>{analyzeStep || "분석 중..."}</> : "🔍 AI 분석"}
       </button>
+      )}
 
       {error && (
         <div style={{
@@ -3647,7 +3654,7 @@ ${dataText.slice(0, 8000)}
                 </div>
               )}
 
-              <SaveBtn onClick={save} saving={saving} saved={saved}/>
+              {canWrite && <SaveBtn onClick={save} saving={saving} saved={saved}/>}
             </>
           ) : (
             <>
@@ -3703,7 +3710,7 @@ ${dataText.slice(0, 8000)}
                 </div>
               )}
 
-              <SaveBtn onClick={save} saving={saving} saved={saved}/>
+              {canWrite && <SaveBtn onClick={save} saving={saving} saved={saved}/>}
             </>
           )}
         </div>
@@ -3745,7 +3752,7 @@ function highlightMatch(text, query) {
 }
 
 // ─── 학습 보관함 (TabLibrary): 검색 / 필터 / 정렬 / 열람 / 편집 / 삭제 ────
-function TabLibrary({ role, roleInfo, knowledge, onReload, loading }) {
+function TabLibrary({ role, roleInfo, knowledge, onReload, loading, canWrite = true, userRole = "" }) {
   const CATEGORIES = ["공장정보", "업무역할", "판단기준", "협업방식", "교정사례"];
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -4100,8 +4107,8 @@ function TabLibrary({ role, roleInfo, knowledge, onReload, loading }) {
                     {String(item.updated_at).slice(0, 10)}
                   </span>
                 )}
-                {/* 편집/삭제 버튼 (편집 중이 아닐 때만) */}
-                {!isEditing && (
+                {/* 편집/삭제 버튼 (편집 중이 아닐 때만 + 쓰기 권한 있을 때만) */}
+                {!isEditing && canWrite && (
                   <div style={{ marginLeft:"auto", display:"flex", gap:6 }}>
                     <button
                       onClick={() => startEdit(item)}
@@ -4289,7 +4296,7 @@ function TabLibrary({ role, roleInfo, knowledge, onReload, loading }) {
   );
 }
 
-function TabStatus({ role, roleInfo, knowledge, onReload, loading, autoConflicts = [], autoCheckBusy = false, onResolveAutoConflict, onStartRelearn, relearning = false, relearnProgress = { current:0, total:0, currentFile:"" } }) {
+function TabStatus({ role, roleInfo, knowledge, onReload, loading, canWrite = true, userRole = "", autoConflicts = [], autoCheckBusy = false, onResolveAutoConflict, onStartRelearn, relearning = false, relearnProgress = { current:0, total:0, currentFile:"" } }) {
   const progress = calcProgress(knowledge);
   const [scanning, setScanning] = useState(false);
   const [scanResults, setScanResults] = useState(null); // { conflicts: [...], scannedAt: timestamp }
@@ -4714,7 +4721,7 @@ JSON으로만 답하세요. 충돌 없으면 빈 배열.
       </button>
 
       {/* ─── 빈약 데이터 재학습 (Step 7-11) ─── */}
-      {qualityReport && qualityReport.weakAutoItems && qualityReport.weakAutoItems.length > 0 && (
+      {canWrite && qualityReport && qualityReport.weakAutoItems && qualityReport.weakAutoItems.length > 0 && (
         <div style={{
           marginTop:18, padding:"14px 16px",
           background:"rgba(99,102,241,0.05)",
@@ -4849,7 +4856,7 @@ JSON으로만 답하세요. 충돌 없으면 빈 배열.
                   }}>{c.itemB.content}</div>
                 </div>
 
-                {!c.resolved && onResolveAutoConflict && (
+                {!c.resolved && canWrite && onResolveAutoConflict && (
                   <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
                     <button
                       onClick={() => onResolveAutoConflict(idx, "skip")}
@@ -4982,7 +4989,7 @@ JSON으로만 답하세요. 충돌 없으면 빈 배열.
                   }}>{c.itemB.content}</div>
                 </div>
 
-                {!c.resolved && (
+                {!c.resolved && canWrite && (
                   <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:5 }}>
                     <button onClick={() => resolveConflict(idx, "keep_a")}
                       disabled={resolving === idx} style={smallBtnStyle("#34d399")}>
@@ -5592,10 +5599,41 @@ function handleSessionExpired() {
   window.location.reload();
 }
 
+// ── 권한 판정 (Step 3b-②) ─────────────────────────────────────────────
+// 로그인 사용자가 특정 에이전트(agentRole)에 쓰기 권한이 있는지.
+// Manager=전부 / FSE=assigned_agents에 포함된 에이전트만 쓰기 / ISE=조회 전용
+function canWriteForAgent(agentRole) {
+  const u = getCurrentUser();
+  if (!u || !u.role) return false;
+  if (u.role === "Manager") return true;
+  if (u.role === "FSE") {
+    const assigned = String(u.assigned_agents || "").split(",").map(s => s.trim()).filter(Boolean);
+    return assigned.indexOf(agentRole) >= 0;
+  }
+  return false; // ISE
+}
+
+// 조회 전용 안내 배너 (쓰기 권한 없는 탭 상단)
+function ReadOnlyBanner({ userRole }) {
+  return (
+    <div style={{
+      background:"rgba(245,158,11,0.08)", border:"1px solid rgba(245,158,11,0.3)",
+      borderRadius:8, padding:"9px 13px", marginBottom:14,
+      fontSize:11.5, color:"#fbbf24", lineHeight:1.6,
+    }}>
+      🔒 조회 전용 — 이 에이전트에 대한 쓰기 권한이 없습니다{userRole ? ` (현재 권한: ${userRole})` : ""}. 저장·편집·업로드는 비활성화됩니다.
+    </div>
+  );
+}
+
 
 function MainApp() {
   const role = getRole();
   const roleInfo = role ? ROLE_CONFIG[role] : null;
+  // Step 3b-②: 현재 에이전트에 대한 쓰기 권한 + 로그인 권한 표시용
+  const canWrite = canWriteForAgent(role);
+  const currentUser = getCurrentUser();
+  const userRole = currentUser?.role || "";
   const [tab, setTab] = useState(0);
   const [knowledge, setKnowledge] = useState([]);
   const [loadingKB, setLoadingKB] = useState(false);
@@ -6874,12 +6912,13 @@ function MainApp() {
   }
 
   const panels = [
-    <TabChat role={role} roleInfo={roleInfo}/>,
-    <TabRules role={role} roleInfo={roleInfo}/>,
-    <TabCorrection role={role} roleInfo={roleInfo} knowledge={knowledge}/>,
-    <TabDocument role={role} roleInfo={roleInfo}/>,
-    <TabLibrary role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}/>,
+    <TabChat role={role} roleInfo={roleInfo} canWrite={canWrite} userRole={userRole}/>,
+    <TabRules role={role} roleInfo={roleInfo} canWrite={canWrite} userRole={userRole}/>,
+    <TabCorrection role={role} roleInfo={roleInfo} knowledge={knowledge} canWrite={canWrite} userRole={userRole}/>,
+    <TabDocument role={role} roleInfo={roleInfo} canWrite={canWrite} userRole={userRole}/>,
+    <TabLibrary role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB} canWrite={canWrite} userRole={userRole}/>,
     <TabStatus role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}
+      canWrite={canWrite} userRole={userRole}
       autoConflicts={autoConflicts}
       autoCheckBusy={autoCheckBusy}
       onResolveAutoConflict={markAutoConflictResolved}
@@ -6929,6 +6968,20 @@ function MainApp() {
             color:roleInfo.color, borderRadius:6, padding:"3px 10px",
             fontSize:11, fontWeight:800,
           }}>{role}</span>
+          {userRole && (
+            <span title={currentUser?.email || ""} style={{
+              background:"rgba(148,163,184,0.12)", border:"1px solid rgba(148,163,184,0.3)",
+              color:"#cbd5e1", borderRadius:6, padding:"3px 10px",
+              fontSize:11, fontWeight:800,
+            }}>👤 {userRole}</span>
+          )}
+          <button onClick={async () => { await endSession(); window.location.reload(); }} style={{
+            background:"rgba(239,68,68,0.1)", border:"1px solid rgba(239,68,68,0.3)",
+            color:"#f87171", borderRadius:6, padding:"5px 11px",
+            fontSize:11, fontWeight:700, cursor:"pointer",
+          }} title="로그아웃">
+            로그아웃
+          </button>
         </div>
       </div>
 
