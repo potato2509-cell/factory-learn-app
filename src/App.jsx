@@ -175,7 +175,7 @@ const TARGET_VALUES = {
   contentLength: 80000,  // 학습 내용 총 글자수
   categoryCount: 5,      // 카테고리 다양성 (전체 5종 모두 사용)
   correctionCount: 60,   // 교정 사례 수
-  recentRate: 70,        // 최신성 (최근 7일 내 업데이트 비율 70%)
+  recentRate: 70,        // 최신성 (최근 30일 내 업데이트 비율 70%) — v31: 백엔드 v26 RECENT_DAYS=30 동기화
 };
 
 // URL 파라미터에서 role 읽기
@@ -201,11 +201,10 @@ const api = {
   // 참고: data.data 가 없으면 전체 JSON을 data로 노출 (scan_learning_folder_all 처럼 응답 shape이 다른 액션 대응)
   async get(action, params = {}) {
     try {
-      const qs = new URLSearchParams({ action, ...params, session_token: getSessionToken() || "" }).toString();
+      const qs = new URLSearchParams({ action, ...params }).toString();
       const res = await fetch(`${API_BASE_URL}?${qs}`);
       if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
       const data = await res.json();
-      if (data && data.success === false && data.error === "session_invalid") { handleSessionExpired(); return { ok: false, error: "session_invalid" }; }
       if (data.success) return { ok: true, data: data.data !== undefined ? data.data : data };
       return { ok: false, error: data.error || "응답 success=false" };
     } catch (e) {
@@ -217,7 +216,7 @@ const api = {
   // 기본: no-cors fire-and-forget (응답 본문 못 받음, boolean 반환)
   // opts.needResponse=true: cors 모드, 응답 받음 ({ ok, data, error } 반환)
   async call(action, payload = {}, opts = {}) {
-    const body = JSON.stringify({ action, ...payload, session_token: getSessionToken() || "" });
+    const body = JSON.stringify({ action, ...payload });
     if (opts.needResponse) {
       try {
         const res = await fetch(API_BASE_URL, {
@@ -228,7 +227,6 @@ const api = {
         });
         if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
         const data = await res.json();
-        if (data && data.success === false && data.error === "session_invalid") { handleSessionExpired(); return { ok: false, error: "session_invalid" }; }
         if (data.success) return { ok: true, data: data.data !== undefined ? data.data : data };
         return { ok: false, error: data.error || "응답 success=false" };
       } catch (e) {
@@ -1328,6 +1326,9 @@ function calcProgress(knowledge) {
 
 // 대시보드 - 5개 지표를 0-100 점수로 정규화 (절대평가)
 // 각 지표별 목표값(TARGET_VALUES) 대비 현재값의 비율, 100점 상한
+// v31: freshness 가중치 0.5배 (균등 20% → 10%) — 단발성 학습으로 부풀림 방지 (옵션 B)
+//      4개 지표 각 22.2% + freshness 11.1% = 합 100%
+//      효과: 누적 페르소나 부당한 깎임 해소 + 신규 페르소나 부풀림 완화
 function calcDashboardScore(agent) {
   const cap = (val, target) => Math.min(100, Math.round((val / target) * 100));
 
@@ -1337,8 +1338,9 @@ function calcDashboardScore(agent) {
   const correctionScore = cap(agent.correctionCount || 0, TARGET_VALUES.correctionCount);
   const freshnessScore = cap(agent.recentRate || 0, TARGET_VALUES.recentRate);
 
+  // v31: freshness만 0.5배 가중치 (분모 4.5)
   const totalScore = Math.round(
-    (itemScore + contentScore + categoryScore + correctionScore + freshnessScore) / 5
+    (itemScore + contentScore + categoryScore + correctionScore + freshnessScore * 0.5) / 4.5
   );
   return { itemScore, contentScore, categoryScore, correctionScore, freshnessScore, totalScore };
 }
@@ -1615,7 +1617,7 @@ function SaveBtn({ onClick, saving, saved }) {
 }
 
 // ─── STEP 1: 채팅 학습 ────────────────────────────────────────────────────────
-function TabChat({ role, roleInfo, canWrite = true, userRole = "" }) {
+function TabChat({ role, roleInfo }) {
   const [msgs, setMsgs] = useState([{
     role:"assistant",
     content:`안녕하세요! 저는 ${roleInfo.label}(${role}) AI입니다.\n\n학습 데이터를 불러오는 중...`,
@@ -2234,9 +2236,7 @@ ${dataText.slice(0, 8000)}
         }}>전송</button>
       </div>
 
-      {canWrite
-        ? <SaveBtn onClick={saveChat} saving={saving} saved={saved}/>
-        : <div style={{ fontSize:11, color:"#fbbf24" }}>🔒 조회 전용 — 대화는 가능하지만 저장 권한이 없습니다{userRole ? ` (${userRole})` : ""}.</div>}
+      <SaveBtn onClick={saveChat} saving={saving} saved={saved}/>
 
       {currentConflict && (
         <ConflictDialog
@@ -2322,7 +2322,7 @@ const RULE_FIELDS = {
   ],
 };
 
-function TabRules({ role, roleInfo, canWrite = true, userRole = "" }) {
+function TabRules({ role, roleInfo }) {
   const fields = RULE_FIELDS[role] || RULE_FIELDS[Object.keys(RULE_FIELDS)[0]];
   const [values, setValues] = useState(Object.fromEntries(fields.map((_,i) => [i, ""])));
   const [loadingExisting, setLoadingExisting] = useState(true);  // 기존 입력 로드 중
@@ -2421,7 +2421,6 @@ function TabRules({ role, roleInfo, canWrite = true, userRole = "" }) {
 
   return (
     <div>
-      {!canWrite && <ReadOnlyBanner userRole={userRole}/>}
       <div style={{ marginBottom:16 }}>
         <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
           <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📋 업무 규칙 & 판단 기준</div>
@@ -2473,7 +2472,7 @@ function TabRules({ role, roleInfo, canWrite = true, userRole = "" }) {
         </div>
       ))}
 
-      {canWrite && <SaveBtn onClick={save} saving={saving} saved={saved}/>}
+      <SaveBtn onClick={save} saving={saving} saved={saved}/>
 
       {currentConflict && (
         <ConflictDialog
@@ -2490,7 +2489,7 @@ function TabRules({ role, roleInfo, canWrite = true, userRole = "" }) {
 }
 
 // ─── STEP 3: 상황 교정 ────────────────────────────────────────────────────────
-function TabCorrection({ role, roleInfo, knowledge, canWrite = true, userRole = "" }) {
+function TabCorrection({ role, roleInfo, knowledge }) {
   const [situation, setSituation] = useState("");
   const [aiAnswer, setAiAnswer] = useState("");
   const [correction, setCorrection] = useState("");
@@ -2608,7 +2607,6 @@ ${knowledgeText || "기본 역할 정의만 있음"}
 
   return (
     <div>
-      {!canWrite && <ReadOnlyBanner userRole={userRole}/>}
       <div style={{ marginBottom:16 }}>
         <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>🎯 상황 던지기 & 판단 교정</div>
         <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
@@ -2677,7 +2675,7 @@ ${knowledgeText || "기본 역할 정의만 있음"}
             }}
           />
 
-          {canWrite && <SaveBtn onClick={saveCase} saving={saving} saved={saved}/>}
+          <SaveBtn onClick={saveCase} saving={saving} saved={saved}/>
         </>
       )}
 
@@ -2722,7 +2720,7 @@ ${knowledgeText || "기본 역할 정의만 있음"}
 }
 
 // ─── STEP 4: 문서·사진 학습 ──────────────────────────────────────────────────
-function TabDocument({ role, roleInfo, canWrite = true, userRole = "" }) {
+function TabDocument({ role, roleInfo }) {
   const [file, setFile] = useState(null);
   const [preview, setPreview] = useState("");
   const [analyzed, setAnalyzed] = useState("");
@@ -3286,7 +3284,6 @@ ${dataText.slice(0, 8000)}
 
   return (
     <div>
-      {!canWrite && <ReadOnlyBanner userRole={userRole}/>}
       <div style={{ marginBottom:16 }}>
         <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📄 문서·사진 학습</div>
         <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
@@ -3502,7 +3499,6 @@ ${dataText.slice(0, 8000)}
       </div>
 
       {/* 분석 버튼 */}
-      {canWrite && (
       <button onClick={analyze} disabled={!file || loading} style={{
         padding:"10px 18px", marginBottom:14,
         background: file&&!loading ? `linear-gradient(135deg,${roleInfo.color},${roleInfo.color}99)` : "rgba(51,65,85,0.3)",
@@ -3514,7 +3510,6 @@ ${dataText.slice(0, 8000)}
       }}>
         {loading ? <><Spinner/>{analyzeStep || "분석 중..."}</> : "🔍 AI 분석"}
       </button>
-      )}
 
       {error && (
         <div style={{
@@ -3654,7 +3649,7 @@ ${dataText.slice(0, 8000)}
                 </div>
               )}
 
-              {canWrite && <SaveBtn onClick={save} saving={saving} saved={saved}/>}
+              <SaveBtn onClick={save} saving={saving} saved={saved}/>
             </>
           ) : (
             <>
@@ -3710,7 +3705,7 @@ ${dataText.slice(0, 8000)}
                 </div>
               )}
 
-              {canWrite && <SaveBtn onClick={save} saving={saving} saved={saved}/>}
+              <SaveBtn onClick={save} saving={saving} saved={saved}/>
             </>
           )}
         </div>
@@ -3752,7 +3747,7 @@ function highlightMatch(text, query) {
 }
 
 // ─── 학습 보관함 (TabLibrary): 검색 / 필터 / 정렬 / 열람 / 편집 / 삭제 ────
-function TabLibrary({ role, roleInfo, knowledge, onReload, loading, canWrite = true, userRole = "" }) {
+function TabLibrary({ role, roleInfo, knowledge, onReload, loading }) {
   const CATEGORIES = ["공장정보", "업무역할", "판단기준", "협업방식", "교정사례"];
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -4107,8 +4102,8 @@ function TabLibrary({ role, roleInfo, knowledge, onReload, loading, canWrite = t
                     {String(item.updated_at).slice(0, 10)}
                   </span>
                 )}
-                {/* 편집/삭제 버튼 (편집 중이 아닐 때만 + 쓰기 권한 있을 때만) */}
-                {!isEditing && canWrite && (
+                {/* 편집/삭제 버튼 (편집 중이 아닐 때만) */}
+                {!isEditing && (
                   <div style={{ marginLeft:"auto", display:"flex", gap:6 }}>
                     <button
                       onClick={() => startEdit(item)}
@@ -4296,7 +4291,7 @@ function TabLibrary({ role, roleInfo, knowledge, onReload, loading, canWrite = t
   );
 }
 
-function TabStatus({ role, roleInfo, knowledge, onReload, loading, canWrite = true, userRole = "", autoConflicts = [], autoCheckBusy = false, onResolveAutoConflict, onStartRelearn, relearning = false, relearnProgress = { current:0, total:0, currentFile:"" } }) {
+function TabStatus({ role, roleInfo, knowledge, onReload, loading, autoConflicts = [], autoCheckBusy = false, onResolveAutoConflict, onStartRelearn, relearning = false, relearnProgress = { current:0, total:0, currentFile:"" } }) {
   const progress = calcProgress(knowledge);
   const [scanning, setScanning] = useState(false);
   const [scanResults, setScanResults] = useState(null); // { conflicts: [...], scannedAt: timestamp }
@@ -4721,7 +4716,7 @@ JSON으로만 답하세요. 충돌 없으면 빈 배열.
       </button>
 
       {/* ─── 빈약 데이터 재학습 (Step 7-11) ─── */}
-      {canWrite && qualityReport && qualityReport.weakAutoItems && qualityReport.weakAutoItems.length > 0 && (
+      {qualityReport && qualityReport.weakAutoItems && qualityReport.weakAutoItems.length > 0 && (
         <div style={{
           marginTop:18, padding:"14px 16px",
           background:"rgba(99,102,241,0.05)",
@@ -4856,7 +4851,7 @@ JSON으로만 답하세요. 충돌 없으면 빈 배열.
                   }}>{c.itemB.content}</div>
                 </div>
 
-                {!c.resolved && canWrite && onResolveAutoConflict && (
+                {!c.resolved && onResolveAutoConflict && (
                   <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
                     <button
                       onClick={() => onResolveAutoConflict(idx, "skip")}
@@ -4989,7 +4984,7 @@ JSON으로만 답하세요. 충돌 없으면 빈 배열.
                   }}>{c.itemB.content}</div>
                 </div>
 
-                {!c.resolved && canWrite && (
+                {!c.resolved && (
                   <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:5 }}>
                     <button onClick={() => resolveConflict(idx, "keep_a")}
                       disabled={resolving === idx} style={smallBtnStyle("#34d399")}>
@@ -5194,7 +5189,7 @@ function HomeDashboard() {
             <ProgressBar label={`내용 총량 (${sel.contentLength.toLocaleString()}자)`} value={sel.contentScore} color={sel.agentColor} />
             <ProgressBar label={`카테고리 (${sel.categoryCount}종)`} value={sel.categoryScore} color={sel.agentColor} />
             <ProgressBar label={`교정 사례 (${sel.correctionCount}건)`} value={sel.correctionScore} color={sel.agentColor} />
-            <ProgressBar label={`최신성 (최근 7일 ${sel.recentRate}%)`} value={sel.freshnessScore} color={sel.agentColor} />
+            <ProgressBar label={`최신성 (최근 30일 ${sel.recentRate}%)`} value={sel.freshnessScore} color={sel.agentColor} />
 
             <div style={{
               marginTop:8, paddingTop:8,
@@ -5253,7 +5248,7 @@ function HomeDashboard() {
         <div>• <b style={{ color:"#cbd5e1" }}>내용 총량</b>: content 글자수 합계 (목표 80,000자)</div>
         <div>• <b style={{ color:"#cbd5e1" }}>카테고리</b>: unique category 개수 (목표 5종)</div>
         <div>• <b style={{ color:"#cbd5e1" }}>교정 사례</b>: 교정사례 카테고리 row 수 (목표 60건)</div>
-        <div>• <b style={{ color:"#cbd5e1" }}>최신성</b>: 최근 7일 내 업데이트 비율 (목표 70%)</div>
+        <div>• <b style={{ color:"#cbd5e1" }}>최신성</b>: 최근 30일 내 업데이트 비율 (목표 70%, 가중치 0.5배)</div>
       </div>
     </div>
   );
@@ -5325,315 +5320,9 @@ const TABS = [
   { id:5, icon:"🧠", label:"학습 현황" },
 ];
 
-// ════════════════════════════════════════════════════════════════════════════
-// ★ Step 3a 프론트 — 로그인 게이트 + 세션 토큰 흐름 (enforce·UI분기 없음)
-// ════════════════════════════════════════════════════════════════════════════
-//
-// 적용: 이 블록을 App_Step7 파일에서 "export default function App()" 바로 위에 붙여넣기.
-//       그리고 아래 "수정 3곳"을 적용 (api.get / api.call / App 함수 시그니처).
-//
-// 동작: 로그인 전엔 로그인 화면만. 로그인 → Google ID 토큰 → start_session →
-//       세션 토큰 수령 → 모든 api 호출에 자동 첨부 → 기존 앱 그대로 렌더.
-//       미등록/비활성은 안내 화면. (권한별 UI 숨김·백엔드 거부는 Step 3b)
-
-import { useState as _useStateAuth, useEffect as _useEffectAuth, useRef as _useRefAuth } from "react";
-
-// ── 상수 ──────────────────────────────────────────────────────────────
-const OAUTH_CLIENT_ID = "830951335500-mr71tivgr98at2ovvqcv16rdd8gvbi9n.apps.googleusercontent.com";
-const SESSION_STORAGE_KEY = "factory_kb_session_v1";
-
-// ── 모듈 레벨 세션 홀더 ────────────────────────────────────────────────
-// api.get / api.call이 이 값을 읽어 모든 요청에 session_token을 자동 첨부.
-// (호출처 수백 곳을 안 건드리기 위한 장치. AuthGate가 로그인 시 setSessionToken 호출)
-let _sessionToken = null;
-function setSessionToken(t) { _sessionToken = t || null; }
-function getSessionToken() { return _sessionToken; }
-
-// ── GIS(Google Identity Services) 동적 로드 ───────────────────────────
-let _gisPromise = null;
-function loadGIS() {
-  if (_gisPromise) return _gisPromise;
-  if (window.google && window.google.accounts && window.google.accounts.id) {
-    _gisPromise = Promise.resolve(window.google);
-    return _gisPromise;
-  }
-  _gisPromise = new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = "https://accounts.google.com/gsi/client";
-    script.async = true;
-    script.defer = true;
-    script.onload = () => resolve(window.google);
-    script.onerror = () => reject(new Error("GIS 로드 실패 (accounts.google.com 차단 가능성)"));
-    document.head.appendChild(script);
-  });
-  return _gisPromise;
-}
-
-// ── start_session 전용 호출 ────────────────────────────────────────────
-// 응답 status(ok / not_registered / inactive / auth_failed)를 구분해야 해서
-// 일반 api.call(실패 시 에러 문자열만) 대신 직접 fetch로 전체 JSON을 읽음.
-// 이 시점엔 세션 토큰이 아직 없으므로 session_token 미첨부.
-async function startSession(idToken) {
-  try {
-    const res = await fetch(API_BASE_URL, {
-      method: "POST",
-      mode: "cors",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ action: "start_session", id_token: idToken }),
-    });
-    if (!res.ok) return { success: false, status: "http_error", error: `HTTP ${res.status}` };
-    return await res.json(); // { success, status, session_token, email, name, role, assigned_agents }
-  } catch (e) {
-    return { success: false, status: "network_error", error: e.message };
-  }
-}
-
-// ── 로그아웃 (세션 삭제 — 백엔드 + 로컬) ───────────────────────────────
-async function endSession() {
-  const token = getSessionToken();
-  if (token) {
-    try {
-      await fetch(API_BASE_URL, {
-        method: "POST", mode: "no-cors",
-        headers: { "Content-Type": "text/plain" },
-        body: JSON.stringify({ action: "logout", session_token: token }),
-      });
-    } catch {}
-  }
-  setSessionToken(null);
-  try { sessionStorage.removeItem(SESSION_STORAGE_KEY); } catch {}
-}
-
-// ── 로그인 게이트 컴포넌트 ─────────────────────────────────────────────
-// 상태: loading(초기) → login(로그인 필요) → ok(통과, children 렌더)
-//        → not_registered / inactive (안내 화면)
-function AuthGate({ children }) {
-  const [phase, setPhase] = _useStateAuth("loading"); // loading|login|ok|not_registered|inactive|error
-  const [user, setUser] = _useStateAuth(null);         // { email, name, role, assigned_agents }
-  const [errorMsg, setErrorMsg] = _useStateAuth("");
-  const btnRef = _useRefAuth(null);
-  const gisReadyRef = _useRefAuth(false);
-
-  // 진입 시: 저장된 세션 있으면 바로 통과 (백엔드 만료는 3b 게이트가 처리)
-  _useEffectAuth(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const saved = sessionStorage.getItem(SESSION_STORAGE_KEY);
-        if (saved) {
-          const parsed = JSON.parse(saved);
-          if (parsed && parsed.session_token) {
-            setSessionToken(parsed.session_token);
-            if (!cancelled) { setUser(parsed); setPhase("ok"); }
-            return;
-          }
-        }
-      } catch {}
-      if (!cancelled) setPhase("login");
-    })();
-    return () => { cancelled = true; };
-  }, []);
-
-  // login 단계 진입 시 GIS 버튼 렌더
-  _useEffectAuth(() => {
-    if (phase !== "login") return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const google = await loadGIS();
-        if (cancelled) return;
-        if (!gisReadyRef.current) {
-          google.accounts.id.initialize({
-            client_id: OAUTH_CLIENT_ID,
-            callback: handleCredential,
-          });
-          gisReadyRef.current = true;
-        }
-        if (btnRef.current) {
-          btnRef.current.innerHTML = "";
-          google.accounts.id.renderButton(btnRef.current, {
-            theme: "filled_blue", size: "large", text: "signin_with",
-            shape: "pill", width: 260,
-          });
-        }
-      } catch (e) {
-        if (!cancelled) { setErrorMsg(e.message); setPhase("error"); }
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [phase]);
-
-  const handleCredential = async (resp) => {
-    const idToken = resp && resp.credential;
-    if (!idToken) { setErrorMsg("ID 토큰을 받지 못했습니다."); setPhase("error"); return; }
-    setPhase("loading");
-    const r = await startSession(idToken);
-    if (r.success && r.status === "ok") {
-      const u = {
-        session_token: r.session_token, email: r.email,
-        name: r.name, role: r.role, assigned_agents: r.assigned_agents,
-      };
-      setSessionToken(r.session_token);
-      try { sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(u)); } catch {}
-      setUser(u);
-      setPhase("ok");
-    } else if (r.status === "not_registered") {
-      setUser({ email: r.email, name: r.name }); setPhase("not_registered");
-    } else if (r.status === "inactive") {
-      setUser({ email: r.email }); setPhase("inactive");
-    } else {
-      setErrorMsg(r.error || "로그인에 실패했습니다."); setPhase("error");
-    }
-  };
-
-  const retry = () => { setErrorMsg(""); setPhase("login"); };
-
-  // ── 화면 ──
-  const wrap = (inner) => (
-    <div style={{
-      minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center",
-      background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
-      fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif", padding:"24px 16px",
-    }}>
-      <div style={{
-        maxWidth:420, width:"100%", textAlign:"center",
-        background:"rgba(8,14,26,0.7)", border:"1px solid rgba(51,65,85,0.4)",
-        borderRadius:16, padding:"36px 28px",
-      }}>
-        <div style={{ fontSize:40, marginBottom:14 }}>🏭</div>
-        <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:6 }}>
-          Factory Engineer AI 학습
-        </div>
-        {inner}
-      </div>
-    </div>
-  );
-
-  if (phase === "ok") return children;
-
-  if (phase === "loading") {
-    return wrap(<div style={{ fontSize:13, color:"#64748b", marginTop:10 }}>확인 중...</div>);
-  }
-
-  if (phase === "login") {
-    return wrap(
-      <>
-        <div style={{ fontSize:13, color:"#64748b", marginBottom:22 }}>
-          로그인이 필요합니다
-        </div>
-        <div ref={btnRef} style={{ display:"flex", justifyContent:"center" }} />
-      </>
-    );
-  }
-
-  if (phase === "not_registered") {
-    return wrap(
-      <>
-        <div style={{ fontSize:14, fontWeight:700, color:"#fbbf24", marginTop:10, marginBottom:8 }}>
-          등록되지 않은 계정입니다
-        </div>
-        <div style={{ fontSize:12.5, color:"#94a3b8", lineHeight:1.7, marginBottom:18 }}>
-          <b style={{ color:"#cbd5e1" }}>{user?.email}</b><br/>
-          이 계정은 접근 권한이 없습니다.<br/>
-          관리자(Manager)에게 등록을 요청하세요.
-        </div>
-        <button onClick={async () => { await endSession(); retry(); }} style={authBtnStyle("#64748b")}>
-          다른 계정으로 로그인
-        </button>
-      </>
-    );
-  }
-
-  if (phase === "inactive") {
-    return wrap(
-      <>
-        <div style={{ fontSize:14, fontWeight:700, color:"#f87171", marginTop:10, marginBottom:8 }}>
-          비활성화된 계정입니다
-        </div>
-        <div style={{ fontSize:12.5, color:"#94a3b8", lineHeight:1.7, marginBottom:18 }}>
-          <b style={{ color:"#cbd5e1" }}>{user?.email}</b><br/>
-          관리자에게 활성화를 요청하세요.
-        </div>
-        <button onClick={async () => { await endSession(); retry(); }} style={authBtnStyle("#64748b")}>
-          다른 계정으로 로그인
-        </button>
-      </>
-    );
-  }
-
-  // error
-  return wrap(
-    <>
-      <div style={{ fontSize:14, fontWeight:700, color:"#f87171", marginTop:10, marginBottom:8 }}>
-        로그인 오류
-      </div>
-      <div style={{ fontSize:12, color:"#94a3b8", lineHeight:1.6, marginBottom:18 }}>
-        {errorMsg || "알 수 없는 오류"}
-      </div>
-      <button onClick={retry} style={authBtnStyle("#3b82f6")}>다시 시도</button>
-    </>
-  );
-}
-
-function authBtnStyle(color) {
-  return {
-    padding:"9px 18px", background:`${color}18`, border:`1px solid ${color}55`,
-    borderRadius:8, color, fontSize:12.5, fontWeight:700, cursor:"pointer",
-  };
-}
-
-// 헤더 등에서 쓸 현재 로그인 사용자 정보 (sessionStorage에서 읽기)
-function getCurrentUser() {
-  try {
-    const saved = sessionStorage.getItem(SESSION_STORAGE_KEY);
-    return saved ? JSON.parse(saved) : null;
-  } catch { return null; }
-}
-
-// ── 세션 만료 처리 (Step 3b-①) ────────────────────────────────────────
-// 게이트가 켜진 뒤 6시간 경과 등으로 세션이 만료되면 백엔드가 "session_invalid"를 반환.
-// 이때 로컬 세션을 비우고 페이지를 새로고침 → AuthGate가 로그인 화면을 다시 표시.
-function handleSessionExpired() {
-  setSessionToken(null);
-  try { sessionStorage.removeItem(SESSION_STORAGE_KEY); } catch {}
-  window.location.reload();
-}
-
-// ── 권한 판정 (Step 3b-②) ─────────────────────────────────────────────
-// 로그인 사용자가 특정 에이전트(agentRole)에 쓰기 권한이 있는지.
-// Manager=전부 / FSE=assigned_agents에 포함된 에이전트만 쓰기 / ISE=조회 전용
-function canWriteForAgent(agentRole) {
-  const u = getCurrentUser();
-  if (!u || !u.role) return false;
-  if (u.role === "Manager") return true;
-  if (u.role === "FSE") {
-    const assigned = String(u.assigned_agents || "").split(",").map(s => s.trim()).filter(Boolean);
-    return assigned.indexOf(agentRole) >= 0;
-  }
-  return false; // ISE
-}
-
-// 조회 전용 안내 배너 (쓰기 권한 없는 탭 상단)
-function ReadOnlyBanner({ userRole }) {
-  return (
-    <div style={{
-      background:"rgba(245,158,11,0.08)", border:"1px solid rgba(245,158,11,0.3)",
-      borderRadius:8, padding:"9px 13px", marginBottom:14,
-      fontSize:11.5, color:"#fbbf24", lineHeight:1.6,
-    }}>
-      🔒 조회 전용 — 이 에이전트에 대한 쓰기 권한이 없습니다{userRole ? ` (현재 권한: ${userRole})` : ""}. 저장·편집·업로드는 비활성화됩니다.
-    </div>
-  );
-}
-
-
-function MainApp() {
+export default function App() {
   const role = getRole();
   const roleInfo = role ? ROLE_CONFIG[role] : null;
-  // Step 3b-②: 현재 에이전트에 대한 쓰기 권한 + 로그인 권한 표시용
-  const canWrite = canWriteForAgent(role);
-  const currentUser = getCurrentUser();
-  const userRole = currentUser?.role || "";
   const [tab, setTab] = useState(0);
   const [knowledge, setKnowledge] = useState([]);
   const [loadingKB, setLoadingKB] = useState(false);
@@ -6912,13 +6601,12 @@ function MainApp() {
   }
 
   const panels = [
-    <TabChat role={role} roleInfo={roleInfo} canWrite={canWrite} userRole={userRole}/>,
-    <TabRules role={role} roleInfo={roleInfo} canWrite={canWrite} userRole={userRole}/>,
-    <TabCorrection role={role} roleInfo={roleInfo} knowledge={knowledge} canWrite={canWrite} userRole={userRole}/>,
-    <TabDocument role={role} roleInfo={roleInfo} canWrite={canWrite} userRole={userRole}/>,
-    <TabLibrary role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB} canWrite={canWrite} userRole={userRole}/>,
+    <TabChat role={role} roleInfo={roleInfo}/>,
+    <TabRules role={role} roleInfo={roleInfo}/>,
+    <TabCorrection role={role} roleInfo={roleInfo} knowledge={knowledge}/>,
+    <TabDocument role={role} roleInfo={roleInfo}/>,
+    <TabLibrary role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}/>,
     <TabStatus role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}
-      canWrite={canWrite} userRole={userRole}
       autoConflicts={autoConflicts}
       autoCheckBusy={autoCheckBusy}
       onResolveAutoConflict={markAutoConflictResolved}
@@ -6968,20 +6656,6 @@ function MainApp() {
             color:roleInfo.color, borderRadius:6, padding:"3px 10px",
             fontSize:11, fontWeight:800,
           }}>{role}</span>
-          {userRole && (
-            <span title={currentUser?.email || ""} style={{
-              background:"rgba(148,163,184,0.12)", border:"1px solid rgba(148,163,184,0.3)",
-              color:"#cbd5e1", borderRadius:6, padding:"3px 10px",
-              fontSize:11, fontWeight:800,
-            }}>👤 {userRole}</span>
-          )}
-          <button onClick={async () => { await endSession(); window.location.reload(); }} style={{
-            background:"rgba(239,68,68,0.1)", border:"1px solid rgba(239,68,68,0.3)",
-            color:"#f87171", borderRadius:6, padding:"5px 11px",
-            fontSize:11, fontWeight:700, cursor:"pointer",
-          }} title="로그아웃">
-            로그아웃
-          </button>
         </div>
       </div>
 
@@ -7583,12 +7257,5 @@ function MainApp() {
         ::-webkit-scrollbar-thumb{background:rgba(59,130,246,0.2);border-radius:2px}
       `}</style>
     </div>
-  );
-}
-export default function App() {
-  return (
-    <AuthGate>
-      <MainApp />
-    </AuthGate>
   );
 }
