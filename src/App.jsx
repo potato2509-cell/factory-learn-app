@@ -1,7261 +1,4690 @@
-// App_Step7_v24.jsx
-// 트랙 1+ — 자동 점검 강화 + 직접 업로드 UI 안내문구 통일
-//
-// 주요 변경 (v23 → v24):
-//
-// [자동 점검 강화]
-//   1. isWeakAutoItem (빈약 감지) 전면 개선
-//      - 파일 형식 인식 확장: pdf|png|jpg|jpeg + pptx|ppt|xlsx|xls|csv|txt|md (v22/v23 신규 형식 반영)
-//      - v19 페이지별 row 구조 반영: 메타 row 개념 폐기, 각 row 단위로 빈약 판정
-//      - 분석 실패 row 자동 감지: "(분석 실패: ...)", "(이미지 없음)" 등 텍스트 포함 시 빈약 분류
-//      - 빈약 기준 단순화: 짧음 + 의미 있는 내용 부족
-//
-//   2. checkConflict (충돌 감지) 강화
-//      - (A) source_file 기준 같은 원본 row끼리는 충돌 검사 제외 (페이지별 row false positive 방지)
-//      - (B) 비교 대상 20건 → 50건 확대
-//      - (C) 수치/날짜 차이 강조 (프롬프트에 명시: 정량 데이터 불일치는 강한 충돌)
-//      - (D) 카테고리 교차 검사 (다른 카테고리 항목과도 비교, ~2배 비용 증가)
-//
-// [직접 업로드 UI 안내문구 통일]
-//   - 직접 업로드 accept: 기존 (.pdf,.txt,.csv,.md,.jpg,.jpeg,.png) 그대로
-//   - PPT/XLSX는 자동학습 폴더로 안내 (변환 흐름 신설하지 않음 — Q5-가)
-//   - 상단 안내 + 지원 형식 태그 + 하단 안내 박스 모두 일관 업데이트:
-//     · "PDF, 사진(JPG/PNG), 텍스트(TXT/CSV/MD) 직접 업로드 가능"
-//     · "📊 PPT/Excel은 학습자료 폴더에 올려주세요 (자동학습이 PDF 변환·청크 분석으로 처리)"
-//
-// 호환성: 기존 학습 데이터 영향 없음. 자동 점검 강화는 새 점검 시작 시 적용.
+/**
+ * 통합 Apps Script — 학습앱 + Teams Proxy
+ *
+ * 변경 이력:
+ *   v7 (2026-05-13, Step 7-11 v7):
+ *     - 기존 doGet/doPost가 두 번씩 정의되어 있던 구조를 통합
+ *     - 첫 번째 doGet/doPost (학습앱)에 두 번째 (Teams Proxy)를 흡수
+ *     - 분기 기준:
+ *       · doPost: payload.secret 있으면 Teams Proxy, 없으면 학습앱
+ *       · doGet:  e.parameter.action 있으면 학습앱, 없으면 alive 메시지
+ *     - scan_learning_folder_all 액션 포함 (Step 7-11 v6 재학습용)
+ *
+ *   v8 (2026-05-14, Step 7-13):
+ *     - PLC 3종 에이전트 추가 (Cell_PLC, Elec_PLC, FA_PLC)
+ *     - TAB_MAP: 3줄 추가
+ *     - DASHBOARD_ROLES: 3항목 추가
+ *
+ *   v9 (2026-05-14, 트랙 1 단계 1·2 — 출처 메타 시스템 기반):
+ *     - SOURCE_META_COLUMNS 상수 추가 (D~G열: source_file, source_page, source_section, source_url)
+ *     - addSourceColumnsToAllSheets 신규 함수 (1회 실행용 마이그레이션)
+ *     - saveKnowledge: sourceMeta 인자 받아 D~G열 저장 (하위 호환 — sourceMeta 없으면 빈 칸)
+ *     - saveCommonKnowledge: 동일하게 sourceMeta 인자 받음
+ *     - ensureCommonKnowledgeSheet: 신규 생성 시 헤더 7개로
+ *
+ *   v10 (2026-05-14, 트랙 1 단계 8-A — 출처 메타 읽기):
+ *     - getKnowledge: D~G열 4개 필드 반환 추가 (source_file/source_page/source_section/source_url)
+ *     - getCommonKnowledge: 동일하게 D~G열 반환 추가
+ *     - 둘 다 D~G가 빈 칸이어도 안전 (구버전 row는 모두 "" 반환)
+ *     - 시트 구조 변경 없음, 마이그레이션 불필요 (재배포만 하면 됨)
+ *
+ *   v11 (2026-05-17, 트랙 1 단계 5 — PPT 자동 변환 지원):
+ *     - getDriveFileContent: PPT/PPTX 감지 시 Drive Advanced API로 PDF 변환
+ *       · 변환된 PDF는 원본 PPT와 같은 폴더에 생성 (Q8-가)
+ *       · 파일명 충돌 시 변환 스킵 + 에러 보고 (Q9-가, 안전 우선)
+ *       · 변환 성공 시 원본 PPT는 휴지통 이동 (Q11-가, 30일 내 복구 가능)
+ *       · 단계별 안전망: 어느 단계 실패해도 PPT 데이터 손실 없음 (Q10)
+ *     - 클라이언트(App.jsx)는 변경 없이 동일 호출 — 백엔드가 PPT를 PDF로 자동 환원
+ *       응답 객체에 새 필드 converted_from_pptx (true 시 클라이언트가 학습 흐름 동일하게 진행)
+ *
+ *   ⚠️ v11 활성화 전 필수 작업: Drive 고급 서비스 활성화
+ *     Apps Script 에디터 → 서비스(+) → "Drive API" 추가 → ID: Drive, 버전: v2 → 확인
+ *     활성화 안 되면 PPT 변환 단계에서 에러 발생 (Drive.Files 미정의)
+ *
+ *   v12 (2026-05-24, PLC Agent query API 신설 — 별도 앱 연결용):
+ *     - doPost에 path 라우팅 추가: data.path === "query" → handleQuery (기존 secret/action 분기 보존)
+ *     - handleQuery: 별도 앱(PLC Agent)의 질문을 받아 KB 조회 + Claude 분석 + 표준 JSON 응답
+ *     - callClaudeAPI 신규: UrlFetchApp으로 Anthropic Messages API 직접 호출
+ *       · 기존 학습앱은 LLM을 클라이언트(App.jsx)에서만 호출했으나, 별도 앱 연결은
+ *         백엔드가 직접 LLM을 호출해야 하므로 신설
+ *     - 출처 정합: KB 각 항목에 src_001.. id를 코드가 부여 → LLM이 [src_xxx] 인용 →
+ *       사용된 id만 코드가 sources[]로 조립 (LLM의 URL 환각 방지)
+ *     - PLC 규칙(§5-1): 학습 자료에 근거 없으면 status:"not_found" (추측 금지)
+ *     - 다국어(§6-1): 입력 언어 자동 감지 / data.lang 강제, 코드·알람명·출처제목 원문 유지
+ *     - CORS(§6-3): 기존 doPost가 이미 text/plain 본문을 JSON.parse + ContentService JSON 응답
+ *     - 신규 스크립트 속성 2개 필요 (배포 불필요, 속성 저장 즉시 반영):
+ *       · ANTHROPIC_API_KEY  : 논의앱(AZS_WhatsApp_Webhook)에서 쓰던 키 값 재사용
+ *       · PLC_QUERY_TOKEN     : 별도 앱 인증용 토큰 (별도 앱과 동일 값)
+ *     - 모델: claude-sonnet-4-6 (analysis 정밀 분석용 기본값. PLC_QUERY_MODEL 상수로 교체 가능)
+ *
+ *   v13 (2026-05-24, PLC query 지식 사용 정책 — 별도 앱 채팅방 논의 반영):
+ *     - 추측 억제 기준을 '출처 유무' → '확실성'으로 전환 (별도 앱 논의 2번)
+ *     - PLC_KNOWLEDGE_MODE 상수 신설 — 단계별 지식 정책 전환:
+ *       · "hybrid" (현재, 클라우드 Claude): KB + 일반 지식 함께 사용 OK, 근거 없는 추정만 억제.
+ *                  불확실하면 '확실하지 않음/현장 확인 필요' 명시. 완전히 모르는 것만 not_found.
+ *       · "strict" (미래, 폐쇄형 Qwen): 학습된 출처에 있는 내용만, 출처 없으면 언급 금지.
+ *                  출처에서 못 찾으면 not_found. (작은 Qwen은 지멘스 범용지식 약함 → 출처만 신뢰)
+ *     - buildQueryPrompts: PLC_KNOWLEDGE_MODE에 따라 지식 사용 정책 블록 분기
+ *     - 일반 지식으로만 답한 내용은 출처 마커 없이 OK (hybrid) → sources[] 비어도 정상 응답
+ *     - 답변 격리(출처/일반 분리) 안 함 — 자연스럽게 답하되 프롬프트로 추측만 억제 (논의 3번)
+ *     - 다국어(§6-1)는 v12 그대로 유지 (논의 8번)
+ *     - 참고: 일반 에이전트(App.jsx callChat)는 이미 KB밖 지식 제약이 없어 범용 사용 중 (논의 4번)
+ *            → 일반 에이전트는 무변경, PLC query에만 추측 억제 적용
+ *     - ⏭ 별도 트랙(이번 미반영): 대용량 파일 학습 전략(논의 6번)·출처메타 보존(7번)은
+ *            학습 파이프라인(App.jsx startSync) 쪽 작업. query는 학습된 KB를 읽기만 함.
+ *
+ *   v14 (2026-05-24, query 파싱 실패 디버그 강화 — 별도 앱 채팅방 디버그 반영):
+ *     - 증상: not_found(짧은 응답)는 통과하나 별도 앱 실호출에서 "파싱 실패" 발생
+ *     - 유력 원인: max_tokens 부족으로 긴 응답(answer+structured)이 중간에 잘림 → JSON 미완성
+ *     1. PLC_QUERY_MAX_TOKENS 2048 → 4096 (긴 분석 응답 잘림 방지) ★주 원인 대응
+ *     2. callClaudeAPI: 받은 RAW 텍스트를 Logger.log로 출력 (원인 가시화)
+ *     3. extractJson: 정규식 폴백 추가 (펜스 제거 후 첫{~마지막} 실패 시 match로 재시도)
+ *     4. system 프롬프트 JSON-only 지시 강화
+ *     5. ⚠️ 디버그 임시: 파싱 실패 시 raw 일부를 answer에 담아 반환 (별도 앱 화면에서 원인 확인용)
+ *        → 원인 확정 후 되돌릴 것. 운영 시 raw를 answer에 노출하면 안 됨.
+ *
+ *   v15 (2026-05-28, v14 디버그 임시 코드 정리 — 운영 안전화):
+ *     - 원인(max_tokens 부족) 대응이 완료되어, v14에서 임시로 넣은 디버그 코드를 운영용으로 정리.
+ *     1. handleQuery 파싱 실패 분기: raw를 answer/message에 노출하던 것 제거
+ *        → 사용자에겐 깔끔한 에러 메시지만, raw는 노출 안 함 (로그에 길이만 기록).
+ *     2. callClaudeAPI: RAW 전문 Logger.log 제거. stop_reason=max_tokens일 때만 경고 로그 유지.
+ *     - 유지: PLC_QUERY_MAX_TOKENS=4096 (실제 잘림 방지), extractJson 정규식 폴백 (실제 기능 개선).
+ *
+ *   v16 (2026-06-02, PLC hybrid 프롬프트 4단계 출처 라벨링 강화 — F31137 not_found 이슈):
+ *     - 증상: 별도 앱에서 "F31137이 뭐야?" → not_found (지멘스 Sinamics 표준 결함 코드인데 답 못 함)
+ *     - 원인: 기존 hybrid 프롬프트가 모호한 일반 안내만 있어 LLM이 보수적으로 not_found 도피
+ *     - 수정: buildQueryPrompts의 hybrid 블록을 4단계 출처 라벨링 정책으로 강화
+ *       (1) KB 기반 — 기존 [src_xxx] 인용 (변경 없음)
+ *       (2) 표준 매뉴얼 기반 — Sinamics 결함 코드, 표준 OB, 프로토콜 등. answer 끝에 'ⓘ 출처: ... 표준 매뉴얼 기반' 라벨
+ *       (3) 일반 PLC/산업 표준 — TON, edge, retentive 등. answer 끝에 'ⓘ 출처: PLC 일반 표준 지식' 라벨
+ *       (4) 정보 없음 — status=not_found (공장 특화인데 KB 없을 때만)
+ *     - 표준 vs 공장 특화 구분 가이드 추가: 공장 자체 신호·파라미터·사례는 KB 없으면 반드시 (4)
+ *     - 답변 예시(F31137·TON) 포함: LLM이 라벨 형식 정확히 따르도록
+ *     - (2)(3)일 때 used_source_ids=[]: 가짜 src 환각 방지
+ *     - strict 블록은 유지 (폐쇄형 LLM 전환 시 사용)
+ *     - structured/sources/status JSON 구조 변경 없음 → 별도 앱 UI 변경 불필요
+ *
+ *   v17 (2026-06-03, Signal Graph 조회 도구 추가 — XML 기반 4626 신호 인덱스):
+ *     - 의뢰 배경: PLC 엔지니어 XML 확보 → 변환된 global_signal_graph.json (4.3MB, 4626 신호)
+ *     - 핵심: JSON을 학습 자료로 넣지 않고 '조회 도구'로 사용 (토큰 절약 + 정확도 100%)
+ *     - 신규 상수: SIGNAL_GRAPH_FILE_ID (Drive 파일 ID)
+ *     - 신규 함수 3개:
+ *       loadSignalGraph()         — Drive에서 JSON 매번 로드 (캐싱은 추후 최적화)
+ *       extractSignalCandidates() — 질문에서 신호명 후보 추출 (도트/CamelCase/F코드/약어/따옴표)
+ *       searchSignalGraph()       — 후보를 graph 키와 매칭 (정확/토큰경계/부분, 상위 5개)
+ *       formatSignalGraphContext()— 매칭 결과를 LLM 컨텍스트용 텍스트로 포맷
+ *     - handleQuery 흐름:
+ *       기존 KB 조회 → Signal Graph 자동 조회 → buildQueryPrompts에 signalContext 전달
+ *       → user message에 [신호 그래프 조회 결과] 섹션으로 주입
+ *     - buildQueryPrompts hybrid 블록에 (1.5) Signal Graph 카테고리 추가
+ *     - 매칭 결과: 신호별 set_locations(블록·네트워크·조건식) + used_in_blocks 노출
+ *     - 답변 라벨: 'ⓘ 출처: Signal Graph 자동 조회 (XML 기반)'
+ *     - 별도 앱 UI 변경 불필요 (백엔드 사전 검색 + 컨텍스트 주입)
+ *     - 검증 케이스: Door_Open_Error, safetyRelease, FDC, Lot Start (모두 graph에 존재)
+ *     - 부담: query당 +1~3초 (Drive 로드 + JSON.parse). 90초 타임아웃 안.
+ *
+ *   v18 (2026-06-03, Signal Graph 정규식 보강 + (1.5) 조건부 안내):
+ *     - 증상 1: "safetyRelease 출처는?" 질문에 Signal Graph 0건 매칭 (데이터엔 있는데 검색 실패)
+ *     - 원인 1: extractSignalCandidates의 CamelCase 패턴이 PascalCase만 잡고 lowerCamelCase 누락
+ *       (\\b[A-Z][a-zA-Z_]{4,}\\b — 첫 글자 대문자 강제)
+ *     - 수정 1: lowerCamelCase 패턴 추가 (\\b[a-z]+[A-Z][a-zA-Z_]{2,}\\b — 중간 대문자 필수)
+ *       → safetyRelease, executeRequest, enableModuleInterface 등 매칭
+ *       → 일반 영단어(release, safety)는 중간 대문자 없어 매칭 안 됨 (노이즈 차단)
+ *     - 증상 2: 검증 시 Signal Graph 0건 매칭인데도 LLM이 'ⓘ 출처: Signal Graph...' 라벨 부착
+ *     - 원인 2: 시스템 프롬프트 (1.5) 카테고리가 항상 노출되어 LLM이 실제 사용 여부 혼동
+ *     - 수정 2: (1.5) 안내에 "섹션이 user message에 실제 있을 때만 사용" 조건부 안내 추가
+ *
+ *   v19 (2026-06-04, callClaudeAPI 백엔드 자동 재시도 — Queue #20):
+ *     - 배경: F07410 검증 시 Anthropic API HTTP 500 (req_011CbdyHbmsQ7nH7dzSL2s58) 일시 장애
+ *       → 학습앱이 즉시 throw하여 사용자에게 에러 노출. 별도 앱 90초 타임아웃 안에 자동 복구 가능했음
+ *     - 수정: callClaudeAPI에 자동 재시도 로직 추가 (v27 페이지 재시도와 동일 패턴)
+ *       1. 즉시 시도 → 실패 시 2초 대기 → 또 실패 시 4초 대기 (총 3회, 최대 ~6초 추가)
+ *       2. 재시도 대상: HTTP 429/500/502/503/504, fetch 예외 (네트워크/타임아웃)
+ *       3. 즉시 throw: HTTP 200(성공), 4xx 클라이언트 오류(401/400 등, 재시도 무의미)
+ *     - 진단 로그: 각 재시도 라운드와 사유를 Logger.log에 기록
+ *     - 영향: 일시적 API 장애 시 자동 복구 → 사용자에게 에러 노출 빈도 ↓
+ *     - 트레이드오프: 진짜 장애 시 최대 6초 추가 대기 (90초 타임아웃 안)
+ *
+ *   v20 (2026-06-04, signal_graph_v2 통합 — 블록/타입 인덱스 추가, C-4 해결):
+ *     - 배경: C-4 검증 결과 "FB200의 IEC_TIMER는?" 질문에 1개만 답 (실제 3개) — 데이터 누락
+ *     - 진단: 기존 global_signal_graph는 출력 신호(Coil)만 인덱싱, Static 변수(IEC_TIMER 등) 미포함
+ *     - 해결: PLC 분석도구 V1 채팅방에서 파서 보강 → 새 인덱스 2개 추가 산출
+ *       · block_signals_index.json (4.9MB, 671 블록 — Section별/Type별 모든 변수)
+ *       · global_type_index.json (4.8MB, 1242 타입 — IEC_TIMER 76개 등)
+ *     - 신규 상수 2개: BLOCK_SIGNALS_FILE_ID, TYPE_INDEX_FILE_ID
+ *     - 신규 함수 6개:
+ *       loadBlockSignals() / loadTypeIndex() — Drive 로드
+ *       extractBlockCandidates() — FB/FC/DB/OB 번호 + 블록명 후보 추출
+ *       extractTypeCandidates() — PLC 타입 화이트리스트 + *_TIMER 패턴 + "타이머" 한글
+ *       searchBlockSignals() — 블록 매칭 (최대 3개), typeFilter 시 그 타입만 노출
+ *       searchTypeIndex() — 타입 위치 (상위 20개 + 전체 개수)
+ *       formatBlockContext() / formatTypeContext() — LLM 컨텍스트 포맷
+ *     - 조건부 로드 — 질문에 블록명/타입명 있을 때만 추가 로드 (평소 부담 0)
+ *       · 신호명만 → signal_graph만 (기존 동일)
+ *       · 블록명 + 선택 타입 → +block_signals (블록 안에서 타입 필터)
+ *       · 타입명만 → +type_index (전 공장)
+ *     - buildQueryPrompts (1.5) 카테고리 확장: 3개 인덱스 사용 가이드 + 라벨 분기
+ *     - 컨텍스트 폭발 방지: 블록 매칭 3개 / 블록당 신호 30개 / 타입 매칭 위치 20개
+ *     - 검증 케이스: "FB200 안의 IEC_TIMER는?" → 3개 (Door_Open_Error_TMR, Close_Error_TMR, Sensor_Error_TMR)
+ *
+ *   v21 (2026-06-04, WinCC 인덱스 통합 — HMI 알람 9048 + PLC 태그 2020+):
+ *     - 배경: WinCC TIA export(xlsx 4개) 확보 → 학습앱 채팅방에서 JSON 인덱스 2개 변환
+ *     - 산출:
+ *       · hmi_alarm_index.json (2.5MB) — by_id(9048) + by_trigger_tag(162) 역인덱스
+ *       · plc_tag_index.json (0.7MB) — by_name(2020 태그 + 942 상수) + by_address(2020)
+ *     - 신규 상수 2개: HMI_ALARM_INDEX_FILE_ID, PLC_TAG_INDEX_FILE_ID
+ *     - 신규 함수 8개:
+ *       loadAlarmIndex() / loadPlcTagIndex() — Drive 로드
+ *       extractAlarmIdCandidates() — 4~5자리 숫자(1000~99999 범위)
+ *       extractPlcAddressCandidates() — %I/Q/M/DB 주소 + Tag[idx] 인덱싱 패턴
+ *       searchAlarmIndex() — ID 매칭 + trigger_tag 역추적 + 텍스트 키워드 (최대 5/3/2 매칭)
+ *       searchPlcTagIndex() — 이름 매칭(정확+부분) + 주소 매칭 (최대 5/3 매칭)
+ *       formatAlarmContext() / formatPlcTagContext() — LLM 컨텍스트 포맷
+ *     - 조건부 로드:
+ *       · 알람 인덱스: 4-5자리 숫자 / 주소 패턴 / "알람|Alarm|warning|error|경고|에러" 키워드 있을 때
+ *       · PLC 태그 인덱스: 주소 패턴 / "태그|tag|주소|address" 키워드 있을 때
+ *     - buildQueryPrompts (1.5) 카테고리 확장: 5개 인덱스 사용 가이드 + WinCC 라벨 분기
+ *     - 검증 케이스:
+ *       · "알람 6092가 뭐야?" → ID 매칭 → text+class+trigger_tag 답변
+ *       · "500_Alarm_AlarmLWord[95] 어떤 알람?" → trigger_tag 역추적 → 64개 알람
+ *       · "keySwitchMaintenanceUnlock 태그?" → 이름 매칭 → 주소·코멘트 답변
+ *       · "%I0.1 주소는?" → 주소 역인덱스 → 태그 답변
+ *     - 부담: 5개 인덱스 총 ~15MB. 워스트 케이스 +7~10초. Q21 캐싱 최적화 우선순위 ↑
+ *
+ *   v22 (2026-06-04, User_Permissions·Audit_Log 시트 + Google OAuth 로그인 기반):
+ *     ※ 다른 채팅방(로그인 기능 트랙)에서 추가된 변경 내용. 파일 끝 「v22 추가 내용」 블록 참조.
+ *     - User_Permissions / Audit_Log 시트 ensure 함수
+ *     - verifyIdToken / checkUserPermission / logAudit / authorizeRequest
+ *     - ACTION_PERMISSIONS 매핑, setupPermissionsInitial 초기화
+ *     - 단 doPost 게이트 활성화는 Step 3에서 (이 v22는 정의만 추가)
+ *
+ *   v23 (2026-06-04, 회로 역추적 통합 + Q21-A 성능 측정 — 학습앱 채팅방):
+ *     1) signal_graph_v3 — condition_str 200→1000자 (긴 조건 끝부분 신호도 추출)
+ *        3개 인덱스 ID 모두 새 폴더로 통일: 1-UvWULg0NpQPL0v9wyboLW_5LsSe8LlZ
+ *     2) 회로 역추적 (학습앱_회로역추적_통합명세서):
+ *        - trace_signal.py 알고리즘 포팅 — 9개 함수 (파일 끝 v23 블록):
+ *          buildKnownSignalSet, extractByDict/Tokens/Signals, traceSignal,
+ *          treeToText, collectExternals, formatTraceContext, detectTraceTrigger
+ *        - 트리거 패턴 (depth 자동): 인터락/안전(5), 왜안돼(4), 끝까지/깊이(5),
+ *          회로분석(2), ON되려면(3), 어디서켜져(3), 추적(3)
+ *        - 처리 룰 (1.5)에 명시: 트리 요약·외부입력 정리·NOT 자연어·KB 결합
+ *        - 라벨: 'ⓘ 출처: 회로 역추적 (Signal Graph 자동 추적)'
+ *     3) Q21-A 성능 측정 (5개 인덱스 부담 측정 → Q21-B 캐싱 설계 데이터):
+ *        Logger.log 7개 측정 포인트 ([Perf] signal_graph/block/type/alarm/plc_tag/
+ *        callClaudeAPI/handleQuery TOTAL)
+ *        - 응답 본문 영향 없음 (Logger만), 1주일 데이터 수집 후 Q21-B 진행
+ *     - 검증 시나리오 (명세서 §7): "safetyRelease ON 되려면?" / "Door_Open_Error 회로 분석"
+ *       / "Total Door Alarm 추적" / "Etc.FDC.Excute 깊이 추적" 4개 통과
+ *     - 부담 추가: 트리거 시 known_signals 구축(~50ms 1회) + traceSignal 재귀(+0.5~2초)
+ *
+ *   v24 (2026-06-04, 회로 역추적 신호 매칭 보강 — 공백 포함 신호명):
+ *     - 배경: v23 명세서 §7 3번 검증 케이스 "Total Door Alarm 추적해줘"에서
+ *       extractSignalCandidates가 공백 포함 신호명을 못 잡음 → 단어 부분 매칭으로
+ *       "1300_...Total Operation Alarm" 같은 다른 alarm 키가 잘못 매칭됨.
+ *       (LLM이 자동 보완해 답변은 OK였으나, 매번 보장 안 됨)
+ *     - 진단: TIA Portal 신호명에 공백 흔함 (예: "500_Control.Main_Status.Total Door Alarm",
+ *       "Heat Press Loading", "Cell Pusher Up State Fault" 등)
+ *     - 수정: detectTraceTrigger 내부에 phrase 매칭 추가 (~15줄, 영향 범위 함수 내부 한정)
+ *       1. 정규식: /[A-Z][a-zA-Z0-9_]+(?:\s+[A-Z][a-zA-Z0-9_]+){1,5}/g
+ *          → 2단어 이상 PascalCase 시퀀스 (자연어 노이즈 차단, 8자 이상만)
+ *       2. graph 키 substring 매칭 (대소문자 무시)
+ *       3. 매칭 다수 시 가장 짧은 키 우선 (가장 정확한 매칭)
+ *       4. 적용 위치: 정확/정규화 매칭 실패 후, 기존 부분 매칭 실패 후 최후 fallback
+ *     - 회귀 안전: extractSignalCandidates 미수정 → signal_graph 검색·블록 추출 등 영향 0
+ *     - 검증: "Total Door Alarm 추적해줘" → "500_Control.Main_Status.Total Door Alarm" 정확 매칭
+ *     - 부담: phrase 추출 + graph 키 4626 순회 — 워스트 ~5ms (무시 가능)
+ *
+ *   v25 (2026-06-04, 옵션 A — handleTrace 별도 endpoint 추가 / 별도 앱 옵션 C 인터랙티브 트리 UI 지원):
+ *     - 배경: 별도 앱 채팅방 의뢰 — 옵션 C (인터랙티브 트리 UI, 노드 클릭 = 깊이 확장,
+ *       외부 입력 강조, 진짜 가치 있는 별도 탭) 진행 위해 raw 트리 JSON 직접 받을 endpoint 필요.
+ *       옵션 B (path:"query" 자동 감지 + LLM 자연어 답변)는 그대로 유지 — 둘 다 작동.
+ *     - 추가: handleTrace(data) 함수 + doPost에 path:"trace" 분기 (~120줄)
+ *     - 요청: { path:"trace", token, data:{ signal, depth, max_locations, lang } }
+ *       · signal       (필수) — 추적 대상 신호명
+ *       · depth        (선택, 기본 3, 최대 10) — 추적 깊이
+ *       · max_locations (선택, 기본 3, 최대 10) — 위치당 cap
+ *       · lang         (선택) — 응답 언어 (현재는 JSON이라 영향 없음)
+ *     - 응답: { status, tree, externals, metadata }
+ *       · tree         — traceSignal 출력 raw JSON (signal/reason/set_locations/condition_str 등)
+ *       · externals    — 외부 입력 leaf 신호명 배열 (정렬됨)
+ *       · metadata     — target/signal_requested/matched_by/depth_requested/known_signals_count
+ *     - 신호 매칭: 정확 → 정규화 → 부분 → phrase (v24와 동일 4단계). 단 detectTraceTrigger와 달리
+ *       depth는 별도 앱이 명시적으로 지정 (트리거 정규식 사용 안 함)
+ *     - signal 못 찾으면 not_found + suggestions[10] (부분 매칭 후보) 반환
+ *     - 인증: 기존 PLC_QUERY_TOKEN 동일
+ *     - 진단 로그: [Perf trace] signal_graph/block_signals/traceSignal/TOTAL
+ *     - 코드 공유: traceSignal / buildKnownSignalSet / collectExternals 옵션 B와 공유 — 중복 없음
+ *
+ *   v31 (2026-06-10, 에이전트 평가 — 최신성 기간 7일→30일):
+ *     ※ v26~v30은 본 헤더에 미반영 (다른 채팅방의 PLC 회로 역추적 4번 탭 작업 — 본문 코드 안에만 존재)
+ *     - 배경: 사용자 직관 + 데이터 시뮬레이션 결과 — 7일 cutoff가 너무 짧아
+ *       단발성 학습만으로 recentRate↑ → freshnessScore 부풀림 / 누적 페르소나는
+ *       일주일 무활동만으로 0점이 되어 부당하게 깎임
+ *     - 변경: RECENT_DAYS 7 → 30 (한 줄)
+ *     - 효과 (실제 KB 데이터 시뮬레이션):
+ *       · 누적 페르소나 부당한 0점 해소 (Elec_ME 80→100, Cell_PLC 60→78)
+ *       · 신규 페르소나 단발 부풀림 완화 (가상 35→28)
+ *       · 균형 페르소나 변화 작음 (가상 47→52)
+ *     - 프론트 v31 (freshnessScore × 0.5 가중치)와 함께 적용 (옵션 A+B)
+ *
+ * 📍 대상 프로젝트: Factory Agent KB (학습앱 백엔드)
+ *
+ * v25 배포 방법: 코드 교체 → Ctrl+S → 배포 → 배포 관리 → 편집 → 새 버전 → 배포
+ *   (v24와 동일. 인덱스 변경 없음, 권한 변경 없음, 옵션 B 동작 변경 없음)
+ *
+ * v24 배포 방법: 코드 교체 → Ctrl+S → 배포 → 배포 관리 → 편집 → 새 버전 → 배포
+ *   (v23과 동일. 새 인덱스 변경 없음, 권한 변경 없음)
+ *
+ * v23 배포 방법: 코드 교체 → Ctrl+S → 배포 → 배포 관리 → 편집 → 새 버전 → 배포
+ *   (스크립트 속성 변경 없음. Drive API 권한 기존 그대로.
+ *    새 인덱스 폴더 1-UvWULg0NpQPL0v9wyboLW_5LsSe8LlZ에 학습앱 서비스 계정 읽기 권한 있어야 함.
+ *    v22 권한 시트는 setupPermissionsInitial 별도 1회 실행 필요 — 별도 안내 참조)
+ *
+ * v21 배포 방법: 코드 교체 → Ctrl+S → 배포 → 배포 관리 → 편집 → 새 버전 → 배포
+ *   (스크립트 속성 변경 없음. Drive API 권한 기존 그대로)
+ *
+ * v13 배포 방법 (마이그레이션 불필요):
+ *   - 코드 교체 → Ctrl+S → 배포 → 배포 관리 → 편집 → 새 버전 → 배포
+ *   - 스크립트 속성(ANTHROPIC_API_KEY, PLC_QUERY_TOKEN)은 v12와 동일 (추가 등록 불필요)
+ *   - 단계 전환 시: 폐쇄형 Qwen 환경에서 PLC_KNOWLEDGE_MODE를 "strict"로 바꾸고 재배포
+ *
+ * v12 배포 방법 (마이그레이션 불필요):
+ *   1. Apps Script 에디터 (Factory Agent KB) 열기
+ *   2. 기존 v11 코드 전체 선택 → 삭제 → 이 파일 전체 붙여넣기
+ *   3. ⚙️ 프로젝트 설정 → 스크립트 속성에 ANTHROPIC_API_KEY, PLC_QUERY_TOKEN 등록 (배포 불필요)
+ *   4. Ctrl+S 저장
+ *   5. ★ 배포 → 배포 관리 → 편집 → 새 버전 → 배포 (외부 URL 반영 필수)
+ *
+ * v11 배포 방법 (마이그레이션 불필요):
+ *   1. Apps Script 에디터 (Factory Agent KB) 열기
+ *   2. 기존 v10 코드 전체 선택 → 삭제
+ *   3. 이 파일 내용 전체 복사 → 붙여넣기
+ *   4. ★ 서비스 패널에서 Drive API v2 활성화 확인 (위 ⚠️ 참조)
+ *   5. Ctrl+S 저장
+ *   6. ★ 배포 → 배포 관리 → 편집 → 새 버전 → 배포 (외부 URL 반영 필수)
+ */
 
-// App_Step7_v23.jsx
-// 트랙 1 단계 7 — 자동학습에서 CSV/TXT/MD 파일 지원
-//
-// 주요 변경 (v22 → v23):
-//   - CSV: SheetJS로 파싱 → XLSX와 동일한 청크 분할 흐름 재사용 (200행 단위)
-//     · source_file: xxx.csv / source_page: "(N/M, 행 X~Y)" 형식 (단일 시트라 시트명 prefix 없음)
-//     · PLC IO 리스트·태그 리스트 등 큰 CSV도 모든 행 누락 없이 학습
-//   - TXT/MD: 단순 텍스트 디코딩 → 4블록 Claude 분석 → 1 row (12000자 cap)
-//     · source_file: xxx.txt|md / source_page: 빈 칸 / source_section: Claude 응답에서 추출
-//   - 자동학습 흐름에 신규 분기 isCsvFile / isTextFile 추가
-//   - 자동학습 결과 UI에 신규 카운트:
-//     · csvChunkCount: CSV 청크 학습 수
-//     · textFileCount: TXT/MD 학습 수
-//
-// 호환성: 기존 PDF/PPT/XLSX/이미지 흐름 v22와 동일, CSV/TXT/MD 분기만 신규 추가
+// ════════════════════════════════════════════════════════════════════════════
+// 상수
+// ════════════════════════════════════════════════════════════════════════════
 
-// App_Step7_v22.jsx
-// 트랙 1 단계 6 — 자동학습에서 XLSX/XLS 파일 지원
-//
-// 주요 변경 (v21 → v22):
-//   - SheetJS(xlsx) 라이브러리 CDN 동적 로딩 (loadSheetJS 헬퍼)
-//   - XLSX 파싱 헬퍼:
-//     · extractXlsxSheets: 모든 시트를 행 배열로 추출 (빈 시트 자동 스킵)
-//     · sheetRowsToMarkdownTable: 행 배열 → Markdown 표 변환
-//     · chunkSheetRows: 큰 시트를 N행씩 청크 분할 (헤더 매 청크 포함)
-//   - 자동학습 흐름에 XLSX 분기 추가 (isImageFile/isPdfFile 다음 isXlsxFile)
-//   - 청크 단위 처리: 시트당 1+ 청크, 각 청크 Claude 호출 → 청크별 row 저장
-//     · source_file: xxx.xlsx
-//     · source_page: "시트: 검사기준 (1/3)" 형식 (청크 1개면 "(1/1)" 생략)
-//     · source_section: Claude 응답에서 [챕터/섹션] 추출
-//     · source_url: XLSX 원본 Drive URL (앵커 없음)
-//   - 청크 크기: 200행씩 (헤더 1행은 매 청크 반복 포함하여 컨텍스트 보존)
-//   - 자동학습 결과 UI에 XLSX 시트 카운트 추가 (xlsxSheetCount)
-//   - 원본 XLSX는 변환·삭제 없이 그대로 보관 (PDF 변환 미수행)
-//
-// 호환성: PDF/PPT/이미지 흐름 v21과 동일, XLSX 분기만 신규 추가
-//
-// 누락 없는 분석 목표:
-//   PLC 자료(IO 리스트/태그 리스트/검사 기준서)의 모든 행이 빠짐없이 학습됨.
-//   1000행 시트 → 5청크 (각 200행) → 5회 Claude 호출 → 5 row 저장
-//   기존 saveToSheet의 자동 청크 분할(긴 응답 자동 잘림)과 직교하여 동작.
+const SHEET_ID = "1Kc_aRh-MLJPJvgmkcqhU4Gw20n5MhEkfnsqoNf8QOLY";
 
-// App_Step7_v21.jsx
-// 트랙 1 단계 5 — 자동학습에서 PPT 파일 지원 (Apps Script v11 자동 변환 활용)
-//
-// 주요 변경 (v20 → v21):
-//   - 자동학습 fetch_drive_file 응답에 converted_from_pptx 플래그 감지
-//     → 백엔드가 이미 PDF로 자동 변환 + 원본 PPT 휴지통 이동 처리됨
-//     → 클라이언트는 PDF로 인식하고 기존 PDF Vision 흐름 그대로 활용
-//   - markFileProcessedMany 헬퍼 추가 — PPT의 fileId + 변환된 PDF의 fileId 둘 다 processed 표시
-//     → 다음 폴더 스캔에서 변환된 PDF가 또 학습 대상으로 잡히는 중복 학습 방지
-//   - PPT 출처 메타: source_page = "슬라이드 N" 형식, source_url = 변환된 PDF URL #page=N
-//   - 자동학습 결과 화면에 PPT 변환 카운트 표시 (pptConvertedCount)
-//   - 변환된 PDF는 자체 page=N 매핑 가능 (목차/Vision 챕터 결정 흐름 동일)
-//
-// 호환성: PDF는 v19 흐름과 동일, PPT만 추가 흐름 (v21에서 처음 지원)
+// 출처 메타 컬럼 (v9 신규, 트랙 1: PDF/PPT/XLSX 학습 시 시트 D~G열로 저장)
+const SOURCE_META_COLUMNS = ["source_file", "source_page", "source_section", "source_url"];
 
-// App_Step7_v20.jsx
-// 트랙 1 단계 8 — 채팅 응답에 출처 표시
-//
-// 주요 변경 (v19 → v20):
-//   - 채팅 컨텍스트 구성 시 row마다 [SRC:N] 번호 부여 + sourceMap 누적 (메타 + content)
-//   - 시스템 프롬프트: 사실 조회 답변일 때 끝줄에 [USED_SOURCES] N,N,N 형식으로 사용한 row 번호 첨부 지시
-//   - 답변 파싱: [USED_SOURCES] 라인 분리 → 본문에서 제거 + 사용된 row의 sourceMeta 추출
-//   - 청크 row 중복 제거 (file+page+url 키 기준 → 같은 파일 같은 페이지는 1개 카드)
-//   - content fallback: sourceMeta 비어있어도 content에 [파일: xxx] 태그 있으면 파일명 카드 표시 ((ㄷ))
-//   - 메시지 객체에 sources 배열 첨부 (Apps Script로 저장될 때는 보존, 화면에는 접힌 카드 UI)
-//   - 답변 메시지 하단 접힌 카드 UI: "📑 출처 N개 보기 ▼" 클릭 시 펼침 → 각 카드 클릭 시 Drive URL 새 탭
-//   - 적용 범위: detail 모드 + 사실 조회만 (isFactualQuery)
-//
-// 호환성: 기존 채팅 흐름 동일, 사실 조회 아닌 답변에는 출처 카드 없음 (노이즈 방지)
-
-// App_Step7_v19.jsx
-// 트랙 1 단계 3·4: PDF 학습에 출처 메타 보존 추가
-//
-// 주요 변경 (v18 → v19):
-//   - 신규 헬퍼: extractPdfOutline (목차 파싱) / parseChapterFromAnalysis (Vision 응답에서 챕터 추출) / buildSourceMeta
-//   - saveToSheet / saveToSheetSingle / saveCommonKnowledge: 4번째 인자 sourceMeta 받음 (하위 호환)
-//   - Vision 프롬프트에 [챕터/섹션] 블록 추가
-//   - TabDocument PDF Vision 모드: 페이지별 N개 row 저장 (종합 요약 row 없음), 페이지별 카드 UI
-//   - TabDocument PDF 텍스트 모드: 4블록 형식 적용 (챕터 정보 추출)
-//   - startSync (폴더 동기화) PDF Vision 모드: 페이지별 N개 row, 첫 페이지로 카테고리 결정
-//   - startRelearn (재학습) PDF Vision 모드: 페이지별 N개 row, 카테고리는 기존 유지
-//   - 챕터 결정 순서: 목차 매핑 → Vision 응답 → 직전 페이지 상속 → 빈 칸
-//   - source_url: 자동학습 PDF는 driveUrl#page=N, 직접 업로드 PDF는 페이지별 이미지 URL
-//
-// 호환성: 기존 학습 데이터는 영향 없음 (sourceMeta 안 보내면 Apps Script v9가 빈 칸으로 저장)
-
-import { useState, useRef, useEffect, useMemo } from "react";
-
-// ─── 설정 ─────────────────────────────────────────────────────────────────────
-// 백엔드 URL (Phase 1에서 FastAPI 주소로 한 줄만 교체)
-const API_BASE_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXpt3UjWjfgDljEiGodgbunj_UnXYc-1RlrXgNiDzAiikXoEP4g9_E/exec";
-
-// LLM 호출 base (Phase 3에서 FastAPI /llm 경로로 통합 예정)
-const LLM_BASE_URL = "/.netlify/functions";
-
-const ROLE_CONFIG = {
-  Cell_PE: { label: "생산 엔지니어", line: "Cell", color: "#3b82f6", bg: "rgba(59,130,246,0.12)", icon: "🔵",
-    focus: "Cell 라인 생산 목표 달성, 납기, 공정 안정화, OEE 관리" },
-  Cell_ME: { label: "설비 엔지니어", line: "Cell", color: "#f97316", bg: "rgba(249,115,22,0.12)", icon: "🟠",
-    focus: "Cell 설비 가동률, 예방보전, 고장 원인, MTBF/MTTR 관리" },
-  Cell_TE: { label: "기술 엔지니어", line: "Cell", color: "#22d3ee", bg: "rgba(34,211,238,0.12)", icon: "🟢",
-    focus: "Cell 공정 기술, 품질 원인 분석, 조건 최적화, 재발 방지" },
-  Elec_PE: { label: "생산 엔지니어", line: "Elec", color: "#a78bfa", bg: "rgba(167,139,250,0.12)", icon: "🟣",
-    focus: "Elec 라인 생산 목표 달성, 납기, 공정 안정화, OEE 관리" },
-  Elec_ME: { label: "설비 엔지니어", line: "Elec", color: "#f43f5e", bg: "rgba(244,63,94,0.12)", icon: "🔴",
-    focus: "Elec 설비 가동률, 예방보전, 고장 원인, MTBF/MTTR 관리" },
-  Elec_TE: { label: "기술 엔지니어", line: "Elec", color: "#34d399", bg: "rgba(52,211,153,0.12)", icon: "🟩",
-    focus: "Elec 공정 기술, 품질 원인 분석, 조건 최적화, 재발 방지" },
-  FA: { label: "FA 엔지니어", line: "공통", color: "#f59e0b", bg: "rgba(245,158,11,0.12)", icon: "🟡",
-    focus: "공정 간 자동 반송 시스템 (C/V, Stocker, OHT, AGV) 운영·정비, WIP 흐름 관리" },
-  Vision: { label: "비전 엔지니어", line: "공통", color: "#ec4899", bg: "rgba(236,72,153,0.12)", icon: "🩷",
-    focus: "외관 검사 시스템, 불량 이미지 분석, 비전 알고리즘, 검사 기준 관리" },
-  Cell_PLC: { label: "PLC 엔지니어", line: "Cell", color: "#84cc16", bg: "rgba(132,204,22,0.12)", icon: "🎛️",
-    focus: "Cell 라인 PLC 프로그램·시퀀스·통신, 알람 분석, I/O 디버깅" },
-  Elec_PLC: { label: "PLC 엔지니어", line: "Elec", color: "#65a30d", bg: "rgba(101,163,13,0.12)", icon: "🎛️",
-    focus: "Elec 라인 PLC 프로그램·시퀀스·통신, 알람 분석, I/O 디버깅" },
-  FA_PLC: { label: "PLC 엔지니어", line: "공통", color: "#4d7c0f", bg: "rgba(77,124,15,0.12)", icon: "🎛️",
-    focus: "물류 자동화(C/V, Stocker, OHT) PLC 프로그램·시퀀스·통신, 알람 분석" },
+const TAB_MAP = {
+  PE: "PE_Knowledge",
+  ME: "ME_Knowledge",
+  TE: "TE_Knowledge",
+  Cell_PE: "Cell_PE_Knowledge",
+  Cell_ME: "Cell_ME_Knowledge",
+  Cell_TE: "Cell_TE_Knowledge",
+  Elec_PE: "Elec_PE_Knowledge",
+  Elec_ME: "Elec_ME_Knowledge",
+  Elec_TE: "Elec_TE_Knowledge",
+  FA: "FA_Knowledge",
+  Vision: "Vision_Knowledge",
+  Cell_PLC: "Cell_PLC_Knowledge",
+  Elec_PLC: "Elec_PLC_Knowledge",
+  FA_PLC: "FA_PLC_Knowledge",
 };
 
-// 대시보드용 8개 에이전트 메타
-const DASHBOARD_AGENT_META = {
-  Cell_PE: { line: "Cell", role: "생산", color: "#3b82f6" },
-  Cell_ME: { line: "Cell", role: "설비", color: "#f97316" },
-  Cell_TE: { line: "Cell", role: "기술", color: "#22d3ee" },
-  Elec_PE: { line: "Elec", role: "생산", color: "#a78bfa" },
-  Elec_ME: { line: "Elec", role: "설비", color: "#f43f5e" },
-  Elec_TE: { line: "Elec", role: "기술", color: "#34d399" },
-  FA: { line: "공통", role: "FA", color: "#f59e0b" },
-  Vision: { line: "공통", role: "비전", color: "#ec4899" },
-  Cell_PLC: { line: "Cell", role: "PLC", color: "#84cc16" },
-  Elec_PLC: { line: "Elec", role: "PLC", color: "#65a30d" },
-  FA_PLC: { line: "공통", role: "PLC", color: "#4d7c0f" },
+const DASHBOARD_ROLES = [
+  "Cell_PE", "Cell_ME", "Cell_TE",
+  "Elec_PE", "Elec_ME", "Elec_TE",
+  "FA", "Vision",
+  "Cell_PLC", "Elec_PLC", "FA_PLC",
+];
+
+const RECENT_DAYS = 30; // v31: 7→30. 단발성 학습으로 freshness 부풀림 방지 (사용자 합의 옵션 A+B)
+const SUMMARY_CATEGORY = "_요약";
+const ROOT_FOLDER_ID = "1aTrM2DEQ8SXy_UEYExpFCzL2afrGRzUW";
+const COMMON_FOLDER_NAME = "_공통";
+const COMMON_KNOWLEDGE_SHEET = "Common_Knowledge";
+const PROCESSED_FILES_SHEET = "Processed_Files";
+
+// ════════════════════════════════════════════════════════════════════════════
+// v12 신규 — PLC Agent query API 상수
+// ════════════════════════════════════════════════════════════════════════════
+
+// Anthropic Messages API
+const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION = "2023-06-01";
+// analysis 모드는 정밀 분석 → Sonnet급. 논의앱과 모델을 맞추고 싶으면 이 값만 교체.
+const PLC_QUERY_MODEL = "claude-sonnet-4-6";
+const PLC_QUERY_MAX_TOKENS = 4096;  // v14: 2048→4096 (긴 분석 응답 잘림 방지)
+
+// v13: 지식 사용 정책 — 단계(환경)에 따라 전환
+//   "hybrid" = 현재 클라우드 Claude. KB + 일반 지식 함께 사용 OK, 근거 없는 추정만 억제.
+//   "strict" = 미래 폐쇄형 Qwen. 학습된 출처에 있는 내용만, 출처 없으면 언급 금지.
+//   폐쇄형 전환 시 이 값을 "strict"로 바꾸고 재배포.
+const PLC_KNOWLEDGE_MODE = "hybrid";
+
+// 별도 앱이 보내는 agent(소문자) → TAB_MAP의 role(대문자) 매핑
+const PLC_AGENT_MAP = {
+  cell_plc: "Cell_PLC",
+  elec_plc: "Elec_PLC",
+  fa_plc: "FA_PLC",
 };
 
-const LINE_COLORS = {
-  Cell: "#0ea5e9",
-  Elec: "#f43f5e",
-  공통: "#10b981",
-};
+// 학습된 SCL 코드 기준일 (화면 하단 "코드 YYYY-MM-DD 기준" 표시용, §4-3 metadata.code_version)
+// 실제 코드 학습이 갱신되면 이 값을 수동 갱신.
+const PLC_CODE_VERSION = "2026-06-07-v29";
 
-// 학습 수준 평가 - 절대평가 목표값 (보수적 기준, 2달 학습 가정)
-// 각 지표별로 이 목표값에 도달하면 100점
-const TARGET_VALUES = {
-  itemCount: 300,        // 학습 항목 수 (row)
-  contentLength: 80000,  // 학습 내용 총 글자수
-  categoryCount: 5,      // 카테고리 다양성 (전체 5종 모두 사용)
-  correctionCount: 60,   // 교정 사례 수
-  recentRate: 70,        // 최신성 (최근 30일 내 업데이트 비율 70%) — v31: 백엔드 v26 RECENT_DAYS=30 동기화
-};
+// v17: Signal Graph (XML → 그래프 변환된 JSON) 조회용
+// v23: signal_graph_v3 — condition_str 길이 200→1000자 + 회로 역추적 통합
+//   3개 인덱스 모두 새 폴더(1-UvWULg0NpQPL0v9wyboLW_5LsSe8LlZ)로 통일 — 관리 일관성
+const SIGNAL_GRAPH_FILE_ID = "1zUsgN4qpz-xKzuUOMBASl3JiZf3Y0Ul5"; // 5.4MB, condition_str 1000자 (v3)
 
-// URL 파라미터에서 role 읽기
-function getRole() {
-  // search 방식과 hash 방식 모두 지원
-  const search = window.location.search || window.location.hash.replace(/^#/, "");
-  const params = new URLSearchParams(search);
-  const r = params.get("role")?.toUpperCase();
-  // Cell_PE 형식 처리 (대소문자 혼용)
-  const roleKey = Object.keys(ROLE_CONFIG).find(k => k.toUpperCase() === r);
-  return roleKey || null;
+// v20: signal_graph_v2 — 블록 단위 + 타입 단위 인덱스 (C-4 검증 해결)
+//   PLC 프로그램 분석도구 V1 채팅방에서 파서 보강 후 추가 산출. v23에서 새 폴더로 통일.
+const BLOCK_SIGNALS_FILE_ID = "1wN14VIP8ZpIA8NtVwTQTbapdy3yTeDoN"; // 5.1MB, 671 블록 (v2와 동일 데이터)
+const TYPE_INDEX_FILE_ID    = "1oY09hpWlLkxS1S9KDOMu_ONBJxwXLkZx"; // 5.0MB, 1242 타입 (v2와 동일 데이터)
+
+// v21: WinCC 인덱스 (HMI Alarm 9048개 + PLC Tag 2020+ 942상수)
+const HMI_ALARM_INDEX_FILE_ID = "1nWfjMKOqrrj7TGJQvBxV_6tE-0tJAXYi"; // 2.5MB, by_id + by_trigger_tag
+const PLC_TAG_INDEX_FILE_ID   = "12uFxXqp1xe7HE2kYJu-YTADIWdqaE3oM"; // 0.7MB, by_name + by_address
+
+// ════════════════════════════════════════════════════════════════════════════
+// 통합 진입점 (doPost / doGet) — 한 번만 정의
+// ════════════════════════════════════════════════════════════════════════════
+
+function doPost(e) {
+  try {
+    if (!e || !e.postData || !e.postData.contents) {
+      return makeResponse({ success: false, error: "no payload" });
+    }
+
+    const data = JSON.parse(e.postData.contents);
+
+    // v12: PLC Agent query API 분기 — path가 있으면 path 라우팅 (별도 앱 연결용)
+    //   기존 학습앱(action)·Teams Proxy(secret) 분기보다 먼저 체크.
+    //   별도 앱은 { path:"query", token, data } 형식으로 보냄 (§3).
+    //   v25: path:"trace" 추가 — 옵션 A (별도 endpoint, 인터랙티브 트리 UI 용)
+    if (data.path !== undefined) {
+      if (data.path === "query") return handleQuery(data);
+      if (data.path === "trace") return handleTrace(data); // v25
+      if (data.path === "plc_index") return handlePlcIndex(data); // v26
+      if (data.path === "plc_block") return handlePlcBlock(data); // v26
+      if (data.path === "plc_ocr") return handlePlcOcr(data); // v27
+      if (data.path === "plc_ladder") return handlePlcLadder(data); // v28
+      if (data.path === "plc_search") return handlePlcSearch(data); // v29 — 4번 탭 자연어→후보 매칭
+      if (data.path === "plc_signal_trace") return handlePlcSignalTrace(data);
+      if (data.path === "plc_alarm") return handlePlcAlarmSearch(data);
+      return makeResponse({ status: "error", message: "unknown path: " + data.path });
+    }
+
+    // Teams Proxy 분기: payload.secret이 있으면 Teams 발송으로 분류
+    if (data.secret !== undefined) {
+      return handleTeamsProxy(data);
+    }
+
+    // 학습앱 분기
+    const action = data.action;
+    if (action === "start_session") return handleStartSession(data);
+    if (action === "logout") return handleLogout(data);
+    const _g = authorizeBySession(data.session_token, action, data.role);
+    if (!_g.ok) return makeResponse({ success: false, error: _g.reason });
+    if (action === "save_minutes") saveMinutes(data);
+    else if (action === "save_knowledge") saveKnowledge(data);
+    else if (action === "save_summary") saveSummary(data);
+    else if (action === "replace_knowledge") replaceKnowledge(data);
+    else if (action === "delete_knowledge") deleteKnowledge(data);
+    else if (action === "save_defect_pattern") saveDefectPattern(data);
+    else if (action === "upload_image") return uploadImageToFolder(data);
+    else if (action === "mark_file_processed") markFileProcessed(data);
+    else if (action === "save_common_knowledge") saveCommonKnowledge(data);
+    return makeResponse({ success: true });
+  } catch(err) {
+    return makeResponse({ success: false, error: err.message });
+  }
 }
 
-// ─── API ──────────────────────────────────────────────────────────────────────
-// API 호출 추상화 레이어 (Phase 1/3 이전 대비)
-// - 백엔드 교체 시 API_BASE_URL / LLM_BASE_URL 한 줄만 바꾸면 모든 도우미가 따라옴
-// - 응답 shape은 { ok, data, error } 형태로 normalize
-// - 도우미 함수 시그니처는 그대로 유지 (호출처 0건 변경)
-const api = {
-  // GET 액션 — Apps Script doGet 라우터로 전송
-  // params: { key: value, ... } 형태 — URLSearchParams으로 자동 직렬화·인코딩
-  // 반환: { ok: true, data: ... } 또는 { ok: false, error: "..." }
-  // 참고: data.data 가 없으면 전체 JSON을 data로 노출 (scan_learning_folder_all 처럼 응답 shape이 다른 액션 대응)
-  async get(action, params = {}) {
-    try {
-      const qs = new URLSearchParams({ action, ...params }).toString();
-      const res = await fetch(`${API_BASE_URL}?${qs}`);
-      if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
-      const data = await res.json();
-      if (data.success) return { ok: true, data: data.data !== undefined ? data.data : data };
-      return { ok: false, error: data.error || "응답 success=false" };
-    } catch (e) {
-      return { ok: false, error: `네트워크 오류: ${e.message}` };
-    }
-  },
+function doGet(e) {
+  try {
+    const action = e && e.parameter && e.parameter.action;
 
-  // POST 액션 — Apps Script doPost 라우터로 전송
-  // 기본: no-cors fire-and-forget (응답 본문 못 받음, boolean 반환)
-  // opts.needResponse=true: cors 모드, 응답 받음 ({ ok, data, error } 반환)
-  async call(action, payload = {}, opts = {}) {
-    const body = JSON.stringify({ action, ...payload });
-    if (opts.needResponse) {
-      try {
-        const res = await fetch(API_BASE_URL, {
-          method: "POST",
-          mode: "cors",
-          headers: { "Content-Type": "text/plain" },
-          body,
-        });
-        if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
-        const data = await res.json();
-        if (data.success) return { ok: true, data: data.data !== undefined ? data.data : data };
-        return { ok: false, error: data.error || "응답 success=false" };
-      } catch (e) {
-        return { ok: false, error: `네트워크 오류: ${e.message}` };
+    // 액션이 없으면 alive 체크 응답 (Teams Proxy 배포 검증 호환)
+    if (!action) {
+      return makeResponse({
+        ok: true,
+        msg: "AZS app alive",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const role = e.parameter.role;
+    const _g = authorizeBySession(e.parameter.session_token, action, role);
+    if (!_g.ok) return makeResponse({ success: false, error: _g.reason });
+    if (action === "get_knowledge") return getKnowledge(role);
+    if (action === "get_minutes") return getMinutes();
+    if (action === "get_all_progress") return getAllProgress();
+    if (action === "get_summary") return getSummary(role);
+    if (action === "count_since_summary") return countSinceLastSummary(role);
+    if (action === "get_category_items") return getCategoryItems(role, e.parameter.category);
+    if (action === "count_defect_images") return countDefectImages(role);
+    if (action === "get_defect_image_data") return getDefectImageData(role);
+    if (action === "scan_learning_folder") return scanLearningFolder(role);
+    if (action === "scan_learning_folder_all") return scanLearningFolderAll(role);
+    if (action === "get_drive_file") return getDriveFileContent(e.parameter.fileId);
+    if (action === "get_common_knowledge") return getCommonKnowledge();
+
+    return makeResponse({ success: false, error: "unknown action: " + action });
+  } catch(err) {
+    return makeResponse({ success: false, error: err.message });
+  }
+}
+
+function makeResponse(data) {
+  return ContentService
+    .createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// jsonResponse는 makeResponse의 별칭 (Teams Proxy 코드 호환)
+function jsonResponse(obj, statusCode) {
+  return makeResponse(obj);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// v9 신규 — 트랙 1 단계 1: 출처 메타 컬럼 마이그레이션 (1회 실행용)
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 트랙 1 마이그레이션: 11개 _Knowledge 시트 + Common_Knowledge에
+ * 출처 메타 컬럼 4개(D~G)를 추가합니다.
+ *
+ * - 재실행 안전: 이미 모든 컬럼이 있으면 skip, 일부만 있으면 누락분만 추가
+ * - 기존 row 데이터는 건드리지 않음 (헤더만 추가, D~G는 빈 칸으로 남음)
+ * - PE/ME/TE 레거시 시트는 대상에서 제외 (DASHBOARD_ROLES만 사용)
+ *
+ * 실행 방법:
+ *   1. 상단 함수 선택 박스에서 addSourceColumnsToAllSheets 선택
+ *   2. ▶ 실행 클릭
+ *   3. 권한 승인 (첫 실행 시)
+ *   4. 실행 로그(보기 → 로그) 확인 — 12개 시트 모두 ✅ 또는 ⏭ 면 성공
+ *
+ * 외부 URL 호출 아니므로 배포 불필요. saveKnowledge 등 외부 호출 함수는
+ * 별도로 배포(배포 → 배포 관리 → 편집 → 새 버전 → 배포)가 필요함.
+ */
+function addSourceColumnsToAllSheets() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+
+  // 대상: DASHBOARD_ROLES 11개의 _Knowledge 시트 + Common_Knowledge = 총 12개
+  const targetSheetNames = DASHBOARD_ROLES
+    .map(role => TAB_MAP[role])
+    .filter(name => name)
+    .concat([COMMON_KNOWLEDGE_SHEET]);
+
+  let okCount = 0;
+  let skipCount = 0;
+  let missCount = 0;
+
+  targetSheetNames.forEach(name => {
+    const sheet = ss.getSheetByName(name);
+    if (!sheet) {
+      Logger.log("❌ 시트 없음: " + name);
+      missCount++;
+      return;
+    }
+
+    const lastCol = sheet.getLastColumn();
+    const headers = lastCol >= 1
+      ? sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(v => String(v || ""))
+      : [];
+
+    const allPresent = SOURCE_META_COLUMNS.every(col => headers.indexOf(col) !== -1);
+    if (allPresent) {
+      Logger.log("⏭ 이미 적용됨: " + name);
+      skipCount++;
+      return;
+    }
+
+    const toAdd = SOURCE_META_COLUMNS.filter(col => headers.indexOf(col) === -1);
+    const startCol = headers.length + 1;
+    sheet.getRange(1, startCol, 1, toAdd.length).setValues([toAdd]);
+
+    Logger.log("✅ " + name + ": " + toAdd.length + "개 컬럼 추가 (" + toAdd.join(", ") + ")");
+    okCount++;
+  });
+
+  Logger.log("\n=== 완료 ===");
+  Logger.log("처리: " + okCount + "개 | 이미 적용: " + skipCount + "개 | 시트 없음: " + missCount + "개");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 학습앱 — 회의록·학습 데이터 저장/조회
+// ════════════════════════════════════════════════════════════════════════════
+
+function saveMinutes(data) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sheet = ss.getSheetByName("Meeting_Minutes");
+  const now = new Date().toLocaleString("ko-KR");
+  sheet.appendRow([
+    data.date || "",
+    data.agenda || "",
+    data.issue_summary || "",
+    data.pe_opinion || "",
+    data.me_opinion || "",
+    data.te_opinion || "",
+    data.discussion || "",
+    data.action_items || "",
+    data.minutes_full || "",
+    now,
+  ]);
+}
+
+/**
+ * 학습 데이터 저장 (v9: 출처 메타 인자 추가, 하위 호환)
+ *
+ * 호출 패턴 1 (기존 — 그대로 동작):
+ *   payload = { action: "save_knowledge", role, category, content }
+ *   → D~G열은 빈 칸으로 저장
+ *
+ * 호출 패턴 2 (v9 신규 — PDF/PPT/XLSX 학습 시):
+ *   payload = {
+ *     action: "save_knowledge", role, category, content,
+ *     sourceMeta: {
+ *       file: "Cell 정비 매뉴얼 v3.2.pdf",
+ *       page: "47",                              // PDF: "47", PPT: "슬라이드 7", XLSX: "시트: Cell"
+ *       section: "2. 안전 인터록 > 2.1 도어 인터록",
+ *       url: "https://drive.google.com/file/d/abc123/view#page=47"
+ *     }
+ *   }
+ *   → D~G열에 메타 4개 저장
+ */
+function saveKnowledge(data) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[data.role];
+  if (!tabName) return;
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet) return;
+  const now = new Date().toLocaleString("ko-KR");
+
+  // 출처 메타 (sourceMeta가 없으면 4개 모두 빈 칸 — 하위 호환)
+  const meta = data.sourceMeta || {};
+  sheet.appendRow([
+    data.category || "",
+    data.content || "",
+    now,
+    meta.file || "",
+    meta.page || "",
+    meta.section || "",
+    meta.url || "",
+  ]);
+}
+
+function getKnowledge(role) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[role];
+  if (!tabName) return makeResponse({ success: false, error: "역할 없음: " + role });
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet) return makeResponse({ success: false, error: "시트 없음: " + tabName });
+  const rows = sheet.getDataRange().getValues();
+  // v10: D~G열 출처 메타 추가 반환 (구버전 row는 빈 칸 그대로 반환되므로 안전)
+  const data = rows.slice(1).map(row => ({
+    category: row[0], content: row[1], updated_at: row[2],
+    source_file: row[3] || "", source_page: row[4] || "",
+    source_section: row[5] || "", source_url: row[6] || "",
+  }));
+  return makeResponse({ success: true, data });
+}
+
+function getMinutes() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sheet = ss.getSheetByName("Meeting_Minutes");
+  const rows = sheet.getDataRange().getValues();
+  const data = rows.slice(1).map(row => ({
+    date: row[0], agenda: row[1], issue_summary: row[2],
+    minutes_full: row[8], created_at: row[9],
+  }));
+  return makeResponse({ success: true, data });
+}
+
+function parseKoreanDate(str) {
+  if (!str) return null;
+  if (str instanceof Date) return str;
+
+  const s = String(str).trim();
+  const match = s.match(/(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?\s*(오전|오후)?\s*(\d{1,2}):(\d{1,2}):?(\d{0,2})/);
+  if (!match) {
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  const year = parseInt(match[1]);
+  const month = parseInt(match[2]) - 1;
+  const day = parseInt(match[3]);
+  const ampm = match[4];
+  let hour = parseInt(match[5]);
+  const minute = parseInt(match[6]);
+  const second = parseInt(match[7] || "0");
+
+  if (ampm === "오후" && hour < 12) hour += 12;
+  if (ampm === "오전" && hour === 12) hour = 0;
+
+  return new Date(year, month, day, hour, minute, second);
+}
+
+function getAllProgress() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const now = new Date();
+  const recentCutoff = new Date(now.getTime() - RECENT_DAYS * 24 * 60 * 60 * 1000);
+  const result = [];
+
+  DASHBOARD_ROLES.forEach(role => {
+    const tabName = TAB_MAP[role];
+    const sheet = tabName ? ss.getSheetByName(tabName) : null;
+
+    if (!sheet || sheet.getLastRow() < 2) {
+      result.push({
+        role: role, itemCount: 0, contentLength: 0, categoryCount: 0,
+        correctionCount: 0, recentRate: 0, lastUpdate: null,
+      });
+      return;
+    }
+
+    const lastRow = sheet.getLastRow();
+    const values = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+
+    let contentLength = 0;
+    let correctionCount = 0;
+    let recentCount = 0;
+    let latestDate = null;
+    const categories = new Set();
+
+    values.forEach(row => {
+      const category = String(row[0] || "").trim();
+      const content = String(row[1] || "");
+      const updatedAt = row[2];
+
+      contentLength += content.length;
+      if (category) categories.add(category);
+      if (category === "교정사례") correctionCount++;
+
+      const dateObj = parseKoreanDate(updatedAt);
+      if (dateObj) {
+        if (dateObj >= recentCutoff) recentCount++;
+        if (!latestDate || dateObj > latestDate) latestDate = dateObj;
+      }
+    });
+
+    const itemCount = values.length;
+    const recentRate = itemCount > 0 ? Math.round((recentCount / itemCount) * 100) : 0;
+    const lastUpdate = latestDate
+      ? Utilities.formatDate(latestDate, "Asia/Seoul", "yyyy-MM-dd") : null;
+
+    result.push({
+      role: role, itemCount: itemCount, contentLength: contentLength,
+      categoryCount: categories.size, correctionCount: correctionCount,
+      recentRate: recentRate, lastUpdate: lastUpdate,
+    });
+  });
+
+  return makeResponse({ success: true, data: result });
+}
+
+function getSummary(role) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[role];
+  if (!tabName) return makeResponse({ success: false, error: "역할 없음: " + role });
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet || sheet.getLastRow() < 2) {
+    return makeResponse({ success: true, data: null });
+  }
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+
+  let latest = null;
+  let latestDate = null;
+  rows.forEach(row => {
+    if (String(row[0] || "").trim() === SUMMARY_CATEGORY) {
+      const d = parseKoreanDate(row[2]);
+      if (d && (!latestDate || d > latestDate)) {
+        latestDate = d;
+        latest = { content: String(row[1] || ""), updated_at: String(row[2] || "") };
       }
     }
-    // 기본: no-cors fire-and-forget
-    try {
-      await fetch(API_BASE_URL, {
-        method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain" },
-        body,
-      });
-      return true;
-    } catch { return false; }
-  },
-
-  // LLM 호출 (Phase 3에서 Qwen으로 전환 시 LLM_BASE_URL 한 줄 + 내부 경로만 변경)
-  llm: {
-    // v29: 텍스트 채팅 — 반환: { text, stopReason } (잘림 감지용)
-    //   기존 string 반환은 callClaude wrapper에서 호환 유지
-    async chat(system, userMsg, opts = {}) {
-      const max_tokens = opts.max_tokens ?? 4096; // v29: 1000 → 4096 (잘림 방지)
-      const res = await fetch(`${LLM_BASE_URL}/claude`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ system, userMsg, max_tokens }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      const text = (data.content || []).map(i => i.text || "").join("").trim();
-      // stop_reason: "end_turn"(정상) | "max_tokens"(잘림) | "stop_sequence" 등
-      const stopReason = data.stop_reason || "";
-      return { text, stopReason };
-    },
-
-    // 이미지 분석 — 반환: string (실패 시 throw). Vision은 응답이 짧아 잘림 위험 낮음, 기존 유지.
-    async vision(system, userMsg, imageBase64, mediaType) {
-      const res = await fetch(`${LLM_BASE_URL}/claude-vision`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ system, userMsg, imageBase64, mediaType }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      return (data.content || []).map(i => i.text || "").join("").trim();
-    },
-  },
-};
-
-// v29: callClaude — 자동 이어쓰기 (max_tokens 한도로 응답이 잘리면 자동 재호출해 이어붙임)
-//   - 최대 3라운드 (안전 한도, 무한 루프 방지)
-//   - 기본: string 반환 (기존 호출처 호환)
-//   - opts.returnFull=true: { text, truncated } 반환 (handleFile에서 검수 UI ⚠️ 표시용)
-async function callClaude(system, userMsg, opts = {}) {
-  const maxRounds = opts.maxRounds ?? 3;
-  const chatOpts = { max_tokens: opts.max_tokens ?? 4096 };
-  let combined = "";
-  let lastStopReason = "";
-  let currentUserMsg = userMsg;
-
-  for (let round = 0; round < maxRounds; round++) {
-    if (round > 0) {
-      // 이어쓰기 — 직전 응답 끝 200자를 컨텍스트로 주고 자연스럽게 이어 작성 요청
-      const tail = combined.slice(-200);
-      currentUserMsg = `(이전 응답이 토큰 한도에서 잘렸습니다. 아래 마지막 부분 뒤에 자연스럽게 이어서 작성하세요. 같은 내용 중복 금지, 인사·메타설명 없이 본문만.)\n\n[직전 응답 끝부분]\n${tail}`;
-    }
-    const { text, stopReason } = await api.llm.chat(system, currentUserMsg, chatOpts);
-    combined += (round === 0 ? text : "\n" + text);
-    lastStopReason = stopReason;
-    if (stopReason !== "max_tokens") break; // 정상 종료
-    console.log(`[v29 callClaude] 라운드 ${round + 1}/${maxRounds}: max_tokens에서 잘림 → 자동 이어쓰기`);
-  }
-
-  const truncated = lastStopReason === "max_tokens"; // maxRounds 후에도 max_tokens면 진짜 잘림
-  if (opts.returnFull) return { text: combined.trim(), truncated };
-  return combined.trim();
+  });
+  return makeResponse({ success: true, data: latest });
 }
 
-// Vision API 호출
-async function callClaudeVision(system, userMsg, imageBase64, mediaType) {
-  return await api.llm.vision(system, userMsg, imageBase64, mediaType);
-}
+function saveSummary(data) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[data.role];
+  if (!tabName) return;
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet) return;
 
-// v27: Vision 호출 자동 재시도 (일시 실패 복구)
-//   - 즉시 시도 → 실패 시 2초 대기 후 재시도 → 또 실패 시 4초 대기 후 재시도 (총 3번)
-//   - 3번 다 실패하면 마지막 에러를 throw (호출 측에서 isError 처리)
-async function callClaudeVisionWithRetry(system, userMsg, imageBase64, mediaType) {
-  const delays = [0, 2000, 4000]; // ms — 즉시 / 2초 / 4초
-  let lastErr;
-  for (let attempt = 0; attempt < delays.length; attempt++) {
-    if (delays[attempt] > 0) {
-      await new Promise(r => setTimeout(r, delays[attempt]));
-    }
-    try {
-      return await callClaudeVision(system, userMsg, imageBase64, mediaType);
-    } catch (e) {
-      lastErr = e;
-      console.warn(`[v27 Vision retry] 시도 ${attempt + 1}/${delays.length} 실패: ${e && e.message ? e.message : e}`);
+  const lastRow = sheet.getLastRow();
+  if (lastRow >= 2) {
+    const rows = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (String(rows[i][0] || "").trim() === SUMMARY_CATEGORY) {
+        sheet.deleteRow(i + 2);
+      }
     }
   }
-  throw lastErr;
+
+  const now = new Date().toLocaleString("ko-KR");
+  sheet.appendRow([SUMMARY_CATEGORY, data.summary || "", now]);
 }
 
-// v27: 학습앱 파일 크기 한계 (Apps Script blob ~50MB 제한). 안전선 45MB.
-const MAX_LEARN_FILE_SIZE = 45 * 1024 * 1024; // 45MB
+function countSinceLastSummary(role) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[role];
+  if (!tabName) return makeResponse({ success: false, error: "역할 없음: " + role });
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet || sheet.getLastRow() < 2) {
+    return makeResponse({ success: true, data: { count: 0, hasSummary: false } });
+  }
 
-// 파일을 Base64로 변환 (이미지인 경우 자동 압축)
-// 긴 변이 1600px 넘으면 비율 유지하며 축소, JPEG 90% 품질로 재인코딩
-function fileToBase64(file) {
-  // 이미지가 아니면 원본 그대로 base64 변환
-  if (!file.type.startsWith("image/")) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result.split(",")[1]);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+
+  let latestSummaryDate = null;
+  rows.forEach(row => {
+    if (String(row[0] || "").trim() === SUMMARY_CATEGORY) {
+      const d = parseKoreanDate(row[2]);
+      if (d && (!latestSummaryDate || d > latestSummaryDate)) {
+        latestSummaryDate = d;
+      }
+    }
+  });
+
+  let count = 0;
+  rows.forEach(row => {
+    const cat = String(row[0] || "").trim();
+    if (cat === SUMMARY_CATEGORY) return;
+    const d = parseKoreanDate(row[2]);
+    if (!d) return;
+    if (!latestSummaryDate || d > latestSummaryDate) count++;
+  });
+
+  return makeResponse({
+    success: true,
+    data: { count: count, hasSummary: latestSummaryDate !== null }
+  });
+}
+
+function getCategoryItems(role, category) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[role];
+  if (!tabName) return makeResponse({ success: false, error: "역할 없음: " + role });
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet || sheet.getLastRow() < 2) {
+    return makeResponse({ success: true, data: [] });
+  }
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+  const data = rows
+    .filter(row => String(row[0] || "").trim() === category)
+    .map(row => ({
+      category: row[0], content: String(row[1] || ""), updated_at: String(row[2] || ""),
+    }));
+  return makeResponse({ success: true, data });
+}
+
+function replaceKnowledge(data) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[data.role];
+  if (!tabName) return;
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet || sheet.getLastRow() < 2) return;
+
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+  const oldContent = String(data.oldContent || "").trim();
+  const category = String(data.category || "").trim();
+
+  for (let i = 0; i < rows.length; i++) {
+    const rowCategory = String(rows[i][0] || "").trim();
+    const rowContent = String(rows[i][1] || "").trim();
+    if (rowCategory === category && rowContent === oldContent) {
+      const now = new Date().toLocaleString("ko-KR");
+      sheet.getRange(i + 2, 1, 1, 3).setValues([[
+        category, data.newContent || "", now,
+      ]]);
+      return;
+    }
+  }
+}
+
+function deleteKnowledge(data) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[data.role];
+  if (!tabName) return;
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet || sheet.getLastRow() < 2) return;
+
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+  const targetContent = String(data.content || "").trim();
+  const category = String(data.category || "").trim();
+
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const rowCategory = String(rows[i][0] || "").trim();
+    const rowContent = String(rows[i][1] || "").trim();
+    if (rowCategory === category && rowContent === targetContent) {
+      sheet.deleteRow(i + 2);
+      return;
+    }
+  }
+}
+
+function countDefectImages(role) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[role];
+  if (!tabName) return makeResponse({ success: false, error: "역할 없음: " + role });
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet || sheet.getLastRow() < 2) {
+    return makeResponse({ success: true, data: { count: 0, hasPattern: false } });
+  }
+
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+  let defectCount = 0;
+  let hasPattern = false;
+
+  rows.forEach(row => {
+    const cat = String(row[0] || "").trim();
+    const content = String(row[1] || "");
+    if (content.includes("[이미지 유형] 불량")) defectCount++;
+    if (cat === "_불량패턴") hasPattern = true;
+  });
+
+  return makeResponse({ success: true, data: { count: defectCount, hasPattern } });
+}
+
+function getDefectImageData(role) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[role];
+  if (!tabName) return makeResponse({ success: false, error: "역할 없음: " + role });
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet || sheet.getLastRow() < 2) {
+    return makeResponse({ success: true, data: [] });
+  }
+
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+  const data = rows
+    .filter(row => String(row[1] || "").includes("[이미지 유형] 불량"))
+    .map(row => ({
+      category: row[0], content: String(row[1] || ""), updated_at: String(row[2] || ""),
+    }));
+
+  return makeResponse({ success: true, data });
+}
+
+function saveDefectPattern(data) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[data.role];
+  if (!tabName) return;
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet) return;
+
+  const PATTERN_CATEGORY = "_불량패턴";
+  const lastRow = sheet.getLastRow();
+  if (lastRow >= 2) {
+    const rows = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (String(rows[i][0] || "").trim() === PATTERN_CATEGORY) {
+        sheet.deleteRow(i + 2);
+      }
+    }
+  }
+
+  const now = new Date().toLocaleString("ko-KR");
+  sheet.appendRow([PATTERN_CATEGORY, data.pattern || "", now]);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 드라이브 연동
+// ════════════════════════════════════════════════════════════════════════════
+
+function getOrCreateFolder(rootId, pathArray) {
+  let current = DriveApp.getFolderById(rootId);
+  for (const name of pathArray) {
+    const folders = current.getFoldersByName(name);
+    if (folders.hasNext()) {
+      current = folders.next();
+    } else {
+      current = current.createFolder(name);
+    }
+  }
+  return current;
+}
+
+function uploadImageToFolder(data) {
+  try {
+    const role = data.role;
+    const filename = data.filename || `image_${Date.now()}.jpg`;
+    const base64 = data.base64;
+    const mimetype = data.mimetype || "image/jpeg";
+
+    if (!base64) {
+      return makeResponse({ success: false, error: "base64 데이터 없음" });
+    }
+
+    const targetFolder = getOrCreateFolder(ROOT_FOLDER_ID, ["학습이미지", role]);
+    const now = new Date();
+    const timestamp = Utilities.formatDate(now, "Asia/Seoul", "yyyyMMdd_HHmmss");
+    const finalFilename = `${role}_${timestamp}_${filename}`;
+
+    const decoded = Utilities.base64Decode(base64);
+    const blob = Utilities.newBlob(decoded, mimetype, finalFilename);
+    const file = targetFolder.createFile(blob);
+
+    return makeResponse({
+      success: true,
+      data: { url: file.getUrl(), fileId: file.getId(), filename: finalFilename },
     });
+  } catch (err) {
+    return makeResponse({ success: false, error: err.message });
+  }
+}
+
+function ensureProcessedFilesSheet() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  let sheet = ss.getSheetByName(PROCESSED_FILES_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(PROCESSED_FILES_SHEET);
+    sheet.appendRow(["role", "file_id", "filename", "processed_at"]);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+/**
+ * Common_Knowledge 시트 보장 (v9: 신규 생성 시 헤더 7개 — 출처 메타 컬럼 포함)
+ *
+ * 마이그레이션(addSourceColumnsToAllSheets)을 이미 실행했으면 시트가 존재하고
+ * 헤더 7개를 갖추고 있어야 하므로, 이 함수는 시트가 아예 없는 예외 상황에만 호출됨.
+ */
+function ensureCommonKnowledgeSheet() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  let sheet = ss.getSheetByName(COMMON_KNOWLEDGE_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(COMMON_KNOWLEDGE_SHEET);
+    // v9: 헤더 7개 (기존 3개 + 출처 메타 4개)
+    sheet.appendRow(["category", "content", "updated_at"].concat(SOURCE_META_COLUMNS));
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function collectFilesRecursive(folder, processedIds, subPath) {
+  const collected = [];
+  subPath = subPath || "";
+
+  const files = folder.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    const fid = f.getId();
+    if (!processedIds.includes(fid)) {
+      collected.push({
+        fileId: fid, filename: f.getName(), mimetype: f.getMimeType(),
+        size: f.getSize(), url: f.getUrl(), subPath: subPath,
+      });
+    }
   }
 
-  // 이미지 압축 처리
-  return new Promise((resolve, reject) => {
-    const MAX_DIMENSION = 1600;
-    const QUALITY = 0.9;
+  const subFolders = folder.getFolders();
+  while (subFolders.hasNext()) {
+    const sub = subFolders.next();
+    const newPath = subPath ? `${subPath}/${sub.getName()}` : sub.getName();
+    const subFiles = collectFilesRecursive(sub, processedIds, newPath);
+    for (let i = 0; i < subFiles.length; i++) {
+      collected.push(subFiles[i]);
+    }
+  }
 
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const img = new Image();
-      img.onload = () => {
-        try {
-          let { width, height } = img;
-          const longSide = Math.max(width, height);
+  return collected;
+}
 
-          // 긴 변이 MAX 초과 시 축소
-          if (longSide > MAX_DIMENSION) {
-            const scale = MAX_DIMENSION / longSide;
-            width = Math.round(width * scale);
-            height = Math.round(height * scale);
-          }
+function scanLearningFolder(role) {
+  try {
+    const rootFolder = DriveApp.getFolderById(ROOT_FOLDER_ID);
+    const learningFolders = rootFolder.getFoldersByName("학습자료");
+    if (!learningFolders.hasNext()) {
+      return makeResponse({ success: true, data: { roleFiles: [], commonFiles: [] } });
+    }
+    const learningFolder = learningFolders.next();
 
-          const canvas = document.createElement("canvas");
-          canvas.width = width;
-          canvas.height = height;
-          const ctx = canvas.getContext("2d");
-          ctx.drawImage(img, 0, 0, width, height);
+    let roleFiles = [];
+    const roleFolders = learningFolder.getFoldersByName(role);
+    if (roleFolders.hasNext()) {
+      const roleFolder = roleFolders.next();
+      const processedIds = getProcessedFileIds(role);
+      roleFiles = collectFilesRecursive(roleFolder, processedIds, "");
+    }
 
-          // JPEG로 재인코딩 (PNG도 JPEG로 변환되어 용량 줄어듦)
-          const dataUrl = canvas.toDataURL("image/jpeg", QUALITY);
-          resolve(dataUrl.split(",")[1]);
-        } catch (err) {
-          reject(err);
+    let commonFiles = [];
+    const commonFolders = learningFolder.getFoldersByName(COMMON_FOLDER_NAME);
+    if (commonFolders.hasNext()) {
+      const commonFolder = commonFolders.next();
+      const processedCommonIds = getProcessedFileIds("_COMMON_");
+      commonFiles = collectFilesRecursive(commonFolder, processedCommonIds, "");
+    }
+
+    return makeResponse({ success: true, data: { roleFiles, commonFiles } });
+  } catch (err) {
+    return makeResponse({ success: false, error: err.message });
+  }
+}
+
+// 재학습 전용 폴더 스캔 (Step 7-11 v6) — Processed_Files 필터링 없이 모든 파일 반환
+function scanLearningFolderAll(role) {
+  try {
+    const rootFolder = DriveApp.getFolderById(ROOT_FOLDER_ID);
+    const learningFolders = rootFolder.getFoldersByName("학습자료");
+    if (!learningFolders.hasNext()) {
+      return makeResponse({ success: true, roleFiles: [], commonFiles: [] });
+    }
+    const learningFolder = learningFolders.next();
+
+    // collectFilesRecursive 재활용 (processedIds 빈 배열로)
+    let roleFiles = [];
+    const roleFolders = learningFolder.getFoldersByName(role);
+    if (roleFolders.hasNext()) {
+      roleFiles = collectFilesRecursive(roleFolders.next(), [], "");
+    }
+
+    let commonFiles = [];
+    const commonFolders = learningFolder.getFoldersByName(COMMON_FOLDER_NAME);
+    if (commonFolders.hasNext()) {
+      commonFiles = collectFilesRecursive(commonFolders.next(), [], "");
+    }
+
+    return makeResponse({ success: true, roleFiles: roleFiles, commonFiles: commonFiles });
+  } catch (err) {
+    return makeResponse({ success: false, error: err.message });
+  }
+}
+
+function getProcessedFileIds(role) {
+  const sheet = ensureProcessedFilesSheet();
+  if (sheet.getLastRow() < 2) return [];
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
+  return rows.filter(r => r[0] === role).map(r => r[1]);
+}
+
+function getDriveFileContent(fileId) {
+  let stage = "init";
+  try {
+    if (!fileId) return makeResponse({ success: false, error: "fileId 누락" });
+
+    stage = "getFileById";
+    const file = DriveApp.getFileById(fileId);
+
+    stage = "metadata";
+    let fileName = file.getName();
+    let mimeType = file.getMimeType();
+    let fileSize = file.getSize();
+    let targetFile = file; // 실제로 base64 변환할 파일 (PPT면 변환된 PDF로 교체됨)
+    let convertedFromPptx = false;
+    Logger.log(`[getDriveFileContent] ${fileName} | ${mimeType} | ${fileSize} bytes`);
+
+    if (mimeType === "application/vnd.google-apps.shortcut") {
+      return makeResponse({ success: false, error: `바로가기 파일은 지원되지 않음 (${fileName})` });
+    }
+
+    // v11: PPT/PPTX 자동 변환 (Drive Advanced API 필요)
+    const isPptx = (mimeType === "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+                || (fileName.toLowerCase().endsWith(".pptx"));
+    const isPpt = (mimeType === "application/vnd.ms-powerpoint")
+               || (fileName.toLowerCase().endsWith(".ppt"));
+
+    if (isPptx || isPpt) {
+      stage = "ppt_convert_check_collision";
+      // 1) 변환 후 PDF 파일명 생성
+      const pdfFileName = fileName.replace(/\.pptx?$/i, ".pdf");
+
+      // 2) 원본 PPT의 부모 폴더 찾기 (Q8-가: 같은 폴더에 생성)
+      const parentFolders = file.getParents();
+      if (!parentFolders.hasNext()) {
+        return makeResponse({
+          success: false,
+          error: `PPT 변환 실패: 원본 파일의 부모 폴더를 찾을 수 없음 (${fileName})`,
+        });
+      }
+      const parentFolder = parentFolders.next();
+
+      // 3) 같은 폴더에 동일 파일명 PDF가 이미 있는지 확인 (Q9-가: 충돌 시 변환 스킵)
+      const existingPdfs = parentFolder.getFilesByName(pdfFileName);
+      if (existingPdfs.hasNext()) {
+        const existing = existingPdfs.next();
+        return makeResponse({
+          success: false,
+          error: `PPT → PDF 변환 스킵: 같은 폴더에 "${pdfFileName}"가 이미 존재 (PPT: ${fileName}, 기존 PDF: ${existing.getId()}). 충돌 해결 후 재시도.`,
+        });
+      }
+
+      stage = "ppt_convert_to_pdf";
+      // 4) Drive API로 PPT → PDF 변환
+      //    참고: Drive.Files.export()는 Google Slides에만 동작. 일반 PPT는 다른 방식 필요.
+      //    PPT 파일을 Google Slides로 임시 변환 → PDF export → Google Slides 삭제 흐름
+      let tempSlidesId = null;
+      let pdfBlob = null;
+      try {
+        // 4-1) PPT를 Google Slides로 임시 변환 (Drive Advanced API v2)
+        const resource = {
+          title: fileName + " (temp for PDF conversion)",
+          mimeType: "application/vnd.google-apps.presentation",
+        };
+        const insertOpts = { convert: true };
+        const blob = file.getBlob();
+        // eslint-disable-next-line no-undef
+        const tempSlides = Drive.Files.insert(resource, blob, insertOpts);
+        tempSlidesId = tempSlides.id;
+
+        // 4-2) Google Slides → PDF export
+        const tempSlidesFile = DriveApp.getFileById(tempSlidesId);
+        pdfBlob = tempSlidesFile.getAs("application/pdf");
+      } catch (convErr) {
+        // 변환 실패 — 임시 Slides 삭제 시도 후 에러 반환 (Q10 단계 1: PPT 그대로 두기)
+        if (tempSlidesId) {
+          try { DriveApp.getFileById(tempSlidesId).setTrashed(true); } catch (_) {}
         }
-      };
-      img.onerror = () => reject(new Error("이미지 로드 실패"));
-      img.src = e.target.result;
-    };
-    reader.onerror = () => reject(new Error("파일 읽기 실패"));
-    reader.readAsDataURL(file);
-  });
-}
+        return makeResponse({
+          success: false,
+          error: `PPT → PDF 변환 실패 (${fileName}): ${convErr.message}. Drive API v2 활성화 확인 필요.`,
+        });
+      }
 
-// 압축 후 base64 데이터 크기를 KB로 추정 (UI 표시용)
-function estimateBase64Size(base64) {
-  return Math.round((base64.length * 3 / 4) / 1024);
-}
+      stage = "ppt_convert_save_pdf";
+      // 5) 변환된 PDF를 원본 폴더에 저장
+      let pdfFile = null;
+      try {
+        pdfFile = parentFolder.createFile(pdfBlob).setName(pdfFileName);
+      } catch (saveErr) {
+        // PDF 저장 실패 — 임시 Slides 삭제 + 에러 반환 (PPT 그대로 보존)
+        if (tempSlidesId) {
+          try { DriveApp.getFileById(tempSlidesId).setTrashed(true); } catch (_) {}
+        }
+        return makeResponse({
+          success: false,
+          error: `PPT → PDF 변환 후 저장 실패 (${fileName}): ${saveErr.message}`,
+        });
+      }
 
-// PDF 텍스트 추출 (간단 방식)
-async function extractTextFromFile(file) {
-  return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = (e) => resolve(e.target.result);
-    reader.onerror = () => resolve("");
-    reader.readAsText(file, "utf-8");
-  });
-}
+      // 6) 임시 Google Slides 삭제 (변환 완료 후 불필요)
+      try {
+        DriveApp.getFileById(tempSlidesId).setTrashed(true);
+      } catch (_) { /* 임시파일 삭제 실패는 무시 (휴지통에 남아도 30일 후 자동) */ }
 
-// ─── PDF 처리 (Step 5-B) ────────────────────────────────────────────────────────
-// pdfjs를 CDN에서 동적 로드 (package.json 의존성 없이)
-// 한 번만 로드하고 캐시
-let _pdfjsLib = null;
-async function loadPdfjs() {
-  if (_pdfjsLib) return _pdfjsLib;
-  // 이미 로드되어 있으면 사용
-  if (window.pdfjsLib) {
-    _pdfjsLib = window.pdfjsLib;
-    return _pdfjsLib;
-  }
-  // CDN에서 로드
-  return new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
-    script.onload = () => {
-      // worker도 CDN으로 설정
-      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-      _pdfjsLib = window.pdfjsLib;
-      resolve(_pdfjsLib);
-    };
-    script.onerror = () => reject(new Error("pdfjs 로드 실패"));
-    document.head.appendChild(script);
-  });
-}
+      stage = "ppt_trash_original";
+      // 7) 원본 PPT 휴지통 이동 (Q11-가: setTrashed)
+      //    이 시점에 PDF는 안전하게 생성됨. 휴지통 실패해도 학습은 진행 (Q10 단계 2).
+      try {
+        file.setTrashed(true);
+        Logger.log(`[v11 PPT변환] 원본 PPT 휴지통 이동: ${fileName} (ID: ${fileId})`);
+      } catch (trashErr) {
+        Logger.log(`[v11 PPT변환] 원본 PPT 휴지통 이동 실패 (학습은 계속): ${trashErr.message}`);
+      }
 
-// PDF 파일에서 페이지 수 + PDF 객체 반환
-async function loadPdfDocument(file) {
-  const pdfjs = await loadPdfjs();
-  const arrayBuffer = await file.arrayBuffer();
-  const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-  return pdf; // pdf.numPages, pdf.getPage(n)
-}
+      // 8) 이후 흐름을 변환된 PDF 기준으로 진행
+      targetFile = pdfFile;
+      fileName = pdfFileName;
+      mimeType = "application/pdf";
+      fileSize = pdfFile.getSize();
+      convertedFromPptx = true;
+      Logger.log(`[v11 PPT변환] ✅ 변환 완료: ${pdfFileName} (${fileSize} bytes)`);
+    }
 
-// ─── 트랙 1 단계 6: XLSX 처리 헬퍼 (v22) ─────────────────────────────────
-// SheetJS(xlsx) CDN 동적 로딩
-let _xlsxLib = null;
-async function loadSheetJS() {
-  if (_xlsxLib) return _xlsxLib;
-  if (window.XLSX) {
-    _xlsxLib = window.XLSX;
-    return _xlsxLib;
-  }
-  return new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
-    script.onload = () => {
-      _xlsxLib = window.XLSX;
-      resolve(_xlsxLib);
-    };
-    script.onerror = () => reject(new Error("SheetJS 로드 실패"));
-    document.head.appendChild(script);
-  });
-}
+    if (mimeType.indexOf("application/vnd.google-apps") === 0) {
+      return makeResponse({ success: false, error: `Google 문서 형식은 미지원: ${mimeType} (${fileName})` });
+    }
 
-// XLSX 파일(base64) → 시트별 행 배열로 파싱
-//   반환: [{ sheetName, rows: [[cell,cell,...], ...] }, ...]
-//   - 빈 시트 (또는 모든 셀이 빈 칸인 시트) 자동 스킵 (Q3)
-//   - 모든 셀을 포맷된 문자열로 (숫자·날짜 자동 포맷)
-async function extractXlsxSheets(base64) {
-  const XLSX = await loadSheetJS();
-  const byteChars = atob(base64);
-  const byteNumbers = new Array(byteChars.length);
-  for (let i = 0; i < byteChars.length; i++) {
-    byteNumbers[i] = byteChars.charCodeAt(i);
-  }
-  const byteArray = new Uint8Array(byteNumbers);
-  const workbook = XLSX.read(byteArray, { type: "array", cellDates: true });
+    stage = "getBlob";
+    const blob = targetFile.getBlob();
+    stage = "getBytes";
+    const bytes = blob.getBytes();
+    stage = "base64Encode";
+    const base64 = Utilities.base64Encode(bytes);
 
-  const result = [];
-  for (const sheetName of workbook.SheetNames) {
-    const sheet = workbook.Sheets[sheetName];
-    if (!sheet) continue;
-    const rows = XLSX.utils.sheet_to_json(sheet, {
-      header: 1, defval: "", blankrows: false, raw: false,
+    return makeResponse({
+      success: true,
+      data: {
+        filename: fileName, mimetype: mimeType, size: fileSize,
+        base64: base64, url: targetFile.getUrl(),
+        converted_from_pptx: convertedFromPptx, // v11: PPT 변환 여부 플래그
+        // v11: 변환된 경우 클라이언트가 두 fileId 모두 processed 표시 → 중복 학습 방지
+        converted_pdf_file_id: convertedFromPptx ? targetFile.getId() : null,
+      },
     });
-    const cleaned = rows.filter(row =>
-      Array.isArray(row) && row.some(cell => String(cell || "").trim().length > 0)
-    );
-    if (cleaned.length === 0) continue; // 빈 시트 스킵
-    result.push({ sheetName, rows: cleaned });
+  } catch (err) {
+    Logger.log(`[getDriveFileContent ERROR] stage=${stage} fileId=${fileId} message=${err.message}`);
+    return makeResponse({ success: false, error: `[${stage}] ${err.message}` });
   }
-  return result;
 }
 
-// 행 배열 → Markdown 표 텍스트 (Q2: Markdown 표 형식)
-function sheetRowsToMarkdownTable(rows) {
-  if (!rows || rows.length === 0) return "";
-  const escapeCell = (v) => String(v || "").replace(/\|/g, "\\|").replace(/\n/g, " ").trim();
-  let maxCols = 0;
-  for (const row of rows) maxCols = Math.max(maxCols, row.length);
-  if (maxCols === 0) return "";
-  const headerCells = (rows[0] || []).map(escapeCell);
-  while (headerCells.length < maxCols) headerCells.push("");
-  const lines = [];
-  lines.push("| " + headerCells.join(" | ") + " |");
-  lines.push("|" + " --- |".repeat(maxCols));
-  for (let i = 1; i < rows.length; i++) {
-    const cells = (rows[i] || []).map(escapeCell);
-    while (cells.length < maxCols) cells.push("");
-    lines.push("| " + cells.join(" | ") + " |");
+function markFileProcessed(data) {
+  const sheet = ensureProcessedFilesSheet();
+  const now = new Date().toLocaleString("ko-KR");
+  sheet.appendRow([data.role || "", data.fileId || "", data.filename || "", now]);
+}
+
+/**
+ * 공통 학습 데이터 저장 (v9: 출처 메타 인자 추가, saveKnowledge와 동일 패턴)
+ *
+ * 호출 패턴 1 (기존 — 그대로 동작):
+ *   payload = { action: "save_common_knowledge", category, content }
+ *   → D~G열은 빈 칸으로 저장
+ *
+ * 호출 패턴 2 (v9 신규 — PDF/PPT/XLSX 공통 자료 학습 시):
+ *   payload = {
+ *     action: "save_common_knowledge", category, content,
+ *     sourceMeta: { file, page, section, url }
+ *   }
+ */
+function saveCommonKnowledge(data) {
+  const sheet = ensureCommonKnowledgeSheet();
+  const now = new Date().toLocaleString("ko-KR");
+
+  // 출처 메타 (saveKnowledge와 동일 패턴, 하위 호환)
+  const meta = data.sourceMeta || {};
+  sheet.appendRow([
+    data.category || "",
+    data.content || "",
+    now,
+    meta.file || "",
+    meta.page || "",
+    meta.section || "",
+    meta.url || "",
+  ]);
+}
+
+function getCommonKnowledge() {
+  const sheet = ensureCommonKnowledgeSheet();
+  if (sheet.getLastRow() < 2) return makeResponse({ success: true, data: [] });
+  // v10: A~G 7개 열 모두 반환 (출처 메타 D~G 추가)
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 7).getValues();
+  const data = rows.map(r => ({
+    category: r[0], content: r[1], updated_at: r[2],
+    source_file: r[3] || "", source_page: r[4] || "",
+    source_section: r[5] || "", source_url: r[6] || "",
+  }));
+  return makeResponse({ success: true, data });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Teams Proxy (논의앱 — AZS Daily Report 발송 + Drive 아카이빙)
+// ════════════════════════════════════════════════════════════════════════════
+
+function handleTeamsProxy(payload) {
+  const props = PropertiesService.getScriptProperties();
+  const expectedSecret = props.getProperty("SHARED_SECRET");
+  if (!expectedSecret) {
+    return makeResponse({ ok: false, error: "SHARED_SECRET not configured" });
+  }
+  if (payload.secret !== expectedSecret) {
+    return makeResponse({ ok: false, error: "unauthorized" });
+  }
+
+  const webhookUrl = props.getProperty("TEAMS_WEBHOOK_URL");
+  if (!webhookUrl) {
+    return makeResponse({ ok: false, error: "TEAMS_WEBHOOK_URL not configured" });
+  }
+
+  const action = payload.action || "send_report";
+  let result;
+  switch (action) {
+    case "send_report": result = handleSendReport(payload, webhookUrl); break;
+    case "send_alarm":  result = handleSendAlarm(payload, webhookUrl); break;
+    case "send_daily":  result = handleSendDaily(payload, webhookUrl); break;
+    case "ping":        result = { ok: true, msg: "pong", action: "ping" }; break;
+    default: return makeResponse({ ok: false, error: "unknown teams action: " + action });
+  }
+  return makeResponse(result);
+}
+
+function handleSendReport(payload, webhookUrl) {
+  let driveUrl = null;
+  let driveError = null;
+  if (payload.html) {
+    try {
+      driveUrl = saveHtmlToDrive(payload);
+      console.log("[12-BE] Drive 적재 완료:", driveUrl);
+    } catch (err) {
+      driveError = err.message;
+      console.error("[12-BE] Drive 적재 실패:", err);
+    }
+  }
+
+  let teamsPayload;
+  if (payload.version === "v3" && payload.report) {
+    teamsPayload = buildSimpleCardWithLink(payload.report, driveUrl);
+  } else {
+    const text = String(payload.text || "").trim();
+    if (!text) return { ok: false, error: "empty text" };
+    teamsPayload = buildAdaptiveCardPayload({
+      title: payload.title || "AZS 일일 이슈 레포트",
+      date: payload.date || "",
+      bodyText: text,
+      accentColor: "Default",
+    });
+  }
+
+  const res = UrlFetchApp.fetch(webhookUrl, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(teamsPayload),
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  if (code >= 200 && code < 300) {
+    logSend("send_report", payload, code);
+    return {
+      ok: true,
+      msg: driveUrl ? "report archived + sent" : "report sent",
+      responseCode: code, driveUrl: driveUrl, driveError: driveError,
+    };
+  }
+  return { ok: false, error: "Teams webhook returned " + code, body: res.getContentText().slice(0, 500) };
+}
+
+function handleSendAlarm(payload, webhookUrl) {
+  const text = String(payload.text || "").trim();
+  if (!text) return { ok: false, error: "empty alarm text" };
+
+  const teamsPayload = buildAdaptiveCardPayload({
+    title: "🚨 AZS 즉시 알람",
+    date: "[" + (payload.rule || "unknown") + "] " + new Date().toLocaleString("ko-KR"),
+    bodyText: text,
+    accentColor: "Attention",
+  });
+
+  const res = UrlFetchApp.fetch(webhookUrl, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(teamsPayload),
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  if (code >= 200 && code < 300) {
+    logSend("send_alarm", payload, code);
+    return { ok: true, msg: "alarm sent", responseCode: code };
+  }
+  return { ok: false, error: "Teams webhook returned " + code };
+}
+
+function handleSendDaily(payload, webhookUrl) {
+  return handleSendReport(payload, webhookUrl);
+}
+
+function saveHtmlToDrive(payload) {
+  const props = PropertiesService.getScriptProperties();
+  const rootFolderId = props.getProperty("DAILY_REPORT_DRIVE_FOLDER_ID");
+  if (!rootFolderId) throw new Error("DAILY_REPORT_DRIVE_FOLDER_ID not configured");
+  if (!payload.html) throw new Error("html missing");
+
+  const dateInfo = parseReportDate(payload.date);
+  const yyyy = String(dateInfo.year);
+  const mm = String(dateInfo.month).padStart(2, "0");
+  const dd = String(dateInfo.day).padStart(2, "0");
+
+  const rootFolder = DriveApp.getFolderById(rootFolderId);
+  const yearFolder = getOrCreateSubfolderAS(rootFolder, yyyy);
+  const monthFolder = getOrCreateSubfolderAS(yearFolder, mm);
+
+  const reportType = payload.reportType || "daily";
+  const reportTypeLabel = reportType === "weekly" ? "주간"
+                        : reportType === "meeting" ? "회의" : "일일";
+  let filename = yyyy + "-" + mm + "-" + dd + "_AZS_" + reportTypeLabel + "레포트.html";
+
+  if (monthFolder.getFilesByName(filename).hasNext()) {
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, "0");
+    const min = String(now.getMinutes()).padStart(2, "0");
+    filename = yyyy + "-" + mm + "-" + dd + "_" + hh + "-" + min + "_AZS_" + reportTypeLabel + "레포트.html";
+  }
+
+  const blob = Utilities.newBlob(payload.html, "text/html;charset=utf-8", filename);
+  const file = monthFolder.createFile(blob);
+
+  try {
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  } catch (shareErr) {
+    console.warn("[12-BE] 파일 공유 설정 실패:", shareErr.message);
+  }
+
+  return file.getUrl();
+}
+
+function parseReportDate(str) {
+  if (!str) {
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate() };
+  }
+
+  const s = String(str).trim();
+  const slashMatch = s.match(/(\d{2,4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (slashMatch) {
+    let year = parseInt(slashMatch[1], 10);
+    if (year < 100) year += 2000;
+    return { year: year, month: parseInt(slashMatch[2], 10), day: parseInt(slashMatch[3], 10) };
+  }
+
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) {
+    return { year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate() };
+  }
+
+  const now = new Date();
+  return { year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate() };
+}
+
+function getOrCreateSubfolderAS(parentFolder, name) {
+  const existing = parentFolder.getFoldersByName(name);
+  if (existing.hasNext()) return existing.next();
+  return parentFolder.createFolder(name);
+}
+
+function buildSimpleCardWithLink(report, driveUrl) {
+  const cardBody = [];
+  cardBody.push({
+    type: "TextBlock", text: "📊 " + (report.title || "AZS 일일 이슈 레포트"),
+    size: "Large", weight: "Bolder", wrap: true,
+  });
+  if (report.date) {
+    cardBody.push({
+      type: "TextBlock", text: "📅 " + report.date, size: "Small",
+      color: "Accent", isSubtle: true, spacing: "Small", wrap: true,
+    });
+  }
+
+  const stats = report.stats || {};
+  const statsLine =
+    "📈 부동 " + (stats.totalIssues || 0) + "건 · " +
+    "장기부동(30분+) " + (stats.longDowntime30 || 0) + "건 · " +
+    "반복 카테고리 " + (stats.recurringCategories || 0) + "개";
+  cardBody.push({
+    type: "TextBlock", text: statsLine, wrap: true,
+    spacing: "Medium", separator: true,
+  });
+
+  if ((report.topIssues || []).length > 0) {
+    cardBody.push({
+      type: "TextBlock", text: "⏱️ 장기부동 TOP " + Math.min(3, report.topIssues.length),
+      weight: "Bolder", color: "Attention", spacing: "Medium", wrap: true,
+    });
+    report.topIssues.slice(0, 3).forEach(function(it, i) {
+      const line = (i + 1) + ". " + (it.equipment || "?") + " — " +
+                   (it.problem || "(문제 미기재)") +
+                   (it.durationMin ? " (" + it.durationMin + "분)" : "");
+      cardBody.push({
+        type: "TextBlock", text: line, wrap: true,
+        spacing: "Small", size: "Small",
+      });
+    });
+  }
+
+  if (!driveUrl) {
+    cardBody.push({
+      type: "TextBlock",
+      text: "⚠️ Drive 아카이빙 실패 — 상세 레포트는 React에서 직접 다운로드하세요",
+      wrap: true, spacing: "Medium", size: "Small",
+      color: "Warning", isSubtle: true,
+    });
+  }
+
+  cardBody.push({
+    type: "TextBlock", text: "— ESHM AI 자동 발송 · " + new Date().toLocaleString("ko-KR"),
+    size: "Small", isSubtle: true, spacing: "Medium",
+    separator: true, horizontalAlignment: "Right", wrap: true,
+  });
+
+  const cardActions = [];
+  if (driveUrl) {
+    cardActions.push({ type: "Action.OpenUrl", title: "📎 상세 HTML 보기", url: driveUrl });
+  }
+
+  const adaptiveCard = {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    type: "AdaptiveCard", version: "1.4", body: cardBody,
+  };
+  if (cardActions.length > 0) adaptiveCard.actions = cardActions;
+
+  return {
+    type: "message",
+    attachments: [{ contentType: "application/vnd.microsoft.card.adaptive", content: adaptiveCard }],
+  };
+}
+
+function buildAdaptiveCardPayload(opts) {
+  const title = opts.title || "AZS 알림";
+  const date = opts.date || "";
+  const bodyText = opts.bodyText || "";
+  const accentColor = opts.accentColor || "Default";
+
+  const cardBody = [{
+    type: "TextBlock", text: title, size: "Large",
+    weight: "Bolder", color: accentColor, wrap: true,
+  }];
+
+  if (date) {
+    cardBody.push({
+      type: "TextBlock", text: date, size: "Small",
+      color: "Accent", isSubtle: true, spacing: "Small", wrap: true,
+    });
+  }
+
+  cardBody.push({
+    type: "TextBlock", text: bodyText, wrap: true,
+    spacing: "Medium", separator: true,
+  });
+
+  cardBody.push({
+    type: "TextBlock", text: "— ESHM AI 자동 발송 · " + new Date().toLocaleString("ko-KR"),
+    size: "Small", isSubtle: true, spacing: "Medium",
+    separator: true, horizontalAlignment: "Right", wrap: true,
+  });
+
+  const adaptiveCard = {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    type: "AdaptiveCard", version: "1.4", body: cardBody,
+  };
+
+  return {
+    type: "message",
+    attachments: [{ contentType: "application/vnd.microsoft.card.adaptive", content: adaptiveCard }],
+  };
+}
+
+function logSend(action, payload, code) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const logSheetId = props.getProperty("LOG_SHEET_ID");
+    if (!logSheetId) return;
+    const ss = SpreadsheetApp.openById(logSheetId);
+    let sheet = ss.getSheetByName("send_log");
+    if (!sheet) sheet = ss.insertSheet("send_log");
+    if (sheet.getLastRow() === 0) {
+      sheet.appendRow(["timestamp", "action", "title", "date", "responseCode", "issuesCount"]);
+    }
+    sheet.appendRow([
+      new Date().toISOString(), action, payload.title || "",
+      payload.date || "", code, (payload.meta && payload.meta.issuesCount) || "",
+    ]);
+  } catch (err) {
+    console.error("logSend failed:", err);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 테스트 함수 (Apps Script 에디터에서 직접 실행)
+// ════════════════════════════════════════════════════════════════════════════
+
+function testPing() {
+  const props = PropertiesService.getScriptProperties();
+  console.log("TEAMS_WEBHOOK_URL:", props.getProperty("TEAMS_WEBHOOK_URL") ? "YES" : "NO");
+  console.log("SHARED_SECRET:", props.getProperty("SHARED_SECRET") ? "YES" : "NO");
+  console.log("DAILY_REPORT_DRIVE_FOLDER_ID:", props.getProperty("DAILY_REPORT_DRIVE_FOLDER_ID") ? "YES" : "NO");
+}
+
+function testSendReport() {
+  const props = PropertiesService.getScriptProperties();
+  const webhookUrl = props.getProperty("TEAMS_WEBHOOK_URL");
+  if (!webhookUrl) { console.error("TEAMS_WEBHOOK_URL not set"); return; }
+  const result = handleSendReport({
+    title: "테스트 메시지", date: "2026-04-29",
+    text: "📊 Apps Script Proxy 배포 테스트", meta: { issuesCount: 0 },
+  }, webhookUrl);
+  console.log("Result:", JSON.stringify(result));
+}
+
+function testSendReportWithHtml() {
+  const props = PropertiesService.getScriptProperties();
+  const webhookUrl = props.getProperty("TEAMS_WEBHOOK_URL");
+  if (!webhookUrl) { console.error("TEAMS_WEBHOOK_URL not set"); return; }
+  if (!props.getProperty("DAILY_REPORT_DRIVE_FOLDER_ID")) {
+    console.error("DAILY_REPORT_DRIVE_FOLDER_ID not set"); return;
+  }
+  const fakeHtml = "<html><head><meta charset='utf-8'><title>AZS 테스트</title></head><body>" +
+                   "<h1>AZS 일일 레포트 테스트</h1></body></html>";
+  const result = handleSendReport({
+    version: "v3", html: fakeHtml, date: "2026-05-08",
+    reportType: "daily", title: "AZS 일일 이슈 레포트",
+    report: {
+      title: "AZS 일일 이슈 레포트", date: "26/5/8",
+      stats: { totalIssues: 24, longDowntime30: 7, recurringCategories: 8, conditionChangeGroups: 0 },
+      topIssues: [
+        { rank: 1, score: 95, equipment: "STK-1-B4", problem: "Cell Overhang", durationMin: 65 },
+        { rank: 2, score: 80, equipment: "STK-2-B4", problem: "Z Servo Fault", durationMin: 60 },
+        { rank: 3, score: 70, equipment: "STK-4-A5", problem: "Ejector Timeout", durationMin: 50 },
+      ],
+      insights: [], actions: [],
+    },
+  }, webhookUrl);
+  console.log("Result:", JSON.stringify(result, null, 2));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// v12 신규 — PLC Agent query API (별도 앱 연결용, 명세서 §4)
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * query API 메인 핸들러. 별도 앱(PLC Agent)의 질문을 받아 표준 JSON으로 응답.
+ * 요청: { path:"query", token, data:{ agent, mode, equipment, lang, input, context } }
+ * 응답: { status, answer, structured, sources, metadata }  (§4-2)
+ */
+function handleQuery(data) {
+  const _perfTotal = Date.now(); // v23: 성능 측정 (구 v22 Q21-A 통합)
+  try {
+    const props = PropertiesService.getScriptProperties();
+
+    // 1) 인증 (§7)
+    const expectedToken = props.getProperty("PLC_QUERY_TOKEN");
+    if (!expectedToken) {
+      return makeResponse({ status: "error", message: "PLC_QUERY_TOKEN not configured" });
+    }
+    if (data.token !== expectedToken) {
+      return makeResponse({ status: "error", message: "unauthorized" });
+    }
+    const apiKey = props.getProperty("ANTHROPIC_API_KEY");
+    if (!apiKey) {
+      return makeResponse({ status: "error", message: "ANTHROPIC_API_KEY not configured" });
+    }
+
+    // 2) 요청 파싱
+    const d = data.data || {};
+    const agent = String(d.agent || "").toLowerCase();   // cell_plc | elec_plc | fa_plc
+    const role = PLC_AGENT_MAP[agent];
+    if (!role) {
+      return makeResponse({ status: "error", message: "unknown agent: " + agent });
+    }
+    const mode = d.mode || "analysis";
+    const equipment = d.equipment || "CL01";
+    const lang = d.lang || "auto";                        // auto | ko | en | id (§6-1)
+    const input = d.input || {};
+    const previousTurns = (d.context && d.context.previous_turns) || [];
+
+    // 3) 질문 텍스트 구성 (kind: text | alarm | photo) — §5-4
+    let question = "";
+    if (input.kind === "photo" && input.photo_ocr) {
+      const o = input.photo_ocr;
+      question = "[현장 사진 OCR 결과]\n"
+        + "알람코드: " + (o.alarm_code || "(없음)") + "\n"
+        + "알람명: " + (o.alarm_name || "(없음)") + "\n"
+        + "화면 원문: " + (o.raw_text || "") + "\n\n"
+        + "위 알람을 분석해 주세요.";
+    } else {
+      question = input.text || "";
+    }
+    if (!String(question).trim()) {
+      return makeResponse({ status: "error", message: "empty input" });
+    }
+
+    // 4) KB 조회 + 각 항목에 src id 부여
+    const items = getPlcKnowledgeData(role);
+    const built = buildKbContextAndSources(items, agent);
+
+    // v17: Signal Graph 자동 조회 (질문에서 신호명 추출 → XML 기반 인덱스 검색)
+    const _perfSG_load = Date.now(); // v23 측정
+    const signalGraph = loadSignalGraph();
+    const _perfSG_search = Date.now();
+    const signalMatches = searchSignalGraph(question, signalGraph);
+    Logger.log("[Perf] signal_graph: load=" + (_perfSG_search - _perfSG_load) + "ms search="
+      + (Date.now() - _perfSG_search) + "ms matches=" + signalMatches.length);
+    const signalContext = formatSignalGraphContext(signalMatches);
+    if (signalMatches.length > 0) {
+      Logger.log("[handleQuery] Signal Graph 매칭: " + signalMatches.length + "개 — "
+        + signalMatches.map(function(m){return m.name;}).join(", "));
+    }
+
+    // v23: 회로 역추적 자동 호출 (트리거 패턴 매칭 시)
+    var traceContext = "";
+    const traceTrigger = detectTraceTrigger(question, signalGraph);
+    if (traceTrigger) {
+      const _perfTrace = Date.now();
+      const _perfTraceLoad = Date.now();
+      const blockIdxForTrace = loadBlockSignals();
+      const _perfTraceLoadMs = Date.now() - _perfTraceLoad;
+      const knownSet = buildKnownSignalSet(signalGraph, blockIdxForTrace);
+      const sortedKnown = Object.keys(knownSet).sort(function(a, b) { return b.length - a.length; });
+      const tree = traceSignal(traceTrigger.target, signalGraph, sortedKnown, traceTrigger.depth, 3);
+      traceContext = formatTraceContext(traceTrigger.target, tree, traceTrigger.depth);
+      Logger.log("[Perf] traceSignal: " + (Date.now() - _perfTrace) + "ms"
+        + " (block_load=" + _perfTraceLoadMs + "ms"
+        + " known=" + sortedKnown.length
+        + " target=" + traceTrigger.target
+        + " depth=" + traceTrigger.depth + ")");
+    }
+
+    // v20: 블록/타입 인덱스 조건부 로드 (블록명/타입명이 질문에 있을 때만)
+    const typeCands = extractTypeCandidates(question);
+    // 블록 후보에서 타입 후보 제외 (예: "IEC_TIMER"가 양쪽에 잡히는 것 방지)
+    const blockCandsRaw = extractBlockCandidates(question);
+    const blockCands = blockCandsRaw.filter(function(b) { return typeCands.indexOf(b) < 0; });
+    var blockContext = "", typeContext = "";
+    var blockMatchedAny = false;
+
+    if (blockCands.length > 0) {
+      const _perfBlock_load = Date.now();
+      const blockIdx = loadBlockSignals();
+      const _perfBlock_search = Date.now();
+      const blockMatches = searchBlockSignals(blockCands, blockIdx, typeCands);
+      Logger.log("[Perf] block_signals: load=" + (_perfBlock_search - _perfBlock_load) + "ms search="
+        + (Date.now() - _perfBlock_search) + "ms matches=" + blockMatches.length);
+      blockContext = formatBlockContext(blockMatches);
+      blockMatchedAny = blockMatches.length > 0;
+      if (blockMatches.length > 0) {
+        Logger.log("[handleQuery] 블록 인덱스 매칭: " + blockMatches.length + "개 — "
+          + blockMatches.map(function(m){return m.key;}).join(", ")
+          + (typeCands.length > 0 ? " / 타입 필터: " + typeCands.join(",") : ""));
+      }
+    }
+    // 타입 인덱스 단독 조회: (a) 블록 후보 없음 또는 (b) 블록 매칭 0건 (fallback)
+    if (typeCands.length > 0 && (blockCands.length === 0 || !blockMatchedAny)) {
+      const _perfType_load = Date.now();
+      const typeIdx = loadTypeIndex();
+      const _perfType_search = Date.now();
+      const typeMatches = searchTypeIndex(typeCands, typeIdx);
+      Logger.log("[Perf] type_index: load=" + (_perfType_search - _perfType_load) + "ms search="
+        + (Date.now() - _perfType_search) + "ms matches=" + typeMatches.length);
+      typeContext = formatTypeContext(typeMatches);
+      if (typeMatches.length > 0) {
+        Logger.log("[handleQuery] 타입 인덱스 매칭: " + typeMatches.length + "개 — "
+          + typeMatches.map(function(m){return m.type + "(" + m.total + ")";}).join(", "));
+      }
+    }
+
+    // v21: WinCC 인덱스 조건부 로드 (알람 ID / PLC 주소 / 알람·태그 키워드 있을 때만)
+    var alarmContext = "", plcTagContext = "";
+    const alarmIdCands = extractAlarmIdCandidates(question);
+    const plcAddrCands = extractPlcAddressCandidates(question);
+    const hasAlarmKeyword = /알람|Alarm|warning|Warning|error|Error|경고|에러/i.test(question);
+    const hasTagKeyword = /태그|tag|주소|address/i.test(question);
+
+    // 알람 인덱스 로드 조건: 알람 ID 후보 / trigger_tag 패턴 / 알람 키워드
+    if (alarmIdCands.length > 0 || plcAddrCands.length > 0 || hasAlarmKeyword) {
+      const _perfAlarm_load = Date.now();
+      const alarmIdx = loadAlarmIndex();
+      const _perfAlarm_search = Date.now();
+      const alarmResult = searchAlarmIndex(question, alarmIdx);
+      const _perfAlarm_total = alarmResult.byId.length + alarmResult.byTrigger.length + alarmResult.byText.length;
+      Logger.log("[Perf] alarm_index: load=" + (_perfAlarm_search - _perfAlarm_load) + "ms search="
+        + (Date.now() - _perfAlarm_search) + "ms matches=" + _perfAlarm_total);
+      alarmContext = formatAlarmContext(alarmResult);
+      if (_perfAlarm_total > 0) {
+        Logger.log("[handleQuery] 알람 인덱스 매칭: byId=" + alarmResult.byId.length
+          + " byTrigger=" + alarmResult.byTrigger.length + " byText=" + alarmResult.byText.length);
+      }
+    }
+    // PLC 태그 인덱스 로드 조건: 주소 패턴 / 태그 키워드
+    if (plcAddrCands.length > 0 || hasTagKeyword) {
+      const _perfPlc_load = Date.now();
+      const plcIdx = loadPlcTagIndex();
+      const _perfPlc_search = Date.now();
+      const plcResult = searchPlcTagIndex(question, plcIdx);
+      const _perfPlc_total = plcResult.byName.length + plcResult.byAddress.length;
+      Logger.log("[Perf] plc_tag_index: load=" + (_perfPlc_search - _perfPlc_load) + "ms search="
+        + (Date.now() - _perfPlc_search) + "ms matches=" + _perfPlc_total);
+      plcTagContext = formatPlcTagContext(plcResult);
+      if (_perfPlc_total > 0) {
+        Logger.log("[handleQuery] PLC 태그 매칭: byName=" + plcResult.byName.length
+          + " byAddress=" + plcResult.byAddress.length);
+      }
+    }
+
+    const combinedSignalContext = signalContext + blockContext + typeContext + alarmContext + plcTagContext + traceContext;
+
+    // 5) 프롬프트 조립
+    const prompts = buildQueryPrompts({
+      role: role, agent: agent, mode: mode, equipment: equipment,
+      lang: lang, question: question, kbContext: built.kbContext,
+      hasKb: items.length > 0, previousTurns: previousTurns,
+      signalContext: combinedSignalContext, // v17 signal + v20 block + v20 type
+    });
+
+    // 6) LLM 호출
+    const _perfLLM = Date.now();
+    const rawText = callClaudeAPI(apiKey, prompts.system, prompts.userMsg);
+    Logger.log("[Perf] callClaudeAPI: " + (Date.now() - _perfLLM) + "ms");
+
+    // 7) JSON 파싱
+    const parsed = extractJson(rawText);
+    if (!parsed) {
+      // 파싱 실패 — 원인 추적용 로그만 남기고, 사용자에겐 raw 노출 없이 깔끔한 에러 반환
+      Logger.log("[handleQuery] 파싱 실패 (rawText 길이: " + String(rawText).length + ")");
+      Logger.log("[Perf] handleQuery TOTAL (parse_fail): " + (Date.now() - _perfTotal) + "ms");
+      return makeResponse({
+        status: "error",
+        message: "응답 처리 중 오류가 발생했습니다. 다시 시도해주세요.",
+        answer: "",
+      });
+    }
+
+    // 8) 표준 응답 조립 (§4-2)
+    const status = parsed.status === "not_found" ? "not_found" : "ok";
+    const usedIds = Array.isArray(parsed.used_source_ids) ? parsed.used_source_ids : [];
+    const sources = (status === "not_found") ? [] : assembleSources(usedIds, built.srcMap);
+
+    // v29: 채팅 탭 격리 — ladder_html 첨부 로직 제거 (V1 합의: 4번 탭 전용)
+    Logger.log("[Perf] handleQuery TOTAL: " + (Date.now() - _perfTotal) + "ms");
+    return makeResponse({
+      status: status,
+      answer: parsed.answer || "",
+      structured: parsed.structured || {},
+      sources: sources,
+      metadata: { agent: agent, mode: mode, code_version: PLC_CODE_VERSION },
+    });
+  } catch (err) {
+    Logger.log("[Perf] handleQuery TOTAL (ERROR): " + (Date.now() - _perfTotal) + "ms");
+    return makeResponse({ status: "error", message: err.message });
+  }
+}
+
+/**
+ * PLC KB 데이터를 배열로 반환 (getKnowledge는 makeResponse로 감싸므로 내부용 헬퍼 신설).
+ * content가 빈 row는 제외.
+ */
+function getPlcKnowledgeData(role) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const tabName = TAB_MAP[role];
+  if (!tabName) return [];
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet) return [];
+  const rows = sheet.getDataRange().getValues();
+  return rows.slice(1).map(function (row) {
+    return {
+      category: row[0], content: row[1], updated_at: row[2],
+      source_file: row[3] || "", source_page: row[4] || "",
+      source_section: row[5] || "", source_url: row[6] || "",
+    };
+  }).filter(function (it) {
+    return it.content && String(it.content).trim();
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// v25 신규 — handleTrace (옵션 A: 별도 endpoint, 인터랙티브 트리 UI 용)
+//   별도 앱이 path:"trace"로 호출 — signal/depth/max_locations 명시적 파라미터
+//   응답: { status, tree, externals, metadata }
+//   옵션 B (path:"query" + detectTraceTrigger 자동 감지)는 그대로 유지
+//   둘 다 traceSignal 함수 공유 — 코드 중복 없음
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 회로 역추적 API (옵션 A).
+ * 요청: { path:"trace", token, data:{ signal, depth, max_locations, lang } }
+ * 응답: { status, tree, externals, metadata }
+ */
+function handleTrace(data) {
+  const _perfTotal = Date.now();
+  try {
+    const props = PropertiesService.getScriptProperties();
+
+    // 1) 인증 (handleQuery와 동일 토큰)
+    const expectedToken = props.getProperty("PLC_QUERY_TOKEN");
+    if (!expectedToken) {
+      return makeResponse({ status: "error", message: "PLC_QUERY_TOKEN not configured" });
+    }
+    if (data.token !== expectedToken) {
+      return makeResponse({ status: "error", message: "unauthorized" });
+    }
+
+    // 2) 파라미터 파싱 + 기본값 + 한계
+    const d = data.data || {};
+    const signal = String(d.signal || "").trim();
+    if (!signal) {
+      return makeResponse({ status: "error", message: "signal parameter required" });
+    }
+    var depth = parseInt(d.depth, 10);
+    if (isNaN(depth) || depth < 1) depth = 3;     // 기본 3
+    if (depth > 10) depth = 10;                    // 최대 10 (재귀 폭주 방지)
+    var maxLocs = parseInt(d.max_locations, 10);
+    if (isNaN(maxLocs) || maxLocs < 1) maxLocs = 3; // 기본 3
+    if (maxLocs > 10) maxLocs = 10;                 // 최대 10
+
+    // 3) Signal Graph 로드
+    const _perfSG_load = Date.now();
+    const signalGraph = loadSignalGraph();
+    if (!signalGraph) {
+      return makeResponse({ status: "error", message: "signal_graph load failed" });
+    }
+    Logger.log("[Perf trace] signal_graph load=" + (Date.now() - _perfSG_load) + "ms");
+
+    // 4) 신호 매칭 — 정확/정규화/부분/phrase 4단계 (detectTraceTrigger와 동일 로직, depth 결정 안 함)
+    var target = null;
+    if (signalGraph[signal]) {
+      target = signal;
+    } else {
+      const candNorm = signal.replace(/[\s"']/g, "").toLowerCase();
+      const keys = Object.keys(signalGraph);
+      // 정규화 매칭
+      for (var ki = 0; ki < keys.length && !target; ki++) {
+        const keyNorm = keys[ki].replace(/[\s"']/g, "").toLowerCase();
+        if (keyNorm === candNorm) target = keys[ki];
+      }
+      // 부분 매칭 (5자+)
+      if (!target && candNorm.length >= 5) {
+        for (var kj = 0; kj < keys.length && !target; kj++) {
+          const keyNorm2 = keys[kj].replace(/[\s"']/g, "").toLowerCase();
+          if (keyNorm2.indexOf(candNorm) >= 0) target = keys[kj];
+        }
+      }
+      // phrase 매칭 — signal에 공백 있으면 substring 매칭 (v24와 동일)
+      if (!target && /\s/.test(signal)) {
+        const sigLow = signal.toLowerCase();
+        var bestKey = null, bestLen = Infinity;
+        for (var gi = 0; gi < keys.length; gi++) {
+          if (keys[gi].toLowerCase().indexOf(sigLow) >= 0 && keys[gi].length < bestLen) {
+            bestKey = keys[gi]; bestLen = keys[gi].length;
+          }
+        }
+        if (bestKey) target = bestKey;
+      }
+    }
+
+    // 5) signal 못 찾음 → 추천 신호 list와 함께 not_found
+    if (!target) {
+      const suggestions = [];
+      const sigLow = signal.toLowerCase().replace(/[\s"']/g, "");
+      if (sigLow.length >= 3) {
+        const keys = Object.keys(signalGraph);
+        for (var si = 0; si < keys.length && suggestions.length < 10; si++) {
+          const kLow = keys[si].toLowerCase().replace(/[\s"']/g, "");
+          if (kLow.indexOf(sigLow.slice(0, Math.min(sigLow.length, 8))) >= 0) {
+            suggestions.push(keys[si]);
+          }
+        }
+      }
+      Logger.log("[Perf trace] not_found: " + signal + " TOTAL=" + (Date.now() - _perfTotal) + "ms");
+      return makeResponse({
+        status: "not_found",
+        message: "signal not in graph: " + signal,
+        suggestions: suggestions,
+      });
+    }
+
+    // 6) known_signals 사전 구축 (block_signals_index 필요)
+    const _perfBlock_load = Date.now();
+    const blockIdx = loadBlockSignals();
+    Logger.log("[Perf trace] block_signals load=" + (Date.now() - _perfBlock_load) + "ms");
+    const knownSet = buildKnownSignalSet(signalGraph, blockIdx);
+    const sortedKnown = Object.keys(knownSet).sort(function(a, b) { return b.length - a.length; });
+
+    // 7) traceSignal 실행
+    const _perfTrace = Date.now();
+    const tree = traceSignal(target, signalGraph, sortedKnown, depth, maxLocs);
+    const externalsObj = collectExternals(tree);
+    const externals = Object.keys(externalsObj).sort();
+    Logger.log("[Perf trace] traceSignal=" + (Date.now() - _perfTrace) + "ms target=" + target
+      + " depth=" + depth + " externals=" + externals.length);
+
+    // 8) 응답
+    Logger.log("[Perf trace] TOTAL=" + (Date.now() - _perfTotal) + "ms");
+    return makeResponse({
+      status: "ok",
+      tree: tree,
+      externals: externals,
+      metadata: {
+        target: target,
+        signal_requested: signal,
+        matched_by: target === signal ? "exact" : "fuzzy",
+        depth_requested: depth,
+        max_locations: maxLocs,
+        known_signals_count: sortedKnown.length,
+        code_version: PLC_CODE_VERSION,
+      },
+    });
+  } catch (err) {
+    Logger.log("[Perf trace] ERROR TOTAL=" + (Date.now() - _perfTotal) + "ms: " + err.message);
+    return makeResponse({ status: "error", message: err.message });
+  }
+}
+
+
+// XML(TIA Portal Openness) → 그래프 변환된 JSON을 Drive에서 매번 로드 → 신호명으로 검색.
+// 4626 신호 인덱스, 각 신호당 set_locations(SET되는 위치)와 used_in_blocks(사용 블록).
+// 학습 자료가 아니라 조회 도구라 KB로 안 넣음 — 매번 매칭된 신호만 LLM에 컨텍스트로 주입.
+
+/** Drive에서 Signal Graph JSON을 매번 로드 (캐싱은 추후 최적화). 실패 시 null. */
+function loadSignalGraph() {
+  try {
+    const file = DriveApp.getFileById(SIGNAL_GRAPH_FILE_ID);
+    const text = file.getBlob().getDataAsString("utf-8");
+    return JSON.parse(text);
+  } catch (e) {
+    Logger.log("[loadSignalGraph] 로드 실패 — Signal Graph 조회 없이 진행: " + e.message);
+    return null;
+  }
+}
+
+/** 질문에서 신호명 후보 추출 (도트표기, CamelCase 5자+, F알람코드, 따옴표 안). */
+function extractSignalCandidates(question) {
+  const q = String(question || "");
+  const set = {};
+  const add = function(s) { if (s && s.length >= 3) set[s] = true; };
+  // 도트 표기: 500_ControlNodes.safetyRelease, Etc.FDC.Excute
+  (q.match(/[A-Za-z][\w_]*(?:\.[\w_ ]+)+/g) || []).forEach(add);
+  // CamelCase / snake_case 단어 (5자+, 첫 글자 대문자)
+  (q.match(/\b[A-Z][a-zA-Z_]{4,}\b/g) || []).forEach(add);
+  // v18: lowerCamelCase 단어 (소문자로 시작 + 중간 대문자, 예: safetyRelease, executeRequest)
+  //   일반 영단어(release, safety)는 중간 대문자 없어 매칭 안 됨 — 노이즈 차단
+  (q.match(/\b[a-z]+[A-Z][a-zA-Z_]{2,}\b/g) || []).forEach(add);
+  // F알람 코드 (F31137 등)
+  (q.match(/\bF\d{4,5}\b/g) || []).forEach(add);
+  // 대문자 약어 (FDC, IVS 등 2-5자)
+  (q.match(/\b[A-Z]{2,5}\b/g) || []).forEach(add);
+  // 따옴표 안 텍스트 (PLC IDE 표시명 패턴: "500_Control Nodes".safety Release)
+  (q.match(/"([^"]+)"/g) || []).forEach(function(m) { add(m.replace(/"/g, "")); });
+  return Object.keys(set);
+}
+
+/** Signal Graph에서 후보들을 매칭 (정확/토큰경계/부분), 상위 N개 반환. */
+function searchSignalGraph(question, graph) {
+  if (!graph) return [];
+  var candidates = extractSignalCandidates(question);
+  if (candidates.length === 0) return [];
+
+  var matches = [];
+  var seen = {};
+  var keys = Object.keys(graph);
+
+  for (var ci = 0; ci < candidates.length && matches.length < 5; ci++) {
+    var cand = candidates[ci];
+    var candNorm = cand.replace(/[\s"']/g, "").toLowerCase();
+    if (candNorm.length < 3) continue;
+
+    for (var ki = 0; ki < keys.length && matches.length < 5; ki++) {
+      var key = keys[ki];
+      if (seen[key]) continue;
+      var keyNorm = key.replace(/[\s"']/g, "").toLowerCase();
+
+      var matched = false;
+      // 1) 정확 매칭
+      if (keyNorm === candNorm) matched = true;
+      // 2) 토큰 경계 매칭 (도트/언더바로 나눈 토큰 중 하나와 정확 일치)
+      else if (keyNorm.split(/[._]/).indexOf(candNorm) >= 0) matched = true;
+      // 3) 부분 매칭 (긴 후보 5자+만 — 짧으면 노이즈 위험)
+      else if (candNorm.length >= 5 && keyNorm.indexOf(candNorm) >= 0) matched = true;
+
+      if (matched) {
+        matches.push({ name: key, data: graph[key], matchedBy: cand });
+        seen[key] = true;
+      }
+    }
+  }
+  return matches;
+}
+
+/** Signal Graph 매칭 결과를 LLM 컨텍스트용 텍스트로 포맷. */
+function formatSignalGraphContext(matches) {
+  if (!matches || matches.length === 0) return "";
+  var lines = ["", "## [신호 그래프 조회 결과] (Signal Graph 자동 검색 — TIA Portal XML 기반)",
+    "질문에서 신호명 후보를 자동 추출해 Signal Graph(4626 신호 인덱스)에서 검색한 결과입니다.",
+    "이 정보는 (1) KB 기반과 동일한 신뢰도(XML 원본 기반)입니다. 답변 시 출처로 정확히 인용하고,",
+    "answer 끝에 'ⓘ 출처: Signal Graph 자동 조회 (XML 기반)' 라벨을 붙이세요.",
+    ""];
+  for (var i = 0; i < matches.length; i++) {
+    var sig = matches[i];
+    lines.push("### 신호: " + sig.name + "  (검색어: " + sig.matchedBy + ")");
+    var sets = (sig.data && sig.data.set_locations) || [];
+    if (sets.length > 0) {
+      lines.push("  SET되는 위치 (" + sets.length + "개):");
+      var showN = Math.min(sets.length, 10);
+      for (var si = 0; si < showN; si++) {
+        var loc = sets[si];
+        lines.push("    [" + (si+1) + "] 블록: " + (loc.block || "?")
+          + " / 네트워크 " + (loc.network_id || "?")
+          + (loc.network_title ? ": " + loc.network_title : ""));
+        lines.push("        모드: " + (loc.mode || "?") + ", operator: " + (loc.operator || "?"));
+        if (loc.condition_str) lines.push("        조건: " + loc.condition_str);
+      }
+      if (sets.length > showN) lines.push("    ... 외 " + (sets.length - showN) + "개");
+    }
+    var uses = (sig.data && sig.data.used_in_blocks) || [];
+    if (uses.length > 0) {
+      var usesShow = uses.slice(0, 10).join(", ");
+      lines.push("  사용되는 블록 (" + uses.length + "개): " + usesShow
+        + (uses.length > 10 ? " 외 " + (uses.length - 10) + "개" : ""));
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+// ──────────────────────────────────────────────────────────────────
+
+// ─── v20: 블록 인덱스 + 타입 인덱스 조회 도구 (signal_graph_v2 — C-4 해결) ───────
+// block_signals_index.json: 블록(671개)별 signals_by_section / signals_by_type / all_signals
+// global_type_index.json:   타입(1242개)별 위치 리스트
+// 조건부 로드 — 질문에 블록명/타입명이 있을 때만 추가 로드 (평소 부담 0)
+
+/** Drive에서 block_signals_index 매번 로드. 실패 시 null. */
+function loadBlockSignals() {
+  try {
+    const file = DriveApp.getFileById(BLOCK_SIGNALS_FILE_ID);
+    const text = file.getBlob().getDataAsString("utf-8");
+    return JSON.parse(text);
+  } catch (e) {
+    Logger.log("[loadBlockSignals] 로드 실패: " + e.message);
+    return null;
+  }
+}
+
+/** Drive에서 global_type_index 매번 로드. 실패 시 null. */
+function loadTypeIndex() {
+  try {
+    const file = DriveApp.getFileById(TYPE_INDEX_FILE_ID);
+    const text = file.getBlob().getDataAsString("utf-8");
+    return JSON.parse(text);
+  } catch (e) {
+    Logger.log("[loadTypeIndex] 로드 실패: " + e.message);
+    return null;
+  }
+}
+
+/** 질문에서 블록 참조 후보 추출 (FB200, OB80, GlobalDB384, DAT_Door 등). */
+function extractBlockCandidates(question) {
+  const q = String(question || "");
+  const set = {};
+  // 블록 번호 패턴: FB200, FC123, DB10, OB80, GlobalDB384 등
+  (q.match(/\b(?:FB|FC|DB|OB|GlobalDB|FunctionBlock|Function|DataBlock|OrganizationBlock)\d+\b/gi) || [])
+    .forEach(function(s) { set[s] = true; });
+  // 블록 이름 후보 — CamelCase 또는 snake_case 식별자 (긴 것만, 노이즈 차단)
+  // 예: DAT_Door, LLGES_CylPressureControl
+  (q.match(/\b[A-Z][a-zA-Z0-9_]{4,}\b/g) || []).forEach(function(s) { set[s] = true; });
+  return Object.keys(set);
+}
+
+/** 질문에서 PLC 타입명 후보 추출 (IEC_TIMER, TON_TIME, PID_Compact 등). */
+function extractTypeCandidates(question) {
+  const q = String(question || "");
+  const set = {};
+  // 화이트리스트 — 자주 쓰는 PLC 타입명 (정확히 등장하는 것만)
+  const WHITELIST = [
+    "IEC_TIMER", "IEC_COUNTER", "TON_TIME", "TOF_TIME", "TP_TIME",
+    "PID_Compact", "PID_CompactConfig", "PID_CompactRetain",
+    "DTL", "Time", "Date",
+  ];
+  WHITELIST.forEach(function(t) {
+    const re = new RegExp("\\b" + t + "\\b");
+    if (re.test(q)) set[t] = true;
+  });
+  // 패턴 매칭: *_TIMER, *_COUNTER, *_FB, *_UDT 형식 (대문자 + 언더바)
+  (q.match(/\b[A-Z][A-Z_]+_(?:TIMER|COUNTER|FB|UDT|STRUCT|TIME)\b/g) || [])
+    .forEach(function(s) { set[s] = true; });
+  // "타이머" 한글도 IEC_TIMER 후보로
+  if (/타이머/.test(q) && !set["IEC_TIMER"]) set["IEC_TIMER"] = true;
+  return Object.keys(set);
+}
+
+/** 블록 인덱스에서 매칭 검색. typeFilter 있으면 그 타입 신호만 노출. 최대 3블록. */
+function searchBlockSignals(blockCands, blockIdx, typeFilter) {
+  if (!blockIdx || blockCands.length === 0) return [];
+  const matches = [];
+  const seen = {};
+  const keys = Object.keys(blockIdx);
+
+  for (var ci = 0; ci < blockCands.length && matches.length < 3; ci++) {
+    const cand = blockCands[ci];
+    const candNorm = cand.replace(/[\s"']/g, "").toLowerCase();
+    if (candNorm.length < 3) continue;
+
+    for (var ki = 0; ki < keys.length && matches.length < 3; ki++) {
+      const key = keys[ki];
+      if (seen[key]) continue;
+      const keyNorm = key.replace(/[\s"']/g, "").toLowerCase();
+
+      var matched = false;
+      // 정확 매칭 (전체 키 또는 블록 이름·번호 부분)
+      if (keyNorm === candNorm) matched = true;
+      // 키 안 토큰 매칭 — 키 형식 "DAT_Door (FB200)" → 토큰 ["dat_door", "fb200"]
+      else if (keyNorm.split(/[\s()._]+/).filter(Boolean).indexOf(candNorm) >= 0) matched = true;
+      // 부분 매칭 (5자+만)
+      else if (candNorm.length >= 5 && keyNorm.indexOf(candNorm) >= 0) matched = true;
+
+      if (matched) {
+        matches.push({ key: key, data: blockIdx[key], matchedBy: cand, typeFilter: typeFilter });
+        seen[key] = true;
+      }
+    }
+  }
+  return matches;
+}
+
+/** 타입 인덱스에서 매칭 검색. 매칭당 상위 20개 위치 + 전체 개수 반환. */
+function searchTypeIndex(typeCands, typeIdx) {
+  if (!typeIdx || typeCands.length === 0) return [];
+  const matches = [];
+  for (var ci = 0; ci < typeCands.length && matches.length < 3; ci++) {
+    const cand = typeCands[ci];
+    if (typeIdx[cand]) {
+      const locs = typeIdx[cand];
+      matches.push({
+        type: cand,
+        total: locs.length,
+        locations: locs.slice(0, 20),
+      });
+    }
+  }
+  return matches;
+}
+
+/** 블록 검색 결과 → LLM 컨텍스트 텍스트. typeFilter 있으면 그 타입만 노출. */
+function formatBlockContext(matches) {
+  if (!matches || matches.length === 0) return "";
+  const lines = ["", "## [블록 인덱스 조회 결과] (block_signals_index — 671블록 인덱스)",
+    "질문에서 블록 참조(FB/FC/DB/OB 번호 또는 블록명)를 추출해 검색한 결과입니다.",
+    "각 블록의 변수·타입 정보가 Section별/Type별로 분류돼 있습니다.",
+    "답변 시 'ⓘ 출처: Signal Graph 자동 조회 (XML 기반 - 블록 인덱스)' 라벨을 붙이세요.",
+    ""];
+
+  for (var i = 0; i < matches.length; i++) {
+    const m = matches[i];
+    const d = m.data;
+    lines.push("### 블록: " + m.key + "  (검색어: " + m.matchedBy + ")");
+    lines.push("  경로: " + (d.block_path || "?") + " / 언어: " + (d.language || "?")
+      + " / 신호 수: " + (d.signal_count || "?"));
+    const filters = m.typeFilter || [];
+
+    if (filters.length > 0) {
+      // 타입 필터 — 해당 타입 신호만 노출
+      const byType = d.signals_by_type || {};
+      for (var fi = 0; fi < filters.length; fi++) {
+        const t = filters[fi];
+        const sigs = byType[t] || [];
+        lines.push("  [타입 " + t + "] " + sigs.length + "개:");
+        for (var si = 0; si < sigs.length; si++) {
+          lines.push("    - " + sigs[si].name + " (Section: " + sigs[si].section + ")");
+        }
+      }
+    } else {
+      // 필터 없음 — Section별 + 타입 분포 요약 (신호 너무 많으면 상위 30개)
+      const bySection = d.signals_by_section || {};
+      const sections = Object.keys(bySection);
+      var shown = 0;
+      const MAX_SHOW = 30;
+      for (var si = 0; si < sections.length && shown < MAX_SHOW; si++) {
+        const sec = sections[si];
+        const sigs = bySection[sec];
+        lines.push("  [" + sec + "] " + sigs.length + "개:");
+        const showN = Math.min(sigs.length, MAX_SHOW - shown);
+        for (var sj = 0; sj < showN; sj++) {
+          lines.push("    - " + sigs[sj].name + ": " + sigs[sj].type);
+        }
+        shown += showN;
+        if (sigs.length > showN) {
+          lines.push("    ... 외 " + (sigs.length - showN) + "개 (제한)");
+          break;
+        }
+      }
+      if (d.signal_count > MAX_SHOW) {
+        lines.push("  (전체 " + d.signal_count + "개 중 상위 " + MAX_SHOW + "개만 노출 — 특정 타입 지정 시 정밀 조회 가능)");
+      }
+    }
+    lines.push("");
   }
   return lines.join("\n");
 }
 
-// 시트를 N행씩 청크 분할 (헤더 매 청크 포함 - 컨텍스트 보존)
-//   반환: [{ chunkIdx, totalChunks, rows, startRow, endRow }, ...]
-//   - dataRowsPerChunk: 청크당 데이터 행 수 (헤더 제외)
-function chunkSheetRows(rows, dataRowsPerChunk) {
-  if (!rows || rows.length === 0) return [];
-  const header = rows[0];
-  const dataRows = rows.slice(1);
-  if (dataRows.length === 0) {
-    return [{ chunkIdx: 1, totalChunks: 1, rows: [header], startRow: 0, endRow: 0 }];
-  }
-  const totalChunks = Math.max(1, Math.ceil(dataRows.length / dataRowsPerChunk));
-  const chunks = [];
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * dataRowsPerChunk;
-    const end = Math.min(start + dataRowsPerChunk, dataRows.length);
-    chunks.push({
-      chunkIdx: i + 1,
-      totalChunks,
-      rows: [header, ...dataRows.slice(start, end)],
-      startRow: start + 1,
-      endRow: end,
-    });
-  }
-  return chunks;
-}
-
-// ─── 트랙 1 단계 7: CSV/TXT/MD 처리 헬퍼 (v23) ──────────────────────────
-// CSV 파일(base64) → 행 배열 (SheetJS로 파싱)
-//   반환: [[cell,cell,...], ...] — XLSX 단일 시트와 같은 형식
-//   - 빈 행 자동 제거
-//   - 인코딩: UTF-8 우선, 실패 시 그대로
-async function extractCsvRows(base64) {
-  const XLSX = await loadSheetJS();
-  // base64 → Uint8Array
-  const byteChars = atob(base64);
-  const byteNumbers = new Array(byteChars.length);
-  for (let i = 0; i < byteChars.length; i++) {
-    byteNumbers[i] = byteChars.charCodeAt(i);
-  }
-  const byteArray = new Uint8Array(byteNumbers);
-  // SheetJS는 CSV를 type:"array"로 받을 수 있음 (자동 감지)
-  const workbook = XLSX.read(byteArray, { type: "array", cellDates: true, raw: false });
-  if (!workbook.SheetNames || workbook.SheetNames.length === 0) return [];
-  const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-  if (!firstSheet) return [];
-  const rows = XLSX.utils.sheet_to_json(firstSheet, {
-    header: 1, defval: "", blankrows: false, raw: false,
-  });
-  return rows.filter(row =>
-    Array.isArray(row) && row.some(cell => String(cell || "").trim().length > 0)
-  );
-}
-
-// base64 → UTF-8 텍스트 디코딩 (TXT/MD용)
-//   - 잘못된 UTF-8 바이트는 fffd로 치환
-function base64ToUtf8Text(base64) {
-  try {
-    const byteChars = atob(base64);
-    const byteNumbers = new Uint8Array(byteChars.length);
-    for (let i = 0; i < byteChars.length; i++) {
-      byteNumbers[i] = byteChars.charCodeAt(i);
+/** 타입 검색 결과 → LLM 컨텍스트 텍스트. 상위 20개 위치 + 전체 개수. */
+function formatTypeContext(matches) {
+  if (!matches || matches.length === 0) return "";
+  const lines = ["", "## [타입 인덱스 조회 결과] (global_type_index — 1242 타입)",
+    "질문에서 PLC 타입명을 추출해 전 공장에서 해당 타입 변수 위치를 검색한 결과입니다.",
+    "답변 시 'ⓘ 출처: Signal Graph 자동 조회 (XML 기반 - 타입 인덱스)' 라벨을 붙이세요.",
+    ""];
+  for (var i = 0; i < matches.length; i++) {
+    const m = matches[i];
+    lines.push("### 타입: " + m.type + "  (전 공장 총 " + m.total + "개)");
+    const showN = Math.min(m.locations.length, 20);
+    for (var li = 0; li < showN; li++) {
+      const loc = m.locations[li];
+      lines.push("  - " + loc.block + " / " + loc.signal
+        + " (Section: " + loc.section + ")");
     }
-    const decoder = new TextDecoder("utf-8", { fatal: false });
-    return decoder.decode(byteNumbers);
+    if (m.total > showN) {
+      lines.push("  ... 외 " + (m.total - showN) + "개 (상위 " + showN + "개만 표시)");
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+// ──────────────────────────────────────────────────────────────────
+
+// ─── v21: WinCC 인덱스 조회 도구 — HMI Alarm + PLC Tag ────────────
+// HMI Alarm 9048개 (ID/text/class/trigger_tag/bit + by_trigger_tag 역인덱스 162태그)
+// PLC Tag 2020개 + 942 상수 (name/path/data_type/address/comment + by_address 역인덱스 2020개)
+// 조건부 로드 — 알람/태그 관련 키워드 있을 때만
+
+/** Drive에서 HMI Alarm 인덱스 매번 로드. 실패 시 null. */
+function loadAlarmIndex() {
+  try {
+    const file = DriveApp.getFileById(HMI_ALARM_INDEX_FILE_ID);
+    const text = file.getBlob().getDataAsString("utf-8");
+    return JSON.parse(text);
   } catch (e) {
-    console.warn("[base64ToUtf8Text] 디코딩 실패:", e.message);
-    return "";
-  }
-}
-
-// PDF에서 모든 페이지 텍스트 추출
-async function extractPdfText(pdf) {
-  const texts = [];
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
-    const textContent = await page.getTextContent();
-    const pageText = textContent.items.map(item => item.str).join(" ");
-    texts.push(pageText);
-  }
-  return texts.join("\n\n"); // 페이지 사이 빈 줄
-}
-
-// PDF의 특정 페이지를 base64 이미지로 변환 (1600px 기준)
-async function pdfPageToBase64(pdf, pageNum) {
-  const page = await pdf.getPage(pageNum);
-  const MAX_DIMENSION = 1600;
-
-  // 원본 viewport (scale 1)
-  const baseViewport = page.getViewport({ scale: 1 });
-  const longSide = Math.max(baseViewport.width, baseViewport.height);
-  // 1600px에 맞도록 스케일 계산
-  const scale = longSide > MAX_DIMENSION ? (MAX_DIMENSION / longSide) : 1;
-  const viewport = page.getViewport({ scale });
-
-  const canvas = document.createElement("canvas");
-  canvas.width = viewport.width;
-  canvas.height = viewport.height;
-  const ctx = canvas.getContext("2d");
-
-  await page.render({ canvasContext: ctx, viewport }).promise;
-
-  const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
-  return dataUrl.split(",")[1]; // base64 부분만
-}
-
-// ─── 트랙 1: PDF 출처 메타 보존 헬퍼 (v19) ─────────────────────────────────
-// pdf.js outline API로 PDF 목차 파싱 → 페이지별 챕터 매핑 (Dense)
-// 반환: { 1: "1. 개요", 2: "1. 개요", ..., 40: "2. 안전 인터록", 42: "2. 안전 인터록 > 2.1 도어 인터록", ... }
-// 목차 없거나 추출 실패 시 빈 객체 {} 반환 (Vision fallback으로 동작)
-async function extractPdfOutline(pdf) {
-  try {
-    const outline = await pdf.getOutline();
-    if (!outline || outline.length === 0) return {};
-
-    // 1단계: 모든 outline 항목을 평탄화 + 페이지 번호 추출
-    const entries = [];
-    const walk = async (items, depth, ancestors) => {
-      for (const item of items) {
-        let pageNum = null;
-        try {
-          if (item.dest) {
-            const dest = typeof item.dest === "string"
-              ? await pdf.getDestination(item.dest)
-              : item.dest;
-            if (dest && dest[0]) {
-              const ref = dest[0];
-              const idx = await pdf.getPageIndex(ref);
-              pageNum = idx + 1; // 1-based
-            }
-          }
-        } catch { /* 페이지 매핑 실패 — 이 항목 스킵 */ }
-
-        if (pageNum) {
-          entries.push({
-            pageNum,
-            depth,
-            title: (item.title || "").trim(),
-            ancestors: [...ancestors],
-          });
-        }
-        if (item.items && item.items.length > 0) {
-          await walk(item.items, depth + 1, [...ancestors, (item.title || "").trim()]);
-        }
-      }
-    };
-    await walk(outline, 0, []);
-
-    if (entries.length === 0) return {};
-
-    // 2단계: 페이지 순으로 정렬
-    entries.sort((a, b) => a.pageNum - b.pageNum);
-
-    // 3단계: Dense 매핑 — 1페이지부터 마지막 페이지까지 챕터 채우기
-    // - 챕터 깊이는 1단계+2단계까지 결합
-    // - 형식: "1단계 > 2단계" (둘 다 있을 때) 또는 "1단계" (1단계만)
-    const totalPages = pdf.numPages;
-    const mapping = {};
-
-    let currentL0 = ""; // 1단계 챕터
-    let currentL1 = ""; // 2단계 챕터
-    let entryIdx = 0;
-
-    for (let p = 1; p <= totalPages; p++) {
-      while (entryIdx < entries.length && entries[entryIdx].pageNum <= p) {
-        const e = entries[entryIdx];
-        if (e.depth === 0) {
-          currentL0 = e.title;
-          currentL1 = ""; // 1단계 바뀌면 2단계 초기화
-        } else if (e.depth === 1) {
-          currentL1 = e.title;
-        }
-        entryIdx++;
-      }
-
-      if (currentL0 && currentL1) {
-        mapping[p] = `${currentL0} > ${currentL1}`;
-      } else if (currentL0) {
-        mapping[p] = currentL0;
-      }
-    }
-
-    return mapping;
-  } catch (e) {
-    console.warn("[PDF 목차 파싱 실패]", e.message);
-    return {};
-  }
-}
-
-// Vision 응답 텍스트에서 [챕터/섹션] 블록 내용 추출
-// - 블록 없음 → 빈 문자열
-// - 블록 있고 "없음" / "해당 없음" / "N/A" 류 → 빈 문자열
-// - 블록 있고 내용 있음 → trim해서 반환
-function parseChapterFromAnalysis(text) {
-  if (!text) return "";
-  const match = text.match(/\[챕터\/섹션\]\s*\n?([^\n\[]*)/);
-  if (!match) return "";
-  const value = (match[1] || "").trim();
-  if (!value) return "";
-  const negativePatterns = /^(없음|해당\s*없음|N\/A|n\/a|null|undefined|-)$/i;
-  if (negativePatterns.test(value)) return "";
-  return value;
-}
-
-// sourceMeta 객체 빌더 — 4개 필드 명시적 생성
-function buildSourceMeta(file, page, section, url) {
-  return {
-    file: file || "",
-    page: page || "",
-    section: section || "",
-    url: url || "",
-  };
-}
-
-// 비용 계산 (PDF 처리)
-const PDF_COST = {
-  visionPerPage: 0.02,  // Vision API 페이지당 $0.02
-  textPerKToken: 0.003, // Claude 텍스트 input 1K token당 $0.003
-  outputPerKToken: 0.015,
-  usdToKrw: 1400,       // 어림 환율
-};
-
-// 텍스트 추출 비용 계산
-function calcTextExtractCost(pageCount) {
-  // 페이지당 약 500 토큰 가정 + 출력 500 토큰
-  const inputTokens = pageCount * 500;
-  const outputTokens = 500;
-  const usd = (inputTokens / 1000) * PDF_COST.textPerKToken
-            + (outputTokens / 1000) * PDF_COST.outputPerKToken;
-  const krw = Math.round(usd * PDF_COST.usdToKrw);
-  return { usd: Math.max(usd, 0.001), krw, label: `약 $${usd.toFixed(3)} (₩${krw.toLocaleString()})` };
-}
-
-// 그림 분석 비용 계산
-function calcVisionCost(pageCount) {
-  const usd = pageCount * PDF_COST.visionPerPage;
-  const krw = Math.round(usd * PDF_COST.usdToKrw);
-  return { usd, krw, label: `약 $${usd.toFixed(2)} (₩${krw.toLocaleString()})` };
-}
-
-// 처리 시간 예상
-function estimateTime(pageCount, mode) {
-  if (mode === "text") return Math.max(5, Math.round(pageCount * 0.3)) + "초";
-  // vision: 페이지당 약 5~6초
-  const seconds = pageCount * 5;
-  if (seconds < 60) return `약 ${seconds}초`;
-  return `약 ${Math.round(seconds / 60)}분`;
-}
-
-// ─── 청크 분할 헬퍼 (Step 7-10A) ────────────────────────────────────────────
-// 긴 학습 항목을 단락 경계로 분할하여 채팅 컨텍스트 점유와 시트 가독성 개선.
-// - 2,500자 초과 시 분할 (그 미만은 분할 안 함)
-// - 청크당 목표 2,000자, 단락 경계 우선
-// - content 앞에 (1/N) 형태 라벨 추가 → 자동 점검에서 같은 출처로 인식
-const CHUNK_THRESHOLD = 2500;
-const CHUNK_TARGET = 2000;
-
-function splitContentIntoChunks(content) {
-  if (!content || content.length <= CHUNK_THRESHOLD) return [content];
-
-  // 단락 경계 후보 (우선순위 높은 순): \n\n > \n > . / 。 / 다. > 공백
-  const chunks = [];
-  let remaining = content;
-
-  while (remaining.length > CHUNK_TARGET) {
-    let cut = CHUNK_TARGET;
-    // 목표 길이 근처에서 가장 가까운 경계 탐색 (목표 ±20% 범위)
-    const minCut = Math.floor(CHUNK_TARGET * 0.7);
-    const maxCut = Math.min(remaining.length, Math.floor(CHUNK_TARGET * 1.2));
-    const window = remaining.slice(minCut, maxCut);
-
-    // 단락 (\n\n) → 문장 (. ! ? 다.) → 줄바꿈 (\n) → 공백 → 마지막에 강제 컷
-    const breakPatterns = [
-      /\n\n/g,        // 단락 경계
-      /[\.!?]\s/g,    // 영문 문장
-      /다\.\s/g,      // 한글 문장
-      /\n/g,          // 줄바꿈
-      /\s\/\s/g,      // " / " 구분자 (이 앱에서 자주 씀)
-      /,\s/g,         // 컴마
-      /\s/g,          // 공백
-    ];
-
-    let breakAt = -1;
-    for (const pat of breakPatterns) {
-      const matches = [...window.matchAll(pat)];
-      if (matches.length > 0) {
-        // 가장 끝쪽 경계 사용 (chunk를 가능한 크게 유지)
-        breakAt = matches[matches.length - 1].index + matches[matches.length - 1][0].length;
-        break;
-      }
-    }
-
-    if (breakAt > 0) {
-      cut = minCut + breakAt;
-    }
-    // 경계 못 찾으면 강제 컷
-
-    chunks.push(remaining.slice(0, cut).trim());
-    remaining = remaining.slice(cut).trim();
-  }
-  if (remaining.length > 0) {
-    chunks.push(remaining);
-  }
-  return chunks;
-}
-
-// 청크 라벨 추가: 원본 prefix(예: "[외부학습 v12]") 다음에 "(1/3)" 삽입
-// prefix가 없으면 content 앞에 "(1/3) " 추가
-function applyChunkLabel(chunk, idx, total) {
-  if (total === 1) return chunk;
-  // 대괄호로 시작하는 prefix 패턴 ("[외부학습 v12] ..." 또는 "[파일: xxx] ...")
-  const prefixMatch = chunk.match(/^(\[[^\]]+\])\s*/);
-  if (prefixMatch) {
-    return `${prefixMatch[1]} (${idx + 1}/${total}) ${chunk.slice(prefixMatch[0].length)}`;
-  }
-  return `(${idx + 1}/${total}) ${chunk}`;
-}
-
-async function saveToSheet(role, category, content, sourceMeta) {
-  // 청크 분할 적용 (긴 항목은 자동 다중 행 저장)
-  // v19: sourceMeta가 있으면 모든 청크에 동일하게 전달 (같은 출처 보존)
-  const chunks = splitContentIntoChunks(content);
-  if (chunks.length === 1) {
-    return saveToSheetSingle(role, category, content, sourceMeta);
-  }
-  // 다중 청크 저장 — 직렬 처리 (Apps Script 일괄 호출 회피)
-  let ok = true;
-  for (let i = 0; i < chunks.length; i++) {
-    const labeled = applyChunkLabel(chunks[i], i, chunks.length);
-    const r = await saveToSheetSingle(role, category, labeled, sourceMeta);
-    if (!r) ok = false;
-  }
-  return ok;
-}
-
-async function saveToSheetSingle(role, category, content, sourceMeta) {
-  // v19: sourceMeta는 선택적 (Apps Script v9가 없으면 빈 칸으로 처리, 하위 호환)
-  const payload = { role, category, content };
-  if (sourceMeta) payload.sourceMeta = sourceMeta;
-  const ok = await api.call("save_knowledge", payload);
-  if (ok) invalidateCache(role); // Step 7-12: 쓰기 후 캐시 무효화
-  return ok;
-}
-
-// ─── 캐시 시스템 (Step 7-12) ────────────────────────────────────────────
-// loadFromSheet 결과를 React 메모리 + localStorage에 캐싱
-// - TTL 10분: 그 안에는 fresh fetch 안 함
-// - 쓰기 작업(save/delete/replace) 시 즉시 무효화
-// - 첫 진입 시 캐시 있으면 즉시 표시 + 백그라운드에서 신선한 데이터 fetch
-// 효과: 채팅 시 매번 호출되는 loadFromSheet의 API 호출 95%+ 감소
-const KNOWLEDGE_CACHE_TTL_MS = 10 * 60 * 1000; // 10분
-const KNOWLEDGE_CACHE_PREFIX = "kb_cache_v1_";
-
-// 메모리 캐시 (세션 내 빠른 접근)
-const _memoryCache = {};
-
-// localStorage 키 빌더
-function cacheKey(role) { return `${KNOWLEDGE_CACHE_PREFIX}${role}`; }
-
-// 캐시 읽기 — TTL 검사 포함
-function readCache(role) {
-  // 메모리 캐시 먼저
-  if (_memoryCache[role]) {
-    const entry = _memoryCache[role];
-    if (Date.now() - entry.ts < KNOWLEDGE_CACHE_TTL_MS) {
-      return { data: entry.data, fresh: false };
-    }
-  }
-  // localStorage fallback
-  try {
-    const raw = localStorage.getItem(cacheKey(role));
-    if (!raw) return null;
-    const entry = JSON.parse(raw);
-    if (Date.now() - entry.ts < KNOWLEDGE_CACHE_TTL_MS) {
-      _memoryCache[role] = entry; // 메모리에도 동기화
-      return { data: entry.data, fresh: false };
-    }
-  } catch {}
-  return null;
-}
-
-// 캐시 쓰기 — 메모리 + localStorage 동기
-function writeCache(role, data) {
-  const entry = { ts: Date.now(), data };
-  _memoryCache[role] = entry;
-  try {
-    localStorage.setItem(cacheKey(role), JSON.stringify(entry));
-  } catch (e) {
-    // localStorage 가득 차거나 차단된 경우 - 메모리만 사용
-    console.warn("[캐시] localStorage 쓰기 실패:", e.message);
-  }
-}
-
-// 캐시 무효화 — 특정 role
-function invalidateCache(role) {
-  delete _memoryCache[role];
-  try { localStorage.removeItem(cacheKey(role)); } catch {}
-}
-
-// 신선한 데이터 직접 가져오기 (캐시 우회)
-async function fetchKnowledgeFromSheet(role) {
-  const r = await api.get("get_knowledge", { role });
-  return r.ok ? r.data : [];
-}
-
-// loadFromSheet — 캐시 우선 (Step 7-12)
-// 캐시 있고 신선하면 그대로 반환, 없거나 stale이면 API 호출
-async function loadFromSheet(role) {
-  const cached = readCache(role);
-  if (cached) {
-    return cached.data;
-  }
-  const fresh = await fetchKnowledgeFromSheet(role);
-  if (fresh.length > 0) writeCache(role, fresh);
-  return fresh;
-}
-
-// loadFromSheet의 강제 fresh 버전 — 명시적 새로고침 시 사용
-async function loadFromSheetFresh(role) {
-  const fresh = await fetchKnowledgeFromSheet(role);
-  if (fresh.length > 0) writeCache(role, fresh);
-  return fresh;
-}
-
-// 대시보드 - 전체 8개 에이전트 진행률 로드
-async function loadAllProgress() {
-  const r = await api.get("get_all_progress");
-  return r.ok ? r.data : [];
-}
-
-// 요약본 로드 (없으면 null)
-async function loadSummary(role) {
-  const r = await api.get("get_summary", { role });
-  return r.ok ? r.data : null;
-}
-
-// 요약본 저장 (기존 _요약 행 삭제 후 새로 1건 저장)
-async function saveSummaryToSheet(role, summary) {
-  return await api.call("save_summary", { role, summary });
-}
-
-// 마지막 요약 이후 추가된 row 수 (요약 갱신 트리거 판단용)
-async function loadSummaryCount(role) {
-  const r = await api.get("count_since_summary", { role });
-  return r.ok ? r.data : { count: 0, hasSummary: false };
-}
-
-// 특정 카테고리의 항목들만 로드 (자동 충돌 검사용)
-async function loadCategoryItems(role, category) {
-  const r = await api.get("get_category_items", { role, category });
-  return r.ok ? r.data : [];
-}
-
-// 기존 row 교체 (신규로 교체 옵션)
-async function replaceKnowledge(role, category, oldContent, newContent) {
-  const ok = await api.call("replace_knowledge", { role, category, oldContent, newContent });
-  if (ok) invalidateCache(role); // Step 7-12
-  return ok;
-}
-
-// 특정 row 삭제
-async function deleteKnowledge(role, category, content) {
-  const ok = await api.call("delete_knowledge", { role, category, content });
-  if (ok) invalidateCache(role); // Step 7-12
-  return ok;
-}
-
-// 불량 사진 누적 카운트 + 패턴 존재 여부
-async function loadDefectImageCount(role) {
-  const r = await api.get("count_defect_images", { role });
-  return r.ok ? r.data : { count: 0, hasPattern: false };
-}
-
-// 불량 사진 학습 데이터 모두 로드 (패턴 추출 시 사용)
-async function loadDefectImageData(role) {
-  const r = await api.get("get_defect_image_data", { role });
-  return r.ok ? r.data : [];
-}
-
-// 불량 패턴 저장 (category="_불량패턴", 항상 1건만 유지)
-async function saveDefectPattern(role, pattern) {
-  return await api.call("save_defect_pattern", { role, pattern });
-}
-
-// ─── 학습자료 폴더 동기화 (Step 5-C) ──────────────────────────────────────────
-
-// 학습자료 폴더 스캔 (특정 role + _공통)
-// 반환: { roleFiles: [...], commonFiles: [...] }
-async function scanLearningFolder(role) {
-  const r = await api.get("scan_learning_folder", { role });
-  return r.ok ? r.data : { roleFiles: [], commonFiles: [] };
-}
-
-// 재학습용 폴더 스캔 (Processed_Files 필터링 없이 전체)
-// scan_learning_folder는 이미 처리된 파일을 제외하지만,
-// 재학습은 정작 그 파일들이 필요하므로 _all 액션 사용
-// 응답 shape이 다름 — Apps Script가 data 래핑 없이 roleFiles/commonFiles 직접 반환
-// (api.get은 data.data가 없으면 전체 JSON을 data로 노출하므로 r.data.roleFiles 접근 가능)
-async function scanLearningFolderAll(role) {
-  const r = await api.get("scan_learning_folder_all", { role });
-  if (r.ok) {
-    return { roleFiles: r.data.roleFiles || [], commonFiles: r.data.commonFiles || [] };
-  }
-  console.error("[재학습] 폴더 스캔 실패:", r.error);
-  return { roleFiles: [], commonFiles: [] };
-}
-
-// 드라이브에서 파일 내용(base64) 가져오기
-// 호출처 시그니처 보존을 위해 { success, data, error } 형태로 변환
-async function fetchDriveFile(fileId) {
-  const r = await api.get("get_drive_file", { fileId });
-  return r.ok
-    ? { success: true, data: r.data }
-    : { success: false, error: r.error };
-}
-
-// 파일 처리 완료로 마크
-async function markFileProcessed(role, fileId, filename) {
-  return await api.call("mark_file_processed", { role, fileId, filename });
-}
-
-// v21: 여러 fileId를 한번에 processed 표시 (PPT → PDF 변환 시 두 ID 모두 표시용)
-//   - entries: [{ fileId, filename }, ...]
-//   - markFileProcessed를 순차 호출 (Apps Script 호출 부담 최소화 + 직렬 안전성)
-async function markFileProcessedMany(role, entries) {
-  if (!entries || entries.length === 0) return true;
-  let allOk = true;
-  for (const entry of entries) {
-    if (!entry || !entry.fileId) continue;
-    const ok = await markFileProcessed(role, entry.fileId, entry.filename || "");
-    if (!ok) allOk = false;
-  }
-  return allOk;
-}
-
-// 공통 학습 데이터 저장 (Common_Knowledge 시트)
-// v19: sourceMeta 인자 추가 (saveToSheetSingle과 동일 패턴, 하위 호환)
-async function saveCommonKnowledge(category, content, sourceMeta) {
-  const payload = { category, content };
-  if (sourceMeta) payload.sourceMeta = sourceMeta;
-  return await api.call("save_common_knowledge", payload);
-}
-
-// 공통 학습 데이터 조회
-async function loadCommonKnowledge() {
-  const r = await api.get("get_common_knowledge");
-  return r.ok ? r.data : [];
-}
-
-// 이미지를 드라이브에 업로드 (Apps Script 직접 호출)
-// CORS 모드 — 응답 필요 (url/fileId/filename 반환)
-// 응답: { url, fileId, filename } 또는 null
-async function uploadImageToDrive(role, filename, base64, mimetype) {
-  const r = await api.call("upload_image", { role, filename, base64, mimetype }, { needResponse: true });
-  if (!r.ok) {
-    console.error("드라이브 업로드 실패:", r.error);
+    Logger.log("[loadAlarmIndex] 로드 실패: " + e.message);
     return null;
   }
-  return r.data; // { url, fileId, filename }
 }
 
-// 신규 항목 vs 기존 항목들 AI 충돌 검사 (v24 강화)
-// 반환: null (충돌 없음) | { conflictWith: {category, content}, type: "duplicate"|"conflict", reason: string }
-//
-// v24 변경:
-//   (A) source_file 기준 같은 원본 row끼리는 충돌 검사 제외 (페이지별 row false positive 방지)
-//   (B) 비교 대상 최근 20건 → 50건 확대
-//   (C) 수치/날짜 차이 강조 (프롬프트 명시)
-//   (D) 카테고리 교차 검사 (같은 카테고리 + 다른 카테고리도 비교 대상)
-//
-// 인자:
-//   - role: 에이전트 키 (예: Cell_PE)
-//   - category: 신규 항목 카테고리
-//   - newContent: 신규 항목 content
-//   - newSourceFile: (선택) 신규 항목의 source_file (false positive 제외용)
-async function checkConflict(role, category, newContent, newSourceFile) {
-  // v24-D: 카테고리 교차 검사 — 전체 knowledge 로드 후 모든 카테고리 비교
-  //   기존 v23: 같은 카테고리만 로드 → 다른 카테고리 충돌 누락
-  //   v24: loadFromSheet (전체 knowledge) → 같은 카테고리 + 다른 카테고리 모두 비교
-  const allKnowledge = await loadFromSheet(role);
-  if (!allKnowledge || allKnowledge.length === 0) return null;
-
-  // v24-A: source_file 기준 같은 원본 row 제외 (페이지별 row false positive 방지)
-  //   - 같은 PDF의 페이지 1과 페이지 2는 다른 내용이지만 같은 원본 → 충돌 아님
-  //   - newSourceFile이 있으면 그 파일과 같은 source_file의 row는 비교 대상에서 제외
-  let candidates = allKnowledge;
-  if (newSourceFile && newSourceFile.trim().length > 0) {
-    candidates = allKnowledge.filter(it => {
-      // source_file 메타가 같으면 같은 원본 → 제외
-      if (it.source_file && it.source_file === newSourceFile) return false;
-      // 메타 없을 때는 content의 [파일: ...] 태그 비교 (백워드 호환)
-      const tagMatch = (it.content || "").match(/\[파일:\s*([^\]]+?)\]/);
-      if (tagMatch && tagMatch[1].trim() === newSourceFile) return false;
-      return true;
-    });
-  }
-
-  if (candidates.length === 0) return null;
-
-  // v24-B: 비교 대상 50건으로 확대 (v23: 20건)
-  //   - 같은 카테고리 우선 + 다른 카테고리 채우기
-  const sameCategoryItems = candidates.filter(it => it.category === category);
-  const otherCategoryItems = candidates.filter(it => it.category !== category);
-  const targets = [
-    ...sameCategoryItems.slice(-30),  // 같은 카테고리 최근 30건
-    ...otherCategoryItems.slice(-20), // 다른 카테고리 최근 20건 (v24-D)
-  ];
-  if (targets.length === 0) return null;
-
-  const targetsText = targets
-    .map((it, i) => `${i + 1}. [${it.category}] ${it.content}`)
-    .join("\n");
-
-  // v24-C: 수치/날짜 차이 강조 + (D) 카테고리 교차 명시
-  const sys = `당신은 학습 데이터 검증자입니다. 신규 항목이 기존 데이터와 중복되거나 충돌하는지 판단하세요.
-
-[기존 항목들 — 같은/다른 카테고리 혼합]
-${targetsText}
-
-[신규 항목]
-[${category}] ${newContent}
-
-[판단 기준]
-- duplicate: 기존 항목 중 하나와 같은 의미 (표현만 다름)
-- conflict: 기존 항목 중 하나와 같은 주제이지만 내용이 다름
-   ★ 특히 정량 데이터(수치·날짜·치수·시간·횟수 등)가 다르면 강한 충돌로 판단
-   ★ 카테고리가 달라도 같은 사실에 대해 모순되면 충돌로 판단
-- none: 충돌 없음 (다른 주제이거나 보완 정보)
-
-JSON으로만 답하세요. 다른 설명 없이.
-
-응답 형식:
-{"type":"duplicate"|"conflict"|"none","matchIndex":1~${targets.length}|null,"reason":"한 줄 사유"}`;
-
+/** Drive에서 PLC Tag 인덱스 매번 로드. 실패 시 null. */
+function loadPlcTagIndex() {
   try {
-    const raw = await callClaude(sys, "판단 결과만 JSON으로 답하세요.");
-    const parsed = safeJSON(raw);
-
-    if (parsed.type === "none") return null;
-    if (!parsed.matchIndex || parsed.matchIndex < 1 || parsed.matchIndex > targets.length) return null;
-
-    return {
-      type: parsed.type,
-      conflictWith: targets[parsed.matchIndex - 1],
-      reason: parsed.reason || "",
-    };
-  } catch {
-    return null; // 검사 실패 시 충돌 없는 것으로 처리 (저장 막지 않음)
-  }
-}
-
-// JSON 파싱
-function safeJSON(raw) {
-  const cleaned = (raw || "").replace(/```json|```/gi, "").trim();
-  const s = cleaned.indexOf("{"), e = cleaned.lastIndexOf("}");
-  if (s === -1 || e === -1) {
-    // 진짜 원인을 알 수 있도록 raw 응답을 에러 메시지에 포함
-    const preview = (cleaned || "").slice(0, 200) || "(빈 응답)";
-    throw new Error(`AI가 JSON 형식으로 답하지 않았습니다. 응답: ${preview}`);
-  }
-  try {
-    return JSON.parse(cleaned.slice(s, e + 1));
-  } catch (parseErr) {
-    throw new Error(`JSON 파싱 실패: ${parseErr.message}`);
-  }
-}
-
-// ─── 빈약 자동학습 항목 감지 (v24 전면 개선) ──────────────────────────────
-// v24 변경:
-//   - 파일 형식 인식 확장: pdf|png|jpg|jpeg + pptx|ppt|xlsx|xls|csv|txt|md (v22/v23 신규 형식 반영)
-//   - v19 페이지별 row 구조 반영: 메타 row 개념 폐기. 각 row가 독립 학습 단위 → row 단위 판정
-//   - 분석 실패 row 자동 감지: "(분석 실패: ...)", "(이미지 없음)" 등
-//   - 빈약 기준 단순화: 짧음 + 의미 있는 내용 부족
-//
-// 학습앱이 만든 row 식별 (v19 이후):
-//   - [자동학습-...] : 폴더 동기화 자동학습
-//   - [파일: xxx.{pdf|png|jpg|jpeg|pptx|ppt|xlsx|xls|csv|txt|md}] : 직접 업로드
-//
-// 빈약 신호 (하나라도 해당하면 빈약):
-//   (1) 분석 실패 텍스트 포함 ("분석 실패", "(이미지 없음)", "(빈 응답)")
-//   (2) 분량 < 300자 (페이지별/청크별 row이므로 v23 이전 500자보다 낮춤)
-//   (3) [추출 텍스트] 블록 내용이 매우 짧음 (50자 미만)
-//   (4) v10 이전 옛 프롬프트 표지 ([시각 설명] 블록 존재)
-function isWeakAutoItem(content) {
-  if (!content) return false;
-
-  // 학습앱이 만든 row만 대상 (v24 확장)
-  const isLearningAppRow =
-    /^\[자동학습-/i.test(content) ||
-    /^\[파일:\s*[^\]]+\.(?:pdf|png|jpg|jpeg|pptx|ppt|xlsx|xls|csv|txt|md)\s*\]/i.test(content);
-  if (!isLearningAppRow) return false;
-
-  // 신호 1: 분석 실패 텍스트 (가장 신뢰)
-  // - PDF Vision: "(분석 실패: ...)" / Claude 호출 실패: "(빈 응답)" / 빈 이미지: "(이미지 없음)"
-  if (/\(분석 실패/.test(content)) return true;
-  if (/\(이미지 없음\)/.test(content)) return true;
-  if (/\(빈 응답\)/.test(content)) return true;
-
-  // 신호 2: v10 이전 옛 프롬프트 표지 (있으면 재학습 권장)
-  if (/\[시각 설명\]/.test(content)) return true;
-
-  // 신호 3: 분량 매우 적음
-  // 페이지별 row 구조 반영하여 300자로 낮춤 (v23 이전 500자에서 조정)
-  if (content.length < 300) return true;
-
-  // 신호 4: [추출 텍스트] 블록 내용이 거의 없음
-  // 4블록 형식 row에서 추출 텍스트 부분이 비어있거나 매우 짧으면 학습 가치 낮음
-  const extractMatch = content.match(/\[추출 텍스트\]\s*\n?([\s\S]*?)(?:\n\[(?:핵심 정보|메타데이터|챕터\/섹션|추천 카테고리)\]|$)/);
-  if (extractMatch) {
-    const extractText = (extractMatch[1] || "").trim();
-    // 50자 미만 + "(분석 실패..." 같은 단서까지 포함하면 매우 짧음
-    if (extractText.length < 50) return true;
-  }
-
-  return false;
-}
-
-// ─── 일관성 자동 점검 (Step 7-4) ────────────────────────────────────────────
-// 신규 항목 1개를 기존 knowledge와 비교해 중복/충돌을 찾음.
-// - 같은 카테고리 + 다른 카테고리 모두 검사 (교차 검사)
-// - 비교 대상은 최근 50건으로 제한 (토큰 절약)
-// - 발견된 충돌 배열 반환 (없으면 빈 배열)
-async function checkConsistencyForItem(newItem, existingKnowledge) {
-  if (!newItem || !newItem.content || existingKnowledge.length === 0) return [];
-
-  // 같은 출처(prefix) 청크끼리는 비교 대상에서 제외
-  // - 청크 분할 시 (1/3), (2/3), (3/3) 형태로 같은 원본에서 나옴 → 충돌로 잘못 잡힘 방지
-  // - prefix 추출 패턴: "[xxx] (N/M)" 또는 "[xxx]"의 첫 대괄호
-  const extractSourcePrefix = (content) => {
-    if (!content) return null;
-    const m = content.match(/^(\[[^\]]+\])/);
-    return m ? m[1] : null;
-  };
-  const newPrefix = extractSourcePrefix(newItem.content);
-
-  // 비교 대상 추출 (자기 자신 제외, 같은 출처 prefix 제외, 최근 50건)
-  const candidates = existingKnowledge
-    .filter(k => {
-      if (!k.content || k.content === newItem.content) return false;
-      if (newPrefix) {
-        const candPrefix = extractSourcePrefix(k.content);
-        if (candPrefix === newPrefix) return false; // 같은 출처 → 제외
-      }
-      return true;
-    })
-    .slice(-50);
-  if (candidates.length === 0) return [];
-
-  const candidatesText = candidates
-    .map((it, i) => `${i + 1}. [${it.category}] ${it.content}`)
-    .join("\n");
-
-  const sys = `당신은 학습 데이터 일관성 검증자입니다. 새로 추가된 항목이 기존 항목들과 중복되거나 충돌하는지 검사하세요.
-
-[새 항목]
-[${newItem.category}] ${newItem.content}
-
-[기존 항목들]
-${candidatesText}
-
-[판단 기준]
-- duplicate: 같은 의미를 다른 표현으로 작성한 경우
-- conflict: 같은 주제이지만 수치/절차/기준이 다른 경우
-- 카테고리가 달라도 내용이 모순되면 충돌로 판단
-
-JSON으로만 답하세요. 발견 없으면 빈 배열.
-
-응답 형식:
-{"matches":[{"existing":3,"type":"duplicate|conflict","reason":"한 줄 사유"}]}`;
-
-  try {
-    const raw = await callClaude(sys, "검사 결과를 JSON으로 답하세요.");
-    const parsed = safeJSON(raw);
-    if (!parsed.matches || !Array.isArray(parsed.matches)) return [];
-
-    const findings = [];
-    for (const m of parsed.matches) {
-      const idx = m.existing - 1;
-      if (idx < 0 || idx >= candidates.length) continue;
-      findings.push({
-        category: newItem.category,
-        itemA: { category: newItem.category, content: newItem.content, updated_at: newItem.updated_at },
-        itemB: candidates[idx],
-        type: m.type === "duplicate" ? "duplicate" : "conflict",
-        reason: m.reason || "",
-        detectedAt: new Date().toISOString(),
-        resolved: false,
-      });
-    }
-    return findings;
+    const file = DriveApp.getFileById(PLC_TAG_INDEX_FILE_ID);
+    const text = file.getBlob().getDataAsString("utf-8");
+    return JSON.parse(text);
   } catch (e) {
-    console.warn("[checkConsistency] 검사 실패:", e.message);
-    return [];
+    Logger.log("[loadPlcTagIndex] 로드 실패: " + e.message);
+    return null;
   }
 }
 
-// ─── 학습 수준 계산 ───────────────────────────────────────────────────────────
-function calcProgress(knowledge) {
-  const categories = ["공장정보", "업무역할", "판단기준", "협업방식", "교정사례"];
-  const result = {};
-  let total = 0;
-  categories.forEach(cat => {
-    const items = knowledge.filter(k => k.category === cat);
-    const score = cat === "교정사례"
-      ? Math.min(100, items.length * 10)
-      : items.length > 0 ? Math.min(100, items[0]?.content?.length / 2) : 0;
-    result[cat] = Math.round(score);
-    total += result[cat];
+/** 질문에서 알람 ID 후보 추출 (1000~99999 범위 숫자 — 너무 작은 건 노이즈). */
+function extractAlarmIdCandidates(question) {
+  const q = String(question || "");
+  const set = {};
+  // 4~5자리 숫자 (알람 ID 범위)
+  (q.match(/\b\d{4,5}\b/g) || []).forEach(function(n) {
+    const num = parseInt(n, 10);
+    if (num >= 1000 && num <= 99999) set[n] = true;
   });
-  result["전체"] = Math.round(total / categories.length);
+  return Object.keys(set);
+}
+
+/** 질문에서 PLC 주소·trigger_tag 후보 추출 (%I0.1, 500_Alarm_AlarmLWord[95] 등). */
+function extractPlcAddressCandidates(question) {
+  const q = String(question || "");
+  const set = {};
+  // PLC 주소: %I0.1, %Q10.0, %M500.0, %DB10.DBX0.0 등
+  (q.match(/%[IQMDB][BWDLX]?\d+(?:\.\d+)*/gi) || []).forEach(function(s) { set[s] = true; });
+  // 인덱싱된 trigger_tag: 500_Alarm_AlarmLWord[95], Etc.FDC.Excute 등 (숫자/문자 모두 시작 가능)
+  (q.match(/\b\w[\w_]*(?:\.[\w_ ]+)*\[\d+\]/g) || []).forEach(function(s) { set[s] = true; });
+  return Object.keys(set);
+}
+
+/** 알람 인덱스 검색 — ID 매칭 + trigger_tag 역추적 + 텍스트 키워드 검색. */
+function searchAlarmIndex(question, alarmIdx) {
+  if (!alarmIdx) return { byId: [], byTrigger: [], byText: [] };
+  const idCands = extractAlarmIdCandidates(question);
+  const triggerCands = extractPlcAddressCandidates(question);
+  // 텍스트 키워드 — CamelCase 단어들 (Cylinder, Magazine 등)
+  const textCands = (question.match(/\b[A-Z][a-zA-Z]{4,}\b/g) || [])
+    .filter(function(w) {
+      const lw = w.toLowerCase();
+      return lw !== "alarm" && lw !== "warning" && lw !== "error";
+    });
+
+  const result = { byId: [], byTrigger: [], byText: [] };
+  const byId = alarmIdx.by_id || {};
+  const byTrigger = alarmIdx.by_trigger_tag || {};
+
+  // 1) ID 매칭 (정확)
+  for (var i = 0; i < idCands.length && result.byId.length < 5; i++) {
+    if (byId[idCands[i]]) {
+      result.byId.push({ id: idCands[i], data: byId[idCands[i]] });
+    }
+  }
+
+  // 2) Trigger tag 역추적
+  for (var i = 0; i < triggerCands.length && result.byTrigger.length < 3; i++) {
+    const cand = triggerCands[i];
+    if (byTrigger[cand]) {
+      const ids = byTrigger[cand];
+      // 상위 10개 알람의 상세 + 전체 개수
+      const sample = ids.slice(0, 10).map(function(aid) {
+        return { id: aid, data: byId[aid] || {} };
+      });
+      result.byTrigger.push({ trigger: cand, total: ids.length, samples: sample });
+    }
+  }
+
+  // 3) 텍스트 키워드 검색 (각 후보당 매칭 알람 카운트만 + 상위 5개)
+  // 부담 큰 작업이라 키워드 1개당 최대 3개 매칭, 후보 2개까지만
+  if (textCands.length > 0 && result.byId.length === 0 && result.byTrigger.length === 0) {
+    const keys = Object.keys(byId);
+    for (var ti = 0; ti < Math.min(textCands.length, 2); ti++) {
+      const kw = textCands[ti].toLowerCase();
+      var matched = 0;
+      const samples = [];
+      for (var ki = 0; ki < keys.length; ki++) {
+        const a = byId[keys[ki]];
+        if (a.text && a.text.toLowerCase().indexOf(kw) >= 0) {
+          matched++;
+          if (samples.length < 5) samples.push({ id: keys[ki], data: a });
+        }
+      }
+      if (matched > 0) result.byText.push({ keyword: textCands[ti], total: matched, samples: samples });
+    }
+  }
   return result;
 }
 
-// 대시보드 - 5개 지표를 0-100 점수로 정규화 (절대평가)
-// 각 지표별 목표값(TARGET_VALUES) 대비 현재값의 비율, 100점 상한
-// v31: freshness 가중치 0.5배 (균등 20% → 10%) — 단발성 학습으로 부풀림 방지 (옵션 B)
-//      4개 지표 각 22.2% + freshness 11.1% = 합 100%
-//      효과: 누적 페르소나 부당한 깎임 해소 + 신규 페르소나 부풀림 완화
-function calcDashboardScore(agent) {
-  const cap = (val, target) => Math.min(100, Math.round((val / target) * 100));
-
-  const itemScore = cap(agent.itemCount || 0, TARGET_VALUES.itemCount);
-  const contentScore = cap(agent.contentLength || 0, TARGET_VALUES.contentLength);
-  const categoryScore = cap(agent.categoryCount || 0, TARGET_VALUES.categoryCount);
-  const correctionScore = cap(agent.correctionCount || 0, TARGET_VALUES.correctionCount);
-  const freshnessScore = cap(agent.recentRate || 0, TARGET_VALUES.recentRate);
-
-  // v31: freshness만 0.5배 가중치 (분모 4.5)
-  const totalScore = Math.round(
-    (itemScore + contentScore + categoryScore + correctionScore + freshnessScore * 0.5) / 4.5
-  );
-  return { itemScore, contentScore, categoryScore, correctionScore, freshnessScore, totalScore };
-}
-
-const SCORE_COLOR = (score) => {
-  if (score >= 80) return "#34d399";
-  if (score >= 60) return "#fbbf24";
-  if (score >= 40) return "#f97316";
-  return "#ef4444";
-};
-
-const SCORE_LABEL = (score) => {
-  if (score >= 80) return "우수";
-  if (score >= 60) return "양호";
-  if (score >= 40) return "보통";
-  return "부족";
-};
-
-// ─── 공통 컴포넌트 ────────────────────────────────────────────────────────────
-function Spinner() {
-  return <span style={{
-    display:"inline-block", width:12, height:12,
-    border:"2px solid rgba(255,255,255,0.2)",
-    borderTop:"2px solid currentColor", borderRadius:"50%",
-    animation:"spin 0.7s linear infinite",
-  }}/>;
-}
-
-// ─── 중복/충돌 다이얼로그 (Step 3) ─────────────────────────────────────────────
-// 신규 저장 시 기존 데이터와 충돌하는 경우 사용자에게 선택지 제공
-function ConflictDialog({ role, category, newContent, conflict, onResolve, onCancel }) {
-  const [editedContent, setEditedContent] = useState(newContent);
-  const [editing, setEditing] = useState(false);
-  const [processing, setProcessing] = useState(false);
-
-  const handle = async (choice) => {
-    setProcessing(true);
-    try {
-      if (choice === "keep_old") {
-        // 기존 유지: 신규는 저장 안 함
-        await onResolve("keep_old", null);
-      } else if (choice === "replace") {
-        // 신규로 교체: 기존 row를 신규 content로 교체
-        await replaceKnowledge(role, category, conflict.conflictWith.content, newContent);
-        await onResolve("replace", null);
-      } else if (choice === "keep_both") {
-        // 둘 다 저장: 신규를 그대로 추가
-        await saveToSheet(role, category, newContent);
-        await onResolve("keep_both", null);
-      } else if (choice === "edit") {
-        // 수정 후 저장: editedContent로 새로 저장
-        if (!editedContent.trim()) {
-          alert("내용을 입력해주세요");
-          setProcessing(false);
-          return;
-        }
-        await saveToSheet(role, category, editedContent);
-        await onResolve("edit", editedContent);
-      } else if (choice === "skip") {
-        // 건너뛰기: 아무것도 저장 안 함
-        await onResolve("skip", null);
-      }
-    } catch (e) {
-      alert("처리 실패: " + e.message);
-    } finally {
-      setProcessing(false);
-    }
-  };
-
-  const typeLabel = conflict.type === "duplicate" ? "중복" : "충돌";
-  const typeColor = conflict.type === "duplicate" ? "#a78bfa" : "#f59e0b";
-
-  return (
-    <div style={{
-      position:"fixed", top:0, left:0, right:0, bottom:0,
-      background:"rgba(0,0,0,0.7)", backdropFilter:"blur(4px)",
-      display:"flex", alignItems:"center", justifyContent:"center",
-      zIndex:1000, padding:"16px", animation:"fadeUp 0.2s ease both",
-    }}>
-      <div style={{
-        background:"#0f172a", border:`1.5px solid ${typeColor}40`,
-        borderRadius:14, padding:"20px", maxWidth:540, width:"100%",
-        maxHeight:"90vh", overflowY:"auto",
-      }}>
-        <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:14 }}>
-          <span style={{
-            background:`${typeColor}20`, color:typeColor,
-            padding:"3px 10px", borderRadius:5, fontSize:11, fontWeight:800,
-          }}>⚠️ {typeLabel} 감지</span>
-          <span style={{ fontSize:11, color:"#64748b" }}>{category}</span>
-        </div>
-
-        <div style={{ fontSize:12, color:"#94a3b8", marginBottom:14, lineHeight:1.6 }}>
-          {conflict.reason || "기존 학습 내용과 중복되거나 충돌됩니다"}
-        </div>
-
-        {/* 기존 내용 */}
-        <div style={{ marginBottom:10 }}>
-          <div style={{ fontSize:10, color:"#64748b", fontWeight:700, marginBottom:5 }}>📂 기존 내용</div>
-          <div style={{
-            background:"rgba(15,23,42,0.6)", border:"1px solid rgba(51,65,85,0.4)",
-            borderRadius:7, padding:"10px 12px", fontSize:12, color:"#cbd5e1",
-            lineHeight:1.6, whiteSpace:"pre-wrap",
-          }}>{conflict.conflictWith.content}</div>
-        </div>
-
-        {/* 신규 내용 (수정 모드면 textarea, 아니면 표시) */}
-        <div style={{ marginBottom:18 }}>
-          <div style={{ fontSize:10, color:"#64748b", fontWeight:700, marginBottom:5 }}>✨ 신규 내용</div>
-          {editing ? (
-            <textarea value={editedContent} onChange={e => setEditedContent(e.target.value)}
-              rows={4} style={{
-                width:"100%", background:"rgba(15,23,42,0.8)",
-                border:`1.5px solid ${typeColor}50`, borderRadius:7,
-                color:"#dde4f0", padding:"10px 12px", fontSize:12,
-                outline:"none", resize:"vertical", lineHeight:1.6,
-                boxSizing:"border-box", fontFamily:"inherit",
-              }}/>
-          ) : (
-            <div style={{
-              background:`${typeColor}08`, border:`1px solid ${typeColor}30`,
-              borderRadius:7, padding:"10px 12px", fontSize:12, color:"#dde4f0",
-              lineHeight:1.6, whiteSpace:"pre-wrap",
-            }}>{editedContent}</div>
-          )}
-        </div>
-
-        {/* 처리 버튼 5개 */}
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:6, marginBottom:6 }}>
-          <button onClick={() => handle("keep_old")} disabled={processing} style={btnStyle("#94a3b8")}>
-            📂 기존 유지
-          </button>
-          <button onClick={() => handle("replace")} disabled={processing} style={btnStyle("#34d399")}>
-            ✨ 신규로 교체
-          </button>
-          <button onClick={() => handle("keep_both")} disabled={processing} style={btnStyle("#a78bfa")}>
-            ➕ 둘 다 저장
-          </button>
-          {!editing ? (
-            <button onClick={() => setEditing(true)} disabled={processing} style={btnStyle("#fbbf24")}>
-              ✏️ 수정하기
-            </button>
-          ) : (
-            <button onClick={() => handle("edit")} disabled={processing} style={btnStyle("#fbbf24")}>
-              💾 수정 저장
-            </button>
-          )}
-        </div>
-        <button onClick={() => handle("skip")} disabled={processing} style={{
-          ...btnStyle("#64748b"), width:"100%",
-        }}>
-          ⏭ 건너뛰기 (저장 안 함)
-        </button>
-
-        {processing && (
-          <div style={{ marginTop:10, textAlign:"center", color:"#94a3b8", fontSize:11 }}>
-            <Spinner/> 처리 중...
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function btnStyle(color) {
-  return {
-    padding:"9px 12px",
-    background:`${color}15`,
-    border:`1px solid ${color}40`,
-    borderRadius:7, color: color,
-    fontSize:12, fontWeight:700, cursor:"pointer",
-  };
-}
-
-function smallBtnStyle(color) {
-  return {
-    padding:"6px 8px",
-    background:`${color}15`,
-    border:`1px solid ${color}40`,
-    borderRadius:5, color: color,
-    fontSize:11, fontWeight:700, cursor:"pointer",
-  };
-}
-
-function ProgressBar({ label, value, color }) {
-  return (
-    <div style={{ marginBottom:10 }}>
-      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:4 }}>
-        <span style={{ fontSize:11, color:"#94a3b8" }}>{label}</span>
-        <span style={{ fontSize:11, color, fontWeight:800 }}>{value}%</span>
-      </div>
-      <div style={{ height:6, background:"rgba(51,65,85,0.5)", borderRadius:3 }}>
-        <div style={{
-          height:"100%", borderRadius:3,
-          width:`${value}%`,
-          background:`linear-gradient(90deg, ${color}, ${color}99)`,
-          transition:"width 0.5s ease",
-        }}/>
-      </div>
-    </div>
-  );
-}
-
-// v20: 채팅 답변 하단 출처 카드 (접힌 형태 → 클릭 시 펼침 → 각 카드 클릭 시 Drive URL 새 탭)
-function SourcesCard({ sources, roleColor }) {
-  const [open, setOpen] = useState(false);
-  if (!sources || sources.length === 0) return null;
-  return (
-    <div style={{ marginTop:10, paddingTop:8, borderTop:`1px dashed rgba(148,163,184,0.2)` }}>
-      <div
-        onClick={() => setOpen(o => !o)}
-        style={{
-          fontSize:11, color:roleColor, fontWeight:700, cursor:"pointer",
-          display:"flex", alignItems:"center", gap:5, userSelect:"none",
-        }}
-      >
-        📑 출처 {sources.length}개 {open ? "▼" : "▶"}
-      </div>
-      {open && (
-        <div style={{ marginTop:6, display:"flex", flexDirection:"column", gap:4 }}>
-          {sources.map((s, i) => {
-            const isClickable = !!s.url;
-            const card = (
-              <div style={{
-                padding:"6px 9px",
-                background:"rgba(8,14,26,0.55)",
-                border:`1px solid rgba(51,65,85,0.5)`,
-                borderRadius:6,
-                fontSize:11, lineHeight:1.5,
-                cursor: isClickable ? "pointer" : "default",
-                transition:"border-color 0.15s",
-              }}
-              onMouseEnter={isClickable ? (e) => e.currentTarget.style.borderColor = `${roleColor}66` : undefined}
-              onMouseLeave={isClickable ? (e) => e.currentTarget.style.borderColor = "rgba(51,65,85,0.5)" : undefined}>
-                <div style={{ color:"#cbd5e1", fontWeight:600 }}>
-                  📄 {s.file}
-                  {s.page && <span style={{ color:"#94a3b8", fontWeight:400 }}> · p.{s.page}</span>}
-                </div>
-                {s.section && (
-                  <div style={{ color:"#94a3b8", fontSize:10, marginTop:1 }}>
-                    📑 {s.section}
-                  </div>
-                )}
-                {isClickable && (
-                  <div style={{ color:"#93c5fd", fontSize:10, marginTop:2 }}>
-                    🔗 원본 열기
-                  </div>
-                )}
-              </div>
-            );
-            return isClickable
-              ? <a key={i} href={s.url} target="_blank" rel="noopener noreferrer" style={{ textDecoration:"none" }}>{card}</a>
-              : <div key={i}>{card}</div>;
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function SaveBtn({ onClick, saving, saved }) {
-  return (
-    <button onClick={onClick} disabled={saving} style={{
-      padding:"8px 16px",
-      background: saved ? "rgba(52,211,153,0.2)" : "rgba(59,130,246,0.15)",
-      border: `1px solid ${saved ? "rgba(52,211,153,0.4)" : "rgba(59,130,246,0.3)"}`,
-      borderRadius:7, color: saved ? "#34d399" : "#93c5fd",
-      fontSize:12, fontWeight:700, cursor:"pointer",
-      display:"inline-flex", alignItems:"center", gap:6,
-    }}>
-      {saving ? <><Spinner/>저장 중...</> : saved ? "✅ 저장됨" : "💾 저장"}
-    </button>
-  );
-}
-
-// ─── STEP 1: 채팅 학습 ────────────────────────────────────────────────────────
-function TabChat({ role, roleInfo }) {
-  const [msgs, setMsgs] = useState([{
-    role:"assistant",
-    content:`안녕하세요! 저는 ${roleInfo.label}(${role}) AI입니다.\n\n학습 데이터를 불러오는 중...`,
-  }]);
-  const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [summary, setSummary] = useState(null);  // 시트에서 로드한 요약본
-  const [commonKnowledge, setCommonKnowledge] = useState([]);  // Common_Knowledge 시트 (모든 에이전트 공유)
-  const [initialized, setInitialized] = useState(false);
-  const [conflictQueue, setConflictQueue] = useState([]);
-  const [currentConflict, setCurrentConflict] = useState(null);
-  const bottomRef = useRef();
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:"smooth" }); }, [msgs]);
-
-  useEffect(() => {
-    if (!currentConflict && conflictQueue.length > 0) {
-      setCurrentConflict(conflictQueue[0]);
-      setConflictQueue(q => q.slice(1));
-    }
-  }, [conflictQueue, currentConflict]);
-
-  const handleConflictResolve = async () => {
-    setCurrentConflict(null);
-  };
-
-  // 시작 시 요약본 + 공통 학습 데이터 로드 + 첫 메시지 동적 생성
-  useEffect(() => {
-    if (initialized) return;
-    (async () => {
-      try {
-        // 본인 요약과 공통 학습 데이터를 병렬 로드 (속도 최적화)
-        const [summaryData, commonData] = await Promise.all([
-          loadSummary(role),
-          loadCommonKnowledge(),
-        ]);
-        setCommonKnowledge(commonData || []);
-
-        if (summaryData && summaryData.content) {
-          // 요약본 있음 → AI에게 부족 부분 질문 동적 생성 요청
-          setSummary(summaryData.content);
-
-          const sys = `당신은 ${roleInfo.label}(${role}) AI입니다. 아래는 지금까지 학습된 요약본입니다.
-
-[학습 요약]
-${summaryData.content}
-
-이 학습 내용을 보고, 아직 부족하거나 추가 학습이 필요한 영역 1~2가지를 골라서
-사용자에게 자연스럽게 질문하는 첫 인사말을 작성하세요.
-
-규칙:
-- "안녕하세요"로 시작
-- "지난 학습을 이어가겠습니다" 같은 표현으로 친근감 표시
-- 부족한 영역을 구체적으로 언급 (예: "아직 교정사례 학습이 적은데, 최근 사례가 있으면 알려주세요")
-- 마지막에 안내문 추가: "(전체 학습 내용을 보고 싶으면 '요약'이라고 입력해 주세요)"
-- 200자 이내, 한국어`;
-
-          try {
-            const reply = await callClaude(sys, "첫 인사말을 만들어주세요.");
-            setMsgs([{ role:"assistant", content: reply }]);
-          } catch {
-            // AI 호출 실패 시 기본 메시지
-            setMsgs([{
-              role:"assistant",
-              content:`안녕하세요! ${roleInfo.label}(${role}) AI입니다. 지난 학습을 이어가겠습니다.\n\n오늘은 어떤 부분을 더 알려주시겠어요?\n\n(전체 학습 내용을 보고 싶으면 '요약'이라고 입력해 주세요)`
-            }]);
-          }
-        } else {
-          // 요약본 없음 → 첫 학습 인사
-          setMsgs([{
-            role:"assistant",
-            content:`안녕하세요! 저는 ${roleInfo.label}(${role}) AI입니다.\n\n지금부터 공장 상황과 업무 방식을 배워갈게요. 편하게 알려주세요.\n\n예를 들어:\n• 어떤 공장인지, 어떤 제품을 만드는지\n• 주요 공정 흐름\n• 평소 신경 쓰는 부분`
-          }]);
-        }
-      } catch (e) {
-        // 로드 실패 시 기본 메시지
-        setMsgs([{
-          role:"assistant",
-          content:`안녕하세요! 저는 ${roleInfo.label}(${role}) AI입니다.\n\n지금부터 공장 상황과 업무 방식을 배워갈게요.`
-        }]);
-      } finally {
-        setInitialized(true);
-      }
-    })();
-  }, [role, roleInfo, initialized]);
-
-  const send = async () => {
-    if (!input.trim() || loading) return;
-    const msg = input.trim();
-    setInput("");
-
-    // "요약" 입력 시 요약본 표시 (AI 호출 없음)
-    if (msg === "요약" || msg === "요약보여줘" || msg === "요약 보여줘") {
-      const newMsgs = [...msgs, { role:"user", content:msg }];
-      if (summary) {
-        setMsgs([...newMsgs, {
-          role:"assistant",
-          content:`📋 지금까지 학습된 내용입니다:\n\n${summary}\n\n추가로 알려주실 내용이 있으면 말씀해 주세요.`
-        }]);
-      } else {
-        setMsgs([...newMsgs, {
-          role:"assistant",
-          content:"아직 저장된 요약이 없습니다. 학습 데이터가 5건 이상 누적되면 자동으로 요약이 생성됩니다."
-        }]);
-      }
-      return;
-    }
-
-    const newMsgs = [...msgs, { role:"user", content:msg }];
-    setMsgs(newMsgs);
-    setLoading(true);
-    try {
-      // ─── 디테일 모드: 토큰 점수 기반 매칭 (Step 7-8) ───
-      // 이전 v7: 카테고리 키워드 매칭 → 카테고리 칸막이로 인해 같은 주제도 표현에 따라
-      //          다른 카테고리만 보고 답을 못 함 (예: "Ceramic Bushing 적용된 라인"이
-      //          "라인" 키워드 때문에 공장정보만 매칭되어 교정사례 데이터를 못 봄).
-      // v8: 카테고리 무관, 질문의 단어가 학습 항목 content에 얼마나 매칭되는지
-      //     점수로 정렬하여 우선 포함. 매칭 없으면 최근 N건 추가.
-
-      const trimmed = msg.trim();
-      const wordCount = trimmed.split(/\s+/).length;
-
-      // 명백한 잡담/짧은 응답 패턴 (디테일 모드 OFF — 학습 데이터 로드 안 함)
-      const chitchatPatterns = [
-        /^(안녕|하이|hi|hello|반가|감사|고마워|고맙|땡큐|thanks?)/i,
-        /^(응|네|예|ㅇㅇ|ㄴㄴ|아니|noo*|yes|ok|okay|오케이)$/i,
-        /^(잘\s*있|좋아|좋네|괜찮|굿|good|great|nice)/,
-        /^(ㅋ+|ㅎ+|ㅠ+|ㅜ+|ㅡㅡ)$/,
-      ];
-      const isChitchat = wordCount <= 2 && chitchatPatterns.some(re => re.test(trimmed));
-      const isDetailMode = !isChitchat;
-
-      // 질문에서 의미 토큰 추출
-      // - 한글 2글자 이상 어절 + 영문/숫자 2글자 이상 단어
-      // - 흔한 조사·접속사·의문어 제외 (의미 단어만 남김)
-      const STOPWORDS = new Set([
-        "있는","있어","있음","있나","없는","없어","없음","하는","하고","하면","합니다",
-        "하나요","뭐야","뭐였","뭐지","무엇","어떻","어디","언제","누구","얼마","얼마나",
-        "그리고","그러나","하지만","따라서","그래서","또는","그것","그거","이것","저것",
-        "거기","여기","저기","우리","나는","나의","내가","당신","구체","정확","상세",
-        "자세히","알려","알려줘","말해","말해줘","적용","적용된","대해","대한","위한",
-        "그게","그건","그건가","해줘","해주세요","주세요","해야","해야하","입니다","이야",
-        "이에요","에서","에게","에서는","에는","으로","에서의",
-      ]);
-      const extractTokens = (text) => {
-        const tokens = [];
-        // 한글 어절
-        const koreanWords = text.match(/[가-힣]{2,}/g) || [];
-        koreanWords.forEach(w => {
-          // 조사 제거 시도 (마지막 1글자가 조사이면 제거)
-          const stripped = w.replace(/(은|는|이|가|을|를|에|의|와|과|도|만|랑|로|으로|에서|에게|한테|부터|까지|보다|처럼|같이|마저|밖에|이라|라는|이라는|이라서|라서)$/, "");
-          const final = stripped.length >= 2 ? stripped : w;
-          if (!STOPWORDS.has(final)) tokens.push(final);
-        });
-        // 영문/숫자
-        const enWords = text.match(/[A-Za-z0-9][A-Za-z0-9\-_]{1,}/g) || [];
-        enWords.forEach(w => tokens.push(w));
-        return [...new Set(tokens)]; // 중복 제거
-      };
-
-      let detailContext = "";
-      let usedScoring = false;
-      let topMatchCount = 0;
-      // v20: 출처 매핑용 — sourceMap[srcIdx-1] = knowledge row 객체
-      const sourceMap = [];
-
-      if (isDetailMode) {
-        const allKnowledge = await loadFromSheet(role);
-        const filtered = allKnowledge.filter(k => k.category !== "_요약" && k.content);
-
-        if (filtered.length > 0) {
-          const tokens = extractTokens(trimmed);
-
-          // 각 항목 점수 계산 (Step 7-9 보완):
-          //   - 출현 횟수 cap (3회): 한 항목 안에서 같은 토큰이 N번 반복돼도 가중 안 함
-          //     → 자동학습 PDF 메타처럼 단어 반복이 많은 항목이 부당하게 점수 폭증하는 것 방지
-          //   - 자동학습 PDF 메타 항목 페널티 (×0.4): 파일명/페이지 URL뿐인 메타 항목은
-          //     실제 정보 항목보다 후순위로 밀어냄
-          const scored = filtered.map(k => {
-            const content = (k.content || "").toLowerCase();
-            let score = 0;
-            let matchedTokens = 0;
-            for (const tok of tokens) {
-              const lowerTok = tok.toLowerCase();
-              if (!lowerTok) continue;
-              // 출현 횟수 카운트
-              let count = 0;
-              let idx = 0;
-              while ((idx = content.indexOf(lowerTok, idx)) !== -1) {
-                count++;
-                idx += lowerTok.length;
-              }
-              if (count > 0) {
-                matchedTokens++;
-                // 출현 횟수 cap → 3회 초과는 점수 안 늘림 (다회 등장 가중 폭증 차단)
-                const cappedCount = Math.min(count, 3);
-                score += tok.length * Math.log(1 + cappedCount);
-              }
-            }
-            // 매칭 토큰 다양성 가중치
-            score += matchedTokens * 2;
-
-            // 자동학습 PDF 메타 항목 페널티
-            // 패턴: "[파일: xxx.pdf] [PDF: xxx.pdf - 그림 분석, N페이지]" 또는 페이지 URL만 다수
-            const rawContent = k.content || "";
-            const isAutoMeta = /^\[파일:\s*[^\]]+\.(pdf|png|jpg|jpeg)\]\s*\[(PDF|이미지)/i.test(rawContent);
-            if (isAutoMeta) {
-              score *= 0.4;
-            }
-
-            return { item: k, score, matchedTokens };
-          });
-
-          // 점수 0보다 큰 것만 우선, 점수 내림차순 정렬
-          const matched = scored
-            .filter(s => s.score > 0)
-            .sort((a, b) => b.score - a.score);
-          topMatchCount = matched.length;
-          usedScoring = matched.length > 0;
-
-          // 우선순위 항목 (점수 매칭) → 6000자 cap까지 채우기 (Step 7-10C)
-          // - 한 항목이 너무 크면 다른 매칭 항목이 못 들어감 → 항목당 3000자 cap
-          // - 청크 분할(7-10A)로 대부분 안 걸리지만, 외부에서 들어온 큰 항목 안전망
-          // v20: 각 row에 [SRC:N] 번호 부여 + sourceMap 누적 (답변 후 출처 표시용)
-          const selected = [];
-          let usedChars = 0;
-          const HARD_CAP = 6000;
-          const ITEM_CAP = 3000;
-          const truncateForContext = (text) => {
-            if (text.length <= ITEM_CAP) return text;
-            return text.slice(0, ITEM_CAP) + ` ... [잘림: 전체 ${text.length}자 중 앞 ${ITEM_CAP}자]`;
-          };
-          for (const s of matched) {
-            const truncatedContent = truncateForContext(s.item.content || "");
-            const srcIdx = selected.length + 1; // 1-based 번호
-            const formatted = `[SRC:${srcIdx}] [${s.item.category}] ${truncatedContent}`;
-            if (usedChars + formatted.length > HARD_CAP) break;
-            selected.push(formatted);
-            sourceMap.push(s.item); // index = srcIdx - 1
-            usedChars += formatted.length + 1; // \n 포함
-          }
-
-          // 남는 공간 → 매칭 안 된 최근 항목으로 컨텍스트 보완
-          if (usedChars < HARD_CAP * 0.6) {
-            const unmatchedRecent = scored
-              .filter(s => s.score === 0)
-              .slice(-15)
-              .reverse();
-            for (const s of unmatchedRecent) {
-              const truncatedContent = truncateForContext(s.item.content || "");
-              const srcIdx = selected.length + 1;
-              const formatted = `[SRC:${srcIdx}] [${s.item.category}] ${truncatedContent}`;
-              if (usedChars + formatted.length > HARD_CAP) break;
-              selected.push(formatted);
-              sourceMap.push(s.item);
-              usedChars += formatted.length + 1;
-            }
-          }
-
-          if (selected.length > 0) {
-            const header = usedScoring
-              ? `[참고 - 원본 학습 데이터 (질문 관련 ${matched.length}건 중 상위 ${selected.length}건)]`
-              : `[참고 - 원본 학습 데이터 (최근 ${selected.length}건)]`;
-            detailContext = `\n\n${header}\n${selected.join("\n")}\n\n위 원본 데이터에서 정확한 정보를 찾아 답변하세요. 각 항목 앞 [SRC:N]은 데이터 식별 번호이니 본문에 노출하지 마세요. 학습된 내용에 관한 질문이면 반드시 위 데이터를 근거로 답하고, 데이터에 없는 정보만 모른다고 답하세요. 데이터에 라인·수치·날짜 같은 구체 정보가 있으면 빠뜨리지 말고 답에 포함하세요. 항목 끝에 "[잘림: ...]" 표시가 있으면 그 항목엔 더 많은 정보가 있다는 의미입니다 — 사용자가 그 부분을 묻거나 "더 알려줘"라고 하면 "이 항목은 일부만 표시되었습니다. '(2/3) 또는 (3/3)' 같은 후속 청크가 있는지 보관함에서 확인해주세요"라고 안내하거나, 잘린 부분과 관련된 구체적 후속 질문을 안내하세요.`;
-          }
-        }
-      }
-
-      const summaryContext = summary
-        ? `\n\n[기존 학습 요약]\n${summary}\n\n위 내용을 이미 알고 있다는 전제로 답변하세요. 같은 질문을 반복하지 마세요.`
-        : "";
-
-      // 공통 학습 데이터 컨텍스트 (모든 에이전트 공유 - 회사 규정/공통 지침)
-      // 디테일 모드일 때는 detailContext가 크므로 commonContext는 줄여서 토큰 절약
-      const commonLimit = isDetailMode ? 2000 : 4000;
-      const commonContext = (commonKnowledge && commonKnowledge.length > 0)
-        ? `\n\n[공통 회사 규정/지침 - 모든 에이전트 공유]\n${
-            commonKnowledge
-              .map(c => `[${c.category}] ${c.content}`)
-              .join("\n")
-              .slice(0, commonLimit)
-          }\n\n위 공통 규정/지침은 ${roleInfo.label} 업무 답변의 기본 전제입니다. 본인 업무 답변이 위 규정과 충돌하지 않도록 답변하세요.`
-        : "";
-
-      // 답변 길이 정책: 사실 조회면 300자, 일반 대화면 150자
-      // 사실 조회 추정: 토큰 매칭이 다수 발생했고 잡담이 아닐 때
-      const isFactualQuery = usedScoring && topMatchCount >= 2;
-      const lengthGuide = isFactualQuery
-        ? "300자 이내로 답하되, 학습된 사실(라인·수치·날짜·부품명 등)은 빠뜨리지 말고 모두 포함하세요. 사용자에게 되묻기보다 데이터에서 찾아 답하는 것을 우선하세요."
-        : "150자 이내로 간결하게 한국어로 답하세요.";
-
-      // v20: 사실 조회일 때만 출처 매핑 요청 (잡담엔 노이즈)
-      const sourceGuide = (isFactualQuery && sourceMap.length > 0)
-        ? `\n\n답변 작성 후 반드시 마지막 줄에 다음 형식 추가 (다른 텍스트 절대 추가 금지):
-[USED_SOURCES] 1,3,5
-여기서 1,3,5는 답변의 근거로 실제 사용한 데이터의 [SRC:N] 번호입니다. 사용한 게 없으면 [USED_SOURCES] none 으로 표기. 인사·잡담·모름 답변은 [USED_SOURCES] none 으로 표기.`
-        : "";
-
-      const system = `당신은 ${roleInfo.label} AI로 훈련 중입니다.
-사용자가 공장 상황과 ${role} 업무를 알려주면 자연스럽게 대화하며 더 깊이 파악하세요.
-모르는 부분은 추가 질문하고, 중요한 내용은 확인하세요.
-수율/KPI 수치보다 실제 업무 흐름, 협업 방식, 현장 문제에 집중하세요.
-${lengthGuide}${summaryContext}${commonContext}${detailContext}${sourceGuide}`;
-      const rawReply = await callClaude(system, msg);
-
-      // v20: 답변에서 [USED_SOURCES] 라인 분리 → 본문에서 제거 + 사용된 row의 sourceMeta 추출
-      let cleanReply = rawReply;
-      let usedSources = [];
-      if (isFactualQuery && sourceMap.length > 0) {
-        const usedMatch = rawReply.match(/\[USED_SOURCES\][^\n]*/);
-        if (usedMatch) {
-          cleanReply = rawReply.replace(usedMatch[0], "").trim();
-          const inside = usedMatch[0].replace("[USED_SOURCES]", "").trim();
-          if (inside && inside.toLowerCase() !== "none") {
-            const indices = inside.split(/[,\s]+/)
-              .map(s => parseInt(s.trim(), 10))
-              .filter(n => !isNaN(n) && n >= 1 && n <= sourceMap.length);
-            // 사용된 row → sourceMeta 추출 + content fallback + 중복 제거
-            const seen = new Set();
-            for (const idx of indices) {
-              const row = sourceMap[idx - 1];
-              if (!row) continue;
-              // 출처 카드 데이터 구축
-              let file = row.source_file || "";
-              const page = row.source_page || "";
-              const section = row.source_section || "";
-              const url = row.source_url || "";
-              // (ㄷ) fallback: sourceMeta 비어있으면 content의 [파일: xxx] 태그에서 파일명 추출
-              if (!file && row.content) {
-                const tagMatch = row.content.match(/\[파일:\s*([^\]]+?)\]/);
-                if (tagMatch) file = tagMatch[1].trim();
-              }
-              // 카드 생성 불가능 (파일명도 없음) → 스킵
-              if (!file) continue;
-              // 중복 키 (file + page + url) — 청크 row 통합
-              const key = `${file}|${page}|${url}`;
-              if (seen.has(key)) continue;
-              seen.add(key);
-              usedSources.push({ file, page, section, url, category: row.category || "" });
-            }
-          }
-        }
-      }
-
-      setMsgs(m => [...m, {
-        role: "assistant",
-        content: cleanReply,
-        sources: usedSources.length > 0 ? usedSources : undefined,
-      }]);
-    } catch {
-      setMsgs(m => [...m, { role:"assistant", content:"⚠️ 오류 발생. 다시 시도해주세요." }]);
-    } finally { setLoading(false); }
-  };
-
-  // 요약본 재생성 (백그라운드)
-  const regenerateSummary = async () => {
-    try {
-      const knowledge = await loadFromSheet(role);
-      // _요약은 제외하고 일반 학습 데이터만
-      const filtered = knowledge.filter(k => k.category !== "_요약");
-      if (filtered.length === 0) return;
-
-      const dataText = filtered.map(k => `[${k.category}] ${k.content}`).join("\n");
-
-      const sys = `당신은 학습 데이터 정리자입니다. ${roleInfo.label}(${role})의 학습 내용을 카테고리별로 구조화해 요약하세요.
-
-[학습 데이터]
-${dataText.slice(0, 8000)}
-
-다음 형식으로 한국어 요약 작성:
-[공장정보] (한 줄 요약)
-[업무역할] (한 줄 요약)
-[판단기준] (한 줄 요약, 핵심 기준 1~3가지)
-[협업방식] (한 줄 요약)
-[교정사례] (한 줄 요약, 없으면 "없음")
-[미흡 영역] (학습이 부족해 보이는 영역 1~2가지)
-
-각 항목 한 줄씩, 전체 500자 이내.`;
-
-      const summaryText = await callClaude(sys, "요약을 작성하세요.");
-      await saveSummaryToSheet(role, summaryText);
-      setSummary(summaryText); // 로컬 state도 갱신
-    } catch (e) {
-      console.error("요약 재생성 실패:", e);
-    }
-  };
-
-  const saveChat = async () => {
-    setSaving(true);
-    let stage = "준비"; // 어느 단계에서 실패했는지 추적
-
-    try {
-      // ─── 0단계: 메시지가 충분한지 확인 ───
-      stage = "사전 검증";
-      const userMsgs = msgs.filter(m => m.role === "user");
-      if (userMsgs.length < 2) {
-        alert("저장할 만큼 대화가 충분하지 않습니다. (사용자 메시지 2개 이상 필요)");
-        return;
-      }
-
-      // ─── 1단계: AI에 정보 추출 요청 ───
-      stage = "AI 정보 추출";
-      const conv = msgs.map(m => `${m.role === "user" ? "사용자" : "AI"}: ${m.content}`).join("\n");
-
-      // 시스템 프롬프트 강화: JSON만, 정보 없으면 빈 문자열
-      const system = `대화에서 ${roleInfo.label} 업무 정보를 추출해 JSON으로만 답하세요. 다른 설명 없이 JSON만.
-
-추출 규칙:
-- 각 카테고리에 해당 정보가 있으면 한 줄로 요약
-- 정보가 없거나 불충분하면 빈 문자열 ""
-- 절대 일반 텍스트로 답하지 말 것
-
-응답 형식 (정확히 이 키 사용):
-{"공장정보":"","업무역할":"","협업방식":""}`;
-
-      let raw;
-      try {
-        raw = await callClaude(system, conv);
-      } catch (apiErr) {
-        throw new Error(`AI 호출 실패: ${apiErr.message || "네트워크 오류"}`);
-      }
-
-      // ─── 2단계: JSON 파싱 ───
-      stage = "JSON 파싱";
-      let parsed;
-      try {
-        parsed = safeJSON(raw);
-      } catch (parseErr) {
-        // raw 응답을 콘솔에 남겨서 사후 분석 가능하게
-        console.error("[saveChat] JSON 파싱 실패. AI 응답 원문:", raw);
-        throw new Error(`AI가 추출 가능한 정보를 인식하지 못했습니다. ${parseErr.message}`);
-      }
-
-      // ─── 3단계: 비어있지 않은 항목만 추리기 ───
-      stage = "유효 항목 검증";
-      const validEntries = Object.entries(parsed)
-        .filter(([cat, content]) => content && typeof content === "string" && content.trim().length > 0);
-
-      if (validEntries.length === 0) {
-        alert("대화에서 추출할 만한 업무 정보가 없습니다. 더 구체적으로 대화해 주세요.");
-        return;
-      }
-
-      // ─── 4단계: 카테고리별 저장 (각 항목 독립 try/catch — 부분 성공 허용) ───
-      stage = "시트 저장";
-      const conflicts = [];
-      const savedCats = [];
-      const failedCats = [];
-
-      for (const [cat, content] of validEntries) {
-        try {
-          const conflict = await checkConflict(role, cat, content);
-          if (conflict) {
-            conflicts.push({ category: cat, content, conflict });
-          } else {
-            await saveToSheet(role, cat, content);
-            savedCats.push(cat);
-          }
-        } catch (itemErr) {
-          console.error(`[saveChat] '${cat}' 저장 실패:`, itemErr);
-          failedCats.push({ cat, msg: itemErr.message || "알 수 없는 오류" });
-        }
-      }
-
-      // ─── 5단계: 충돌 큐 + 결과 메시지 ───
-      if (conflicts.length > 0) {
-        setConflictQueue(conflicts);
-      }
-
-      // 결과별 사용자 알림
-      if (savedCats.length > 0 && failedCats.length === 0 && conflicts.length === 0) {
-        // 전체 성공 — 토스트만
-        setSaved(true);
-        setTimeout(() => setSaved(false), 3000);
-      } else if (savedCats.length > 0 && (failedCats.length > 0 || conflicts.length > 0)) {
-        // 부분 성공
-        const parts = [`${savedCats.length}개 저장됨 (${savedCats.join(", ")})`];
-        if (conflicts.length > 0) parts.push(`${conflicts.length}개 충돌 검토 필요`);
-        if (failedCats.length > 0) parts.push(`${failedCats.length}개 실패: ${failedCats.map(f => f.cat).join(", ")}`);
-        alert(parts.join("\n"));
-        setSaved(true);
-        setTimeout(() => setSaved(false), 3000);
-      } else if (savedCats.length === 0 && conflicts.length > 0) {
-        // 모두 충돌만 — 충돌 모달이 알아서 뜨므로 별도 알림 X
-        setSaved(true);
-        setTimeout(() => setSaved(false), 3000);
-      } else {
-        // 전부 실패
-        const detail = failedCats.map(f => `· ${f.cat}: ${f.msg}`).join("\n");
-        alert(`저장 실패\n\n${detail}`);
-        return;
-      }
-
-      // ─── 6단계: 백그라운드 요약 재생성 ───
-      stage = "요약 재생성";
-      try {
-        const countData = await loadSummaryCount(role);
-        if (countData && countData.count >= 5) {
-          regenerateSummary(); // await 안 함 (백그라운드)
-        }
-      } catch (summaryErr) {
-        // 요약 재생성 실패는 저장 자체엔 영향 없음 — 콘솔에만
-        console.warn("[saveChat] 요약 재생성 실패 (저장은 정상):", summaryErr);
-      }
-
-    } catch (e) {
-      // 진짜 에러 메시지를 콘솔과 사용자 모두에게 노출
-      console.error(`[saveChat] '${stage}' 단계에서 실패:`, e);
-      alert(`저장 실패 (${stage} 단계)\n\n${e.message || "알 수 없는 오류"}\n\n다시 시도하거나 콘솔(F12)을 확인해 주세요.`);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div>
-      <div style={{ marginBottom:14 }}>
-        <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
-          <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>💬 공장 & 업무 대화로 학습</div>
-          {commonKnowledge.length > 0 && (
-            <span title="모든 에이전트가 공유하는 회사 규정/지침이 채팅 컨텍스트에 자동 주입됩니다" style={{
-              background:"rgba(212,175,55,0.12)",
-              border:"1px solid rgba(212,175,55,0.35)",
-              borderRadius:10,
-              padding:"2px 8px",
-              fontSize:10.5,
-              fontWeight:700,
-              color:"#d4af37",
-              cursor:"help",
-            }}>📚 공통 {commonKnowledge.length}건 적용 중</span>
-          )}
-        </div>
-        <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
-          공장/제품/공정/업무 방식을 자유롭게 알려주세요
-        </div>
-      </div>
-
-      {/* 가이드 버튼 */}
-      <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:10 }}>
-        {summary && (
-          <button onClick={() => setInput("요약")} style={{
-            background:"rgba(167,139,250,0.1)", border:"1px solid rgba(167,139,250,0.3)",
-            borderRadius:14, padding:"4px 11px", color:"#a78bfa", fontSize:11, cursor:"pointer", fontWeight:700,
-          }}>📋 요약 보기</button>
-        )}
-        {["어떤 공장인지 알려줄게요", "주요 공정 흐름은요", "하루 일과가 어때요", "자주 생기는 문제는"].map((q,i) => (
-          <button key={i} onClick={() => setInput(q)} style={{
-            background:"rgba(59,130,246,0.08)", border:"1px solid rgba(59,130,246,0.2)",
-            borderRadius:14, padding:"4px 11px", color:"#93c5fd", fontSize:11, cursor:"pointer",
-          }}>{q}</button>
-        ))}
-      </div>
-
-      {/* 채팅창 */}
-      <div style={{
-        background:"rgba(4,8,15,0.7)", border:"1px solid rgba(59,130,246,0.15)",
-        borderRadius:12, padding:14, height:320, overflowY:"auto", marginBottom:10,
-      }}>
-        {msgs.map((m,i) => (
-          <div key={i} style={{
-            display:"flex", justifyContent:m.role==="user"?"flex-end":"flex-start",
-            marginBottom:10, animation:"fadeUp 0.2s ease both",
-          }}>
-            {m.role==="assistant" && (
-              <div style={{
-                width:26, height:26, borderRadius:"50%",
-                background:roleInfo.bg, border:`1.5px solid ${roleInfo.color}44`,
-                display:"flex", alignItems:"center", justifyContent:"center",
-                fontSize:12, marginRight:7, flexShrink:0, marginTop:2,
-              }}>{roleInfo.icon}</div>
-            )}
-            <div style={{
-              maxWidth:"80%",
-              background:m.role==="user"?"rgba(59,130,246,0.12)":"rgba(20,30,50,0.9)",
-              border:`1px solid ${m.role==="user"?"rgba(59,130,246,0.25)":"rgba(51,65,85,0.35)"}`,
-              borderRadius:m.role==="user"?"12px 3px 12px 12px":"3px 12px 12px 12px",
-              padding:"8px 12px", fontSize:12.5, color:"#dde4f0",
-              lineHeight:1.7, whiteSpace:"pre-wrap",
-            }}>
-              {m.content}
-              {/* v20: 출처 카드 (사실 조회 답변에 출처 있을 때만) */}
-              {m.sources && m.sources.length > 0 && (
-                <SourcesCard sources={m.sources} roleColor={roleInfo.color}/>
-              )}
-            </div>
-          </div>
-        ))}
-        {loading && (
-          <div style={{ display:"flex", gap:8, alignItems:"center" }}>
-            <div style={{ width:26, height:26, borderRadius:"50%", background:roleInfo.bg,
-              display:"flex", alignItems:"center", justifyContent:"center", fontSize:12 }}>
-              {roleInfo.icon}
-            </div>
-            <span style={{ fontSize:12, color:"#475569", animation:"pulse 1s infinite" }}>생각 중...</span>
-          </div>
-        )}
-        <div ref={bottomRef}/>
-      </div>
-
-      <div style={{ display:"flex", gap:8, marginBottom:10 }}>
-        <input value={input} onChange={e=>setInput(e.target.value)}
-          onKeyDown={e=>e.key==="Enter"&&send()}
-          placeholder="자유롭게 입력하세요 (Enter 전송)"
-          style={{
-            flex:1, background:"rgba(8,14,26,0.9)",
-            border:"1.5px solid rgba(59,130,246,0.25)", borderRadius:8,
-            color:"#e2e8f0", padding:"9px 13px", fontSize:13, outline:"none",
-          }}
-        />
-        <button onClick={send} disabled={!input.trim()||loading} style={{
-          padding:"9px 16px",
-          background:input.trim()&&!loading?"linear-gradient(135deg,#3b82f6,#22d3ee)":"rgba(51,65,85,0.3)",
-          border:"none", borderRadius:8, color:"#fff", fontSize:13, fontWeight:700,
-          cursor:input.trim()&&!loading?"pointer":"not-allowed",
-        }}>전송</button>
-      </div>
-
-      <SaveBtn onClick={saveChat} saving={saving} saved={saved}/>
-
-      {currentConflict && (
-        <ConflictDialog
-          role={role}
-          category={currentConflict.category}
-          newContent={currentConflict.content}
-          conflict={currentConflict.conflict}
-          onResolve={handleConflictResolve}
-          onCancel={handleConflictResolve}
-        />
-      )}
-    </div>
-  );
-}
-
-// ─── STEP 2: 업무 규칙 ────────────────────────────────────────────────────────
-const RULE_FIELDS = {
-  Cell_PE: [
-    { key:"판단기준", label:"Cell 공정 이상 발생 시 대응 순서", placeholder:"예: 이상 감지 → 현장 확인 → 조장 보고 → 원인 파악 → ME/TE 협의" },
-    { key:"협업방식", label:"Cell ME·TE팀과 협업 방식", placeholder:"예: 설비 고장은 ME에게 즉시 연락, 공정 개선은 TE와 주 1회 협의" },
-    { key:"판단기준", label:"생산 vs 품질 vs 안전 우선순위", placeholder:"예: 안전 최우선, 불량 발생 시 라인 정지 가능, 불량 출하 금지" },
-    { key:"판단기준", label:"보고 & 에스컬레이션 기준", placeholder:"예: 다운타임 30분 초과 시 팀장 보고, 불량 배치 시 품질팀 즉시 통보" },
-  ],
-  Cell_ME: [
-    { key:"판단기준", label:"Cell 설비 고장 시 대응 순서", placeholder:"예: 알람 확인 → 현장 점검 → 원인 파악 → 부품 교체 → 테스트 런" },
-    { key:"협업방식", label:"Cell PE·TE팀과 협업 방식", placeholder:"예: 생산 영향 큰 고장은 PE에게 즉시 보고, 공정 조건 변경은 TE와 협의" },
-    { key:"판단기준", label:"PM(예방보전) 기준", placeholder:"예: MTBF 기반 PM 주기, 소모품 교체 기준, 예방보전 우선순위" },
-    { key:"판단기준", label:"라인 정지 vs 임시 조치 판단 기준", placeholder:"예: 즉시 정지 조건, 임시 조치 후 운영 가능 조건" },
-  ],
-  Cell_TE: [
-    { key:"판단기준", label:"Cell 공정 조건 변경 기준", placeholder:"예: 불량률 기준 초과 시 조건 검토, 변경 전 ME/PE 협의 필수" },
-    { key:"협업방식", label:"Cell PE·ME팀과 협업 방식", placeholder:"예: 품질 이슈는 PE와 즉시 공유, 설비 조건은 ME와 협의 후 변경" },
-    { key:"판단기준", label:"불량 원인 분석 방법", placeholder:"예: 4M 분석(Man/Machine/Material/Method), 재현 테스트, 데이터 분석" },
-    { key:"판단기준", label:"재발 방지 기준", placeholder:"예: 동일 불량 2회 이상 시 근본 원인 분석서 작성, 개선 검증 기간 설정" },
-  ],
-  Elec_PE: [
-    { key:"판단기준", label:"Elec 공정 이상 발생 시 대응 순서", placeholder:"예: 이상 감지 → 현장 확인 → 조장 보고 → 원인 파악 → ME/TE 협의" },
-    { key:"협업방식", label:"Elec ME·TE팀과 협업 방식", placeholder:"예: 설비 고장은 ME에게 즉시 연락, 공정 개선은 TE와 주 1회 협의" },
-    { key:"판단기준", label:"생산 vs 품질 vs 안전 우선순위", placeholder:"예: 안전 최우선, 불량 발생 시 라인 정지 가능, 불량 출하 금지" },
-    { key:"판단기준", label:"보고 & 에스컬레이션 기준", placeholder:"예: 다운타임 30분 초과 시 팀장 보고, 불량 배치 시 품질팀 즉시 통보" },
-  ],
-  Elec_ME: [
-    { key:"판단기준", label:"Elec 설비 고장 시 대응 순서", placeholder:"예: 알람 확인 → 현장 점검 → 원인 파악 → 부품 교체 → 테스트 런" },
-    { key:"협업방식", label:"Elec PE·TE팀과 협업 방식", placeholder:"예: 생산 영향 큰 고장은 PE에게 즉시 보고, 공정 조건 변경은 TE와 협의" },
-    { key:"판단기준", label:"PM(예방보전) 기준", placeholder:"예: MTBF 기반 PM 주기, 소모품 교체 기준, 예방보전 우선순위" },
-    { key:"판단기준", label:"라인 정지 vs 임시 조치 판단 기준", placeholder:"예: 즉시 정지 조건, 임시 조치 후 운영 가능 조건" },
-  ],
-  Elec_TE: [
-    { key:"판단기준", label:"Elec 공정 조건 변경 기준", placeholder:"예: 불량률 기준 초과 시 조건 검토, 변경 전 ME/PE 협의 필수" },
-    { key:"협업방식", label:"Elec PE·ME팀과 협업 방식", placeholder:"예: 품질 이슈는 PE와 즉시 공유, 설비 조건은 ME와 협의 후 변경" },
-    { key:"판단기준", label:"불량 원인 분석 방법", placeholder:"예: 4M 분석(Man/Machine/Material/Method), 재현 테스트, 데이터 분석" },
-    { key:"판단기준", label:"재발 방지 기준", placeholder:"예: 동일 불량 2회 이상 시 근본 원인 분석서 작성, 개선 검증 기간 설정" },
-  ],
-  FA: [
-    { key:"판단기준", label:"반송 설비(C/V·Stocker·OHT·AGV) 이상 시 대응 순서", placeholder:"예: 알람 확인 → 영향 라인 파악 → 우회 경로 확보 → 정비 → 재가동" },
-    { key:"협업방식", label:"PE·ME·TE팀과 협업 방식", placeholder:"예: 라인 정지 영향 시 PE 즉시 공유, 본 라인 설비와 정비 일정은 ME와 협의, 반송 중 품질 영향 시 TE와 협업" },
-    { key:"판단기준", label:"WIP(공정 중 재공) 관리 기준", placeholder:"예: Stocker 처리 한계, 공정별 WIP 적정 수준, 누적 시 라인 속도 조정 기준" },
-    { key:"판단기준", label:"반송 이슈 vs 공정 이슈 구분 기준", placeholder:"예: 잼/충돌/통신두절은 반송 측, 대기시간 영향은 공정 변수 함께 검토" },
-  ],
-  Vision: [
-    { key:"판단기준", label:"외관 검사 기준 및 불량 분류", placeholder:"예: 불량 등급 기준(Critical/Major/Minor), 자동 검출 기준, 수동 검사 트리거" },
-    { key:"협업방식", label:"PE·TE팀과 협업 방식", placeholder:"예: 새 불량 유형 발생 시 TE와 즉시 협의, 알고리즘 변경 시 PE 승인" },
-    { key:"판단기준", label:"비전 시스템 이상 대응", placeholder:"예: 검출율 급감 시 조치 기준, 카메라·조명 점검 주기, 재교정 기준" },
-    { key:"판단기준", label:"불량 이미지 분석 방법", placeholder:"예: 이미지 패턴 분류 기준, 오검출·미검출 구분, 데이터 축적 및 개선 방법" },
-  ],
-  Cell_PLC: [
-    { key:"판단기준", label:"Cell PLC 알람 발생 시 대응 순서", placeholder:"예: 알람 확인 → 시퀀스 분석 → I/O 점검 → 코드 수정 → 테스트" },
-    { key:"협업방식", label:"Cell PE·ME·TE팀과 협업 방식", placeholder:"예: 알람은 ME와 공유, 시퀀스 변경은 PE 승인, 통신 이슈는 TE와 분석" },
-    { key:"판단기준", label:"PLC 수정 vs 임시 우회 판단 기준", placeholder:"예: 안전 관련 변경은 즉시 정지 후 수정, 비안전은 우회 후 점검 시간에 수정" },
-    { key:"판단기준", label:"백업·버전 관리 기준", placeholder:"예: 변경 전후 백업 필수, 변경 사유·날짜·담당자 기록, 주간 정기 백업" },
-  ],
-  Elec_PLC: [
-    { key:"판단기준", label:"Elec PLC 알람 발생 시 대응 순서", placeholder:"예: 알람 확인 → 시퀀스 분석 → I/O 점검 → 코드 수정 → 테스트" },
-    { key:"협업방식", label:"Elec PE·ME·TE팀과 협업 방식", placeholder:"예: 알람은 ME와 공유, 시퀀스 변경은 PE 승인, 통신 이슈는 TE와 분석" },
-    { key:"판단기준", label:"PLC 수정 vs 임시 우회 판단 기준", placeholder:"예: 안전 관련 변경은 즉시 정지 후 수정, 비안전은 우회 후 점검 시간에 수정" },
-    { key:"판단기준", label:"백업·버전 관리 기준", placeholder:"예: 변경 전후 백업 필수, 변경 사유·날짜·담당자 기록, 주간 정기 백업" },
-  ],
-  FA_PLC: [
-    { key:"판단기준", label:"FA(반송) PLC 알람 발생 시 대응 순서", placeholder:"예: 알람 확인 → 영향 라인 파악 → I/O·통신 점검 → 시퀀스 수정 → 재가동" },
-    { key:"협업방식", label:"PE·ME·TE팀과 협업 방식", placeholder:"예: 라인 정지 영향 시 PE 즉시 공유, 본 라인 PLC와 인터페이스는 라인 PLC팀과 협의" },
-    { key:"판단기준", label:"반송 시퀀스 수정 우선순위", placeholder:"예: WIP 흐름 영향 큰 시퀀스 우선, 안전 관련 즉시 수정" },
-    { key:"판단기준", label:"백업·버전 관리 기준", placeholder:"예: 변경 전후 백업 필수, 영향 범위 사전 공유, 주간 정기 백업" },
-  ],
-};
-
-function TabRules({ role, roleInfo }) {
-  const fields = RULE_FIELDS[role] || RULE_FIELDS[Object.keys(RULE_FIELDS)[0]];
-  const [values, setValues] = useState(Object.fromEntries(fields.map((_,i) => [i, ""])));
-  const [loadingExisting, setLoadingExisting] = useState(true);  // 기존 입력 로드 중
-  const [hasExisting, setHasExisting] = useState(false);  // 기존 입력 있었는지 (배지 표시용)
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [conflictQueue, setConflictQueue] = useState([]); // 충돌 대기 큐
-  const [currentConflict, setCurrentConflict] = useState(null); // 현재 처리 중인 충돌
-
-  // 시트에서 기존 입력 내용 로드 (영속성)
-  // - 같은 필드 라벨로 저장된 항목 중 가장 최근(updated_at) 것을 textarea에 복원
-  // - role이 바뀌면 다시 로드 (race condition 방지: cancelled 플래그)
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      setLoadingExisting(true);
-      setHasExisting(false);
-      // 역할 바뀐 직후 잔상 방지 — 일단 빈 칸으로 리셋
-      setValues(Object.fromEntries(fields.map((_,i) => [i, ""])));
-      try {
-        const items = await loadFromSheet(role);
-        if (cancelled) return;
-        const restored = {};
-        let foundAny = false;
-        fields.forEach((field, i) => {
-          const labelPrefix = `[${field.label}]`;
-          const matched = (items || [])
-            .filter(it => it.content && it.content.startsWith(labelPrefix))
-            .sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0))[0];
-          if (matched) {
-            restored[i] = matched.content.slice(labelPrefix.length).trim();
-            foundAny = true;
-          }
-        });
-        if (foundAny) {
-          setValues(v => ({ ...v, ...restored }));
-          setHasExisting(true);
-        }
-      } catch (e) {
-        console.error("[TabRules] 기존 입력 로드 실패:", e);
-      } finally {
-        if (!cancelled) setLoadingExisting(false);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [role]);
-
-  // 큐에서 다음 충돌 꺼내기
-  useEffect(() => {
-    if (!currentConflict && conflictQueue.length > 0) {
-      const next = conflictQueue[0];
-      setCurrentConflict(next);
-      setConflictQueue(q => q.slice(1));
-    }
-  }, [conflictQueue, currentConflict]);
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      const conflicts = [];
-      const safeItems = []; // 충돌 없는 항목
-
-      // 1단계: 각 입력 항목별로 충돌 검사
-      for (const [idx, content] of Object.entries(values)) {
-        if (!content.trim()) continue;
-        const field = fields[parseInt(idx)];
-        const fullContent = `[${field.label}] ${content}`;
-        const conflict = await checkConflict(role, field.key, fullContent);
-        if (conflict) {
-          conflicts.push({ category: field.key, content: fullContent, conflict });
-        } else {
-          safeItems.push({ category: field.key, content: fullContent });
-        }
-      }
-
-      // 2단계: 충돌 없는 항목은 즉시 저장
-      for (const item of safeItems) {
-        await saveToSheet(role, item.category, item.content);
-      }
-
-      // 3단계: 충돌 항목들을 큐에 쌓아서 사용자에게 차례로 표시
-      if (conflicts.length > 0) {
-        setConflictQueue(conflicts);
-      }
-
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-    } catch { alert("저장 실패"); }
-    finally { setSaving(false); }
-  };
-
-  const handleConflictResolve = async () => {
-    setCurrentConflict(null);
-    // useEffect가 다음 큐 항목을 자동으로 처리
-  };
-
-  return (
-    <div>
-      <div style={{ marginBottom:16 }}>
-        <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
-          <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📋 업무 규칙 & 판단 기준</div>
-          {loadingExisting && (
-            <span style={{
-              background:"rgba(100,116,139,0.15)",
-              border:"1px solid rgba(100,116,139,0.3)",
-              borderRadius:10, padding:"2px 8px",
-              fontSize:10.5, fontWeight:700, color:"#94a3b8",
-            }}>기존 입력 불러오는 중…</span>
-          )}
-          {!loadingExisting && hasExisting && (
-            <span title="시트에 저장된 기존 입력 내용을 자동 복원했습니다" style={{
-              background:"rgba(34,197,94,0.12)",
-              border:"1px solid rgba(34,197,94,0.35)",
-              borderRadius:10, padding:"2px 8px",
-              fontSize:10.5, fontWeight:700, color:"#4ade80",
-              cursor:"help",
-            }}>✅ 기존 입력 복원됨</span>
-          )}
-        </div>
-        <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
-          {roleInfo.label}로서 실제로 따르는 행동 원칙을 입력하세요
-        </div>
-      </div>
-
-      {fields.map((f, i) => (
-        <div key={i} style={{
-          background:"rgba(15,23,42,0.6)", border:`1px solid ${roleInfo.color}20`,
-          borderRadius:10, padding:"14px 16px", marginBottom:12,
-        }}>
-          <div style={{ fontSize:11, color:roleInfo.color, fontWeight:800, marginBottom:8 }}>
-            {f.label}
-          </div>
-          <textarea
-            value={values[i] || ""}
-            onChange={e => setValues(v => ({ ...v, [i]: e.target.value }))}
-            placeholder={f.placeholder}
-            rows={2}
-            style={{
-              width:"100%", background:"rgba(4,8,15,0.8)",
-              border:"1.5px solid rgba(51,65,85,0.6)",
-              borderRadius:7, color:"#dde4f0",
-              padding:"9px 12px", fontSize:12.5, outline:"none",
-              resize:"vertical", lineHeight:1.7,
-              boxSizing:"border-box", fontFamily:"inherit",
-            }}
-          />
-        </div>
-      ))}
-
-      <SaveBtn onClick={save} saving={saving} saved={saved}/>
-
-      {currentConflict && (
-        <ConflictDialog
-          role={role}
-          category={currentConflict.category}
-          newContent={currentConflict.content}
-          conflict={currentConflict.conflict}
-          onResolve={handleConflictResolve}
-          onCancel={handleConflictResolve}
-        />
-      )}
-    </div>
-  );
-}
-
-// ─── STEP 3: 상황 교정 ────────────────────────────────────────────────────────
-function TabCorrection({ role, roleInfo, knowledge }) {
-  const [situation, setSituation] = useState("");
-  const [aiAnswer, setAiAnswer] = useState("");
-  const [correction, setCorrection] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [cases, setCases] = useState([]);
-  const [conflictQueue, setConflictQueue] = useState([]);
-  const [currentConflict, setCurrentConflict] = useState(null);
-
-  useEffect(() => {
-    if (!currentConflict && conflictQueue.length > 0) {
-      setCurrentConflict(conflictQueue[0]);
-      setConflictQueue(q => q.slice(1));
-    }
-  }, [conflictQueue, currentConflict]);
-
-  const handleConflictResolve = async () => {
-    setCurrentConflict(null);
-  };
-
-  const SAMPLES = {
-    Cell_PE: [
-      "오전 10시, STK 라인 불량률이 갑자기 1.8%로 올랐다. 원인 불명. 라인은 현재 가동 중.",
-      "야간 교대 중 CUT 설비가 멈췄고 ME는 부품 교체에 2시간 필요.",
-      "기술팀에서 Cell 공정 조건 변경 요청. 변경 시 생산 속도 15% 감소 예상.",
-    ],
-    Cell_ME: [
-      "STK-1-B3 설비에서 진공 오류 알람 발생. 생산은 계속 진행 중.",
-      "동일 부품이 이번 주 3번째 교체됨. 근본 원인 파악이 필요한 상황.",
-      "PM 일정이 생산 피크 기간과 겹침. PE에서 PM 연기 요청이 왔다.",
-    ],
-    Cell_TE: [
-      "Cell 불량률이 0.3%에서 1.5%로 갑자기 상승. 공정 조건은 변경 없음.",
-      "신규 원자재 로트 투입 후 불량 발생. 기존 로트와 혼용 중.",
-      "PE에서 생산 속도 증가 요청. 현재 공정 조건에서 품질 리스크가 있음.",
-    ],
-    Elec_PE: [
-      "오전 10시, Elec 라인 불량률이 갑자기 상승. 원인 불명. 라인은 현재 가동 중.",
-      "야간 교대 중 전극 설비가 멈췄고 ME는 부품 교체에 2시간 필요.",
-      "기술팀에서 Elec 공정 조건 변경 요청. 변경 시 생산 속도 감소 예상.",
-    ],
-    Elec_ME: [
-      "Elec 설비에서 오류 알람 발생. 생산은 계속 진행 중.",
-      "동일 부품이 이번 주 3번째 교체됨. Elec 라인 근본 원인 파악 필요.",
-      "Elec PM 일정이 생산 피크 기간과 겹침. PE에서 PM 연기 요청.",
-    ],
-    Elec_TE: [
-      "Elec 불량률이 갑자기 상승. 공정 조건은 변경 없음.",
-      "신규 전극 원자재 로트 투입 후 불량 발생. 기존 로트와 혼용 중.",
-      "PE에서 Elec 생산 속도 증가 요청. 현재 공정 조건에서 품질 리스크 있음.",
-    ],
-    FA: [
-      "OHT 호기 충돌로 Cell 라인 반송 지연 발생. 라인 대기 시간 30분 누적 중.",
-      "Stocker 처리 한계 도달로 공정 앞단 WIP 급증. 라인 속도 조정 검토 필요.",
-      "AGV 통신 두절 빈발. MES 연동 문제인지 통신망 문제인지 구분 필요.",
-    ],
-    Vision: [
-      "비전 검사기에서 불량 검출율이 갑자기 50% 이하로 떨어졌다.",
-      "새로운 불량 유형이 발생했는데 현재 알고리즘이 검출하지 못하고 있다.",
-      "조명 노후화로 의심되는 오검출이 증가하고 있다. 생산에 영향을 주고 있음.",
-    ],
-    Cell_PLC: [
-      "Cell STK 라인 PLC에서 'Servo Fault' 알람 빈발. 시퀀스 점검이 필요함.",
-      "ME에서 설비 수정 후 PLC 시퀀스도 조정 요청. 변경 영향 검토 필요.",
-      "Cell PLC 통신 알람 간헐 발생. 네트워크 또는 PLC 측 문제 구분 필요.",
-    ],
-    Elec_PLC: [
-      "Elec 설비 PLC에서 'Communication Error' 알람 발생. 생산 영향 미정.",
-      "신규 Elec 설비 도입으로 PLC 인터페이스 통합 필요. 기존 시퀀스 영향 검토.",
-      "Elec PLC 변경 이후 간헐 알람 발생. 변경 사항 롤백 검토 중.",
-    ],
-    FA_PLC: [
-      "OHT 시퀀스 알람 빈발. 호기 간 동기화 문제 의심.",
-      "Stocker PLC와 라인 PLC 간 통신 두절. 인터페이스 점검 필요.",
-      "AGV 시퀀스 변경 후 일부 라인에서 진입 거부 알람 발생.",
-    ],
-  };
-
-  const askAI = async () => {
-    if (!situation.trim()) return;
-    setLoading(true);
-    setAiAnswer("");
-    try {
-      const knowledgeText = knowledge.map(k => `${k.category}: ${k.content}`).join("\n");
-      const system = `당신은 아래 지식을 보유한 ${roleInfo.label}(${role}) AI입니다.
-${knowledgeText || "기본 역할 정의만 있음"}
-주어진 현장 상황에 대해 ${roleInfo.label}로서 즉각적인 판단과 행동 방침을 150자 이내로 답하세요.`;
-      const reply = await callClaude(system, situation);
-      setAiAnswer(reply);
-    } catch { setAiAnswer("⚠️ 오류 발생"); }
-    finally { setLoading(false); }
-  };
-
-  const saveCase = async () => {
-    setSaving(true);
-    try {
-      const content = `상황: ${situation} | AI판단: ${aiAnswer} | 교정: ${correction || "정확함"}`;
-
-      // 충돌 검사
-      const conflict = await checkConflict(role, "교정사례", content);
-      if (conflict) {
-        setConflictQueue([{ category: "교정사례", content, conflict }]);
-      } else {
-        await saveToSheet(role, "교정사례", content);
-      }
-
-      setCases(c => [...c, { situation, aiAnswer, correction, date: new Date().toLocaleDateString("ko-KR") }]);
-      setSituation(""); setAiAnswer(""); setCorrection("");
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-    } catch { alert("저장 실패"); }
-    finally { setSaving(false); }
-  };
-
-  return (
-    <div>
-      <div style={{ marginBottom:16 }}>
-        <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>🎯 상황 던지기 & 판단 교정</div>
-        <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
-          실제 상황 입력 → AI 판단 확인 → 틀리면 교정 → 저장
-        </div>
-      </div>
-
-      {/* 샘플 */}
-      <div style={{ marginBottom:12 }}>
-        <div style={{ fontSize:10, color:"#374151", fontWeight:700, marginBottom:6, letterSpacing:1 }}>샘플 상황</div>
-        {(SAMPLES[role]||SAMPLES.PE).map((s,i) => (
-          <button key={i} onClick={() => setSituation(s)} style={{
-            display:"block", width:"100%", textAlign:"left",
-            background:"rgba(167,139,250,0.06)", border:"1px solid rgba(167,139,250,0.18)",
-            borderRadius:7, padding:"7px 12px", color:"#a78bfa",
-            fontSize:11.5, cursor:"pointer", lineHeight:1.5, marginBottom:5,
-          }}>{s}</button>
-        ))}
-      </div>
-
-      <textarea value={situation} onChange={e=>setSituation(e.target.value)}
-        placeholder="현장 상황을 직접 입력하세요..."
-        rows={3} style={{
-          width:"100%", background:"rgba(4,8,15,0.8)",
-          border:"1.5px solid rgba(167,139,250,0.3)", borderRadius:8,
-          color:"#e2e8f0", padding:"10px 13px", fontSize:13, outline:"none",
-          resize:"vertical", lineHeight:1.7, boxSizing:"border-box",
-          fontFamily:"inherit", marginBottom:10,
-        }}
-      />
-
-      <button onClick={askAI} disabled={!situation.trim()||loading} style={{
-        padding:"10px 18px", marginBottom:14,
-        background:situation&&!loading?"linear-gradient(135deg,#a78bfa,#7c3aed)":"rgba(51,65,85,0.3)",
-        border:"none", borderRadius:8,
-        color:situation&&!loading?"#fff":"#374151",
-        fontSize:13, fontWeight:700,
-        cursor:situation&&!loading?"pointer":"not-allowed",
-        display:"inline-flex", alignItems:"center", gap:8,
-      }}>
-        {loading?<><Spinner/>AI 판단 중...</>:"🤖 AI 판단 확인"}
-      </button>
-
-      {aiAnswer && (
-        <>
-          <div style={{
-            background:`${roleInfo.color}08`, border:`1px solid ${roleInfo.color}25`,
-            borderRadius:10, padding:"13px 15px", marginBottom:12,
-          }}>
-            <div style={{ fontSize:10, color:roleInfo.color, fontWeight:800, marginBottom:7 }}>
-              {roleInfo.icon} {roleInfo.label}의 판단
-            </div>
-            <div style={{ fontSize:13, color:"#dde4f0", lineHeight:1.75, whiteSpace:"pre-wrap" }}>
-              {aiAnswer}
-            </div>
-          </div>
-
-          <textarea value={correction} onChange={e=>setCorrection(e.target.value)}
-            placeholder="AI 판단이 맞으면 비워두세요. 틀렸다면 올바른 대응을 입력하세요."
-            rows={2} style={{
-              width:"100%", background:"rgba(4,8,15,0.8)",
-              border:"1.5px solid rgba(249,115,22,0.25)", borderRadius:8,
-              color:"#e2e8f0", padding:"9px 13px", fontSize:12.5, outline:"none",
-              resize:"vertical", lineHeight:1.7, boxSizing:"border-box",
-              fontFamily:"inherit", marginBottom:10,
-            }}
-          />
-
-          <SaveBtn onClick={saveCase} saving={saving} saved={saved}/>
-        </>
-      )}
-
-      {cases.length > 0 && (
-        <div style={{ marginTop:24 }}>
-          <div style={{ fontSize:10, color:"#374151", fontWeight:700, letterSpacing:1, marginBottom:10 }}>
-            📚 저장된 교정 사례 ({cases.length}건)
-          </div>
-          {[...cases].reverse().map((c,i) => (
-            <div key={i} style={{
-              background:"rgba(8,14,26,0.8)", border:"1px solid rgba(51,65,85,0.35)",
-              borderRadius:8, padding:"11px 13px", marginBottom:8,
-            }}>
-              <div style={{ fontSize:11, color:"#64748b", marginBottom:4 }}>
-                <span style={{ color:"#475569" }}>상황: </span>{c.situation.slice(0,60)}...
-              </div>
-              <div style={{ fontSize:11, color:"#64748b", marginBottom: c.correction ? 4 : 0 }}>
-                <span style={{ color:roleInfo.color }}>AI: </span>{c.aiAnswer.slice(0,60)}...
-              </div>
-              {c.correction && (
-                <div style={{ fontSize:11, color:"#fbbf24" }}>
-                  <span style={{ color:"#f97316" }}>교정: </span>{c.correction}
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {currentConflict && (
-        <ConflictDialog
-          role={role}
-          category={currentConflict.category}
-          newContent={currentConflict.content}
-          conflict={currentConflict.conflict}
-          onResolve={handleConflictResolve}
-          onCancel={handleConflictResolve}
-        />
-      )}
-    </div>
-  );
-}
-
-// ─── STEP 4: 문서·사진 학습 ──────────────────────────────────────────────────
-function TabDocument({ role, roleInfo }) {
-  const [file, setFile] = useState(null);
-  const [preview, setPreview] = useState("");
-  const [analyzed, setAnalyzed] = useState("");
-  const [category, setCategory] = useState("판단기준");
-  const [imageType, setImageType] = useState(""); // 이미지 유형 (검사기준서/다이어그램/불량/설비/기타)
-  const [recommendedCategory, setRecommendedCategory] = useState(""); // AI가 추천한 카테고리
-  const [uploadedImageUrl, setUploadedImageUrl] = useState(""); // 드라이브 업로드된 이미지 URL
-
-  // PDF 관련 (Step 5-B)
-  const [pdfDoc, setPdfDoc] = useState(null);          // 로드된 PDF 객체
-  const [pdfPageCount, setPdfPageCount] = useState(0); // 페이지 수
-  const [pdfMode, setPdfMode] = useState("text");      // "text" | "vision"
-  const [pdfImageUrls, setPdfImageUrls] = useState([]); // 페이지별 드라이브 URL
-  // v19: PDF Vision 모드 페이지별 분석 결과 (카드 UI용)
-  //   각 원소: { pageNum, content, section, summary, imageUrl, isError, errorMsg }
-  //   - content: 4블록 응답 전체 텍스트 (사용자 편집 가능)
-  //   - section: 챕터/섹션 (목차 우선, Vision fallback, 직전 페이지 상속)
-  //   - summary: [핵심 정보] 블록 한 줄 (카드 헤더에 표시)
-  const [pdfPageResults, setPdfPageResults] = useState([]);
-  // v19: 카드별 펼침 상태 (페이지 번호 → boolean)
-  const [pageExpanded, setPageExpanded] = useState({});
-  // v19: PDF Vision 모드 페이지별 저장 진행률
-  const [saveProgress, setSaveProgress] = useState({ current: 0, total: 0 });
-  const [loading, setLoading] = useState(false);
-  const [analyzeStep, setAnalyzeStep] = useState(""); // 분석 진행 단계 표시
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [error, setError] = useState("");
-  const [defectInfo, setDefectInfo] = useState({ count: 0, hasPattern: false }); // 불량 사진 누적 정보
-  const fileRef = useRef();
-
-  const CATEGORIES = ["공장정보", "업무역할", "판단기준", "협업방식", "교정사례"];
-  const IMAGE_TYPES = ["검사 기준서", "공정 다이어그램", "불량 사진", "설비 사진", "기타"];
-  const DEFECT_PATTERN_THRESHOLD = 10; // 불량 사진 N장 이상 누적 시 패턴 추출
-
-  const isImage = file && file.type.startsWith("image/");
-  const isPDF = file && file.type === "application/pdf";
-  const isDoc = file && (file.name.endsWith(".docx") || file.name.endsWith(".doc"));
-  const isExcel = file && (file.name.endsWith(".xlsx") || file.name.endsWith(".xls"));
-
-  // 시작 시 불량 사진 누적 카운트 로드
-  useEffect(() => {
-    (async () => {
-      const info = await loadDefectImageCount(role);
-      setDefectInfo(info);
-    })();
-  }, [role]);
-
-  const handleFile = async (e) => {
-    const f = e.target.files[0];
-    if (!f) return;
-    setFile(f);
-    setAnalyzed("");
-    setError("");
-    setImageType("");
-    setRecommendedCategory("");
-    setUploadedImageUrl("");
-    setPdfDoc(null);
-    setPdfPageCount(0);
-    setPdfImageUrls([]);
-    setPdfMode("text");
-    // v19: 페이지별 결과·펼침 상태·저장 진행률 초기화
-    setPdfPageResults([]);
-    setPageExpanded({});
-    setSaveProgress({ current: 0, total: 0 });
-
-    if (f.type.startsWith("image/")) {
-      const url = URL.createObjectURL(f);
-      setPreview(url);
-    } else {
-      setPreview("");
-    }
-
-    // PDF면 페이지 수 자동 파악
-    if (f.type === "application/pdf") {
-      try {
-        const pdf = await loadPdfDocument(f);
-        setPdfDoc(pdf);
-        setPdfPageCount(pdf.numPages);
-      } catch (err) {
-        setError(`PDF 로드 실패: ${err.message}`);
-      }
-    }
-  };
-
-  // 이미지 유형별 특화 프롬프트
-  const getTypeSpecificPrompt = (detectedType) => {
-    const baseRole = `당신은 ${roleInfo.label}(${role}) AI입니다.`;
-    switch (detectedType) {
-      case "검사 기준서":
-        return `${baseRole}\n검사 기준서 이미지에서 다음을 정확히 추출하세요:\n- 검사 항목명 (각 항목)\n- 측정 위치 / 측정 방법\n- 규격값 (수치, 허용 오차 포함)\n- CTQ 여부\n표 형태가 있으면 표 구조를 살려서 정리.`;
-      case "공정 다이어그램":
-        return `${baseRole}\n공정 다이어그램에서 다음을 추출하세요:\n- 공정 단계 순서 (좌→우 또는 위→아래)\n- 각 단계의 명칭과 역할\n- 단계 간 연결 관계 / 분기 / 피드백 루프\n- 표시된 주요 변수나 조건`;
-      case "불량 사진":
-        return `${baseRole}\n불량 현상 사진에서 다음을 추출하세요:\n- 불량의 시각적 특징 (색상, 형태, 위치, 크기)\n- 불량 발생 부위 (제품의 어느 부분)\n- 추정 원인 (시각적 단서 기반)\n- 분류 가능한 불량 유형 (예: 스크래치, 변색, 누액, 변형 등)`;
-      case "설비 사진":
-        return `${baseRole}\n설비 사진에서 다음을 추출하세요:\n- 설비 종류 / 명칭 (식별 가능한 경우)\n- 주요 부품 또는 구조\n- 라벨, 표시판, 게이지 표시값\n- 설비 상태 (정상/이상 신호 있는지)`;
-      default:
-        return `${baseRole}\n업로드된 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.\n한국어로 간결하게 정리.`;
-    }
-  };
-
-  // AI에게 이미지 유형 자동 판단 요청
-  const detectImageType = async (base64, mediaType) => {
-    const sys = `당신은 이미지 분류기입니다. 업로드된 이미지가 다음 중 어느 유형인지 판단하세요.
-- 검사 기준서: 표/다이어그램으로 검사 항목과 규격이 정리된 문서
-- 공정 다이어그램: 공정 흐름이나 시스템 구조를 보여주는 도식
-- 불량 사진: 제품의 불량/이상 현상을 찍은 사진
-- 설비 사진: 공장 설비, 기계, 장비를 찍은 사진
-- 기타: 위에 해당하지 않음
-
-또한 이 이미지가 다음 카테고리 중 어디에 가장 잘 맞는지 추천하세요:
-- 공장정보, 업무역할, 판단기준, 협업방식, 교정사례
-
-JSON으로만 답하세요. 다른 설명 없이.
-
-응답 형식:
-{"imageType":"검사 기준서|공정 다이어그램|불량 사진|설비 사진|기타","recommendedCategory":"공장정보|업무역할|판단기준|협업방식|교정사례","reason":"한 줄 사유"}`;
-
-    try {
-      const raw = await callClaudeVision(sys, "이 이미지를 분류하세요.", base64, mediaType);
-      const parsed = safeJSON(raw);
-      return {
-        imageType: parsed.imageType || "기타",
-        recommendedCategory: parsed.recommendedCategory || "판단기준",
-      };
-    } catch {
-      return { imageType: "기타", recommendedCategory: "판단기준" };
-    }
-  };
-
-  const analyze = async () => {
-    if (!file) return;
-    setLoading(true);
-    setError("");
-    setAnalyzed("");
-    setImageType("");
-    setRecommendedCategory("");
-    setUploadedImageUrl("");
-    // v19: PDF Vision 모드 재분석 시 이전 페이지 결과 초기화
-    setPdfPageResults([]);
-    setPageExpanded({});
-
-    try {
-      let result = "";
-      let detectedType = "";
-
-      if (isImage) {
-        const base64 = await fileToBase64(file);
-        // 압축된 이미지는 항상 JPEG로 재인코딩됨
-        const mediaType = "image/jpeg";
-
-        // 압축 후 크기 표시 (디버깅 + 사용자 안내용)
-        const compressedKB = estimateBase64Size(base64);
-        console.log(`이미지 압축 완료: ${compressedKB}KB`);
-
-        // 1단계: 이미지 유형 자동 판단
-        setAnalyzeStep("이미지 유형 분석 중...");
-        const detection = await detectImageType(base64, mediaType);
-        detectedType = detection.imageType;
-        setImageType(detectedType);
-        setRecommendedCategory(detection.recommendedCategory);
-        setCategory(detection.recommendedCategory); // 카테고리 자동 설정
-
-        // 2단계: 유형별 특화 프롬프트로 분석
-        setAnalyzeStep(`${detectedType} 분석 중...`);
-        const specificPrompt = getTypeSpecificPrompt(detectedType);
-
-        // 시각 메타데이터 + 추출 텍스트 + 메타데이터 + 챕터/섹션을 한꺼번에 요청 (v19: 4블록)
-        const analysisPrompt = `${specificPrompt}
-
-이미지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출하세요. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 항목명·대수·사양·비고 등 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
-
-다음 4블록 형식으로 한국어 답변:
-[추출 텍스트]
-(이미지에서 읽거나 추론한 정보. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
-
-[핵심 정보]
-(이 이미지가 다루는 공정·설비·이슈 — 한 문장)
-
-[메타데이터]
-(문서 제목, Rev, 작성일, 페이지 번호 등이 보이면 기재. 없으면 생략)
-
-[챕터/섹션]
-(이미지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 예: "2. 안전 인터록", "§4.3 도어 인터록". 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)`;
-
-        result = await callClaudeVision(
-          analysisPrompt,
-          `이 ${detectedType} 이미지를 분석하세요.`,
-          base64,
-          mediaType
-        );
-
-        // 3단계: 드라이브에 이미지 업로드 (백그라운드 진행, 실패해도 분석은 유지)
-        setAnalyzeStep("드라이브 저장 중...");
-        let imageUrl = "";
-        try {
-          const uploadResult = await uploadImageToDrive(role, file.name, base64, mediaType);
-          if (uploadResult && uploadResult.url) {
-            imageUrl = uploadResult.url;
-            setUploadedImageUrl(imageUrl);
-          }
-        } catch (e) {
-          console.error("드라이브 업로드 실패 (분석은 계속 진행):", e);
-        }
-
-        // 메타데이터 추가 (URL 있으면 포함)
-        const urlLine = imageUrl ? `[이미지URL] ${imageUrl}\n` : "";
-        result = `${urlLine}[이미지 유형] ${detectedType}\n${result}`;
-      } else if (isPDF && pdfDoc) {
-        // ─── PDF 처리 (Step 5-B) ───
-        if (pdfMode === "text") {
-          // 텍스트 추출 모드
-          setAnalyzeStep(`PDF 텍스트 추출 중 (${pdfPageCount}페이지)...`);
-          const fullText = await extractPdfText(pdfDoc);
-
-          if (!fullText || fullText.trim().length < 50) {
-            // 텍스트 추출 실패 = 스캔 PDF 가능성
-            throw new Error("텍스트 추출이 거의 안 되었습니다. 스캔 PDF로 보입니다. '그림 분석' 모드로 다시 시도하세요.");
-          }
-
-          setAnalyzeStep("AI 분석 중...");
-          // v19: 텍스트 추출 모드도 4블록 형식 (챕터 정보 추출 위해)
-          const sys = `${roleInfo.label}(${role}) AI입니다. PDF에서 추출한 텍스트입니다.
-카테고리: ${category}
-한국어로 핵심 내용만 정리하되, 학습 가치 있는 구체 정보(수치·부품명·단계 등)는 빠뜨리지 마세요.
-표/구조가 있으면 살려서 정리하세요.
-
-다음 4블록 형식으로 한국어 답변:
-[추출 텍스트]
-(원문에서 학습 가치 있는 내용. 1000자 이내 권장)
-
-[핵심 정보]
-(이 문서가 다루는 공정·설비·이슈 — 한 문장)
-
-[메타데이터]
-(문서 제목, Rev, 작성일이 보이면 기재. 없으면 생략)
-
-[챕터/섹션]
-(이 문서의 주요 챕터/섹션 제목. 예: "2. 안전 인터록". 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)`;
-          const truncated = fullText.slice(0, 12000); // 너무 길면 자르기
-          result = await callClaude(sys, `다음 PDF 내용에서 핵심을 추출하세요:\n\n${truncated}`);
-
-          result = `[PDF: ${file.name} - 텍스트 추출, ${pdfPageCount}페이지]\n${result}`;
-        } else {
-          // v19: 그림 분석 모드 — 페이지별 카드 + 페이지별 row 저장 (종합 요약 없음)
-          // 1) 목차 파싱 (성공하면 페이지→챕터 매핑)
-          setAnalyzeStep("PDF 목차 파싱 중...");
-          const outlineMap = await extractPdfOutline(pdfDoc);
-
-          const pageResults = []; // 페이지별 결과 누적
-          const pageUrls = [];
-          let lastSection = ""; // 직전 페이지 챕터 상속용
-
-          for (let pageNum = 1; pageNum <= pdfPageCount; pageNum++) {
-            setAnalyzeStep(`페이지 ${pageNum}/${pdfPageCount} 분석 중...`);
-
-            // 1단계: 페이지를 base64 이미지로 변환
-            const pageBase64 = await pdfPageToBase64(pdfDoc, pageNum);
-
-            // 2단계: 드라이브에 업로드 (백그라운드)
-            const pageFilename = `${file.name.replace(/\.pdf$/i, "")}_p${pageNum}.jpg`;
-            let pageUrl = "";
-            try {
-              const uploadResult = await uploadImageToDrive(role, pageFilename, pageBase64, "image/jpeg");
-              if (uploadResult && uploadResult.url) {
-                pageUrl = uploadResult.url;
-              }
-            } catch (e) {
-              console.error(`페이지 ${pageNum} 드라이브 업로드 실패:`, e);
-            }
-            pageUrls.push(pageUrl);
-
-            // 3단계: Vision API로 분석 (v19: 4블록)
-            const pagePrompt = `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pdfPageCount} 분석.
-카테고리: ${category}
-
-페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출하세요. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 항목명·대수·사양·비고 등 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
-
-다음 4블록 형식:
-[추출 텍스트] (페이지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
-[핵심 정보] (이 페이지가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재. 없으면 생략)
-[챕터/섹션] (페이지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 예: "2. 안전 인터록". 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)`;
-
-            let pageContent = "";
-            let isError = false;
-            let errorMsg = "";
-            try {
-              pageContent = await callClaudeVision(
-                pagePrompt,
-                `이 PDF 페이지를 분석하세요.`,
-                pageBase64,
-                "image/jpeg"
-              );
-            } catch (e) {
-              isError = true;
-              errorMsg = e.message || "분석 실패";
-              pageContent = `(분석 실패: ${errorMsg})`;
-            }
-
-            // 챕터 결정: 목차 → Vision 응답 → 직전 페이지 상속 → 빈 칸
-            let section = outlineMap[pageNum] || "";
-            if (!section && !isError) {
-              section = parseChapterFromAnalysis(pageContent);
-            }
-            if (!section) section = lastSection; // 직전 페이지 상속
-            if (section) lastSection = section;
-
-            // 핵심 정보 추출 (카드 헤더에 한 줄 표시용)
-            let summary = "";
-            const summaryMatch = pageContent.match(/\[핵심 정보\]\s*\n?([^\n\[]*)/);
-            if (summaryMatch) summary = (summaryMatch[1] || "").trim();
-
-            pageResults.push({
-              pageNum,
-              content: pageContent,
-              section,
-              summary,
-              imageUrl: pageUrl,
-              isError,
-              errorMsg,
-            });
-          }
-
-          setPdfImageUrls(pageUrls);
-          setPdfPageResults(pageResults);
-          // 첫 페이지만 펼치고 나머지는 접힘
-          setPageExpanded({ 1: true });
-
-          // analyzed에는 카드 UI 모드 식별용 더미 값 (실제 결과는 pdfPageResults에 있음)
-          result = `[PDF: ${file.name} - 그림 분석, ${pdfPageCount}페이지] (페이지별 카드 보기)`;
-        }
-      } else {
-        // v28: 텍스트 파일 처리 — 청크 분할 (큰 txt도 손실 없이 전체 학습)
-        //   기존 v27까지: text.slice(0, 2000)으로 앞 2000자만 학습 → 큰 파일은 나머지 손실
-        //   v28: 12000자 단위 청크 분할 → 청크별 Claude 분석 → 결과 합쳐서 1 row 저장 (검수 흐름 유지)
-        const sysBase = `${roleInfo.label}(${role}) AI입니다. 카테고리: ${category}.
-
-파일이 매뉴얼·작업 지시서·도면 텍스트면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음 — 정보가 많으면 길게, 적으면 짧게.
-
-다음 3블록 형식:
-[추출 텍스트] (파일의 실제 내용. 구체값 빠뜨리지 말 것)
-[핵심 정보] (이 파일이 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)`;
-        let text = await extractTextFromFile(file);
-        if (!text || text.length < 10) text = `파일명: ${file.name}`;
-
-        const TXT_CHUNK_SIZE = 12000;
-        const chunks = [];
-        for (let pos = 0; pos < text.length; pos += TXT_CHUNK_SIZE) {
-          chunks.push(text.slice(pos, pos + TXT_CHUNK_SIZE));
-        }
-        const totalChunks = chunks.length;
-
-        if (totalChunks === 1) {
-          // 작은 파일 — 기존 흐름과 동일 (분할 라벨 없음)
-          setAnalyzeStep("파일 분석 중...");
-          const r = await callClaude(sysBase, `다음 내용에서 핵심을 추출하세요:\n${chunks[0]}`, { returnFull: true });
-          result = r.text;
-          if (r.truncated) {
-            // v29: 자동 이어쓰기 3회 후에도 잘림 → 사용자에게 경고
-            result = "⚠️ [경고] 응답이 토큰 한도에서 잘렸을 수 있습니다. 일부 내용이 누락됐을 가능성 — 저장 전 검수 필수.\n\n" + result;
-          }
-        } else {
-          // 큰 파일 — 청크별로 순차 분석 후 결과 합치기
-          const chunkResults = [];
-          let anyTruncated = false;
-          for (let cIdx = 0; cIdx < totalChunks; cIdx++) {
-            setAnalyzeStep(`파일 분석 중... (${cIdx + 1}/${totalChunks} 청크)`);
-            const chunkLabel = ` [청크 ${cIdx + 1}/${totalChunks}, 약 ${cIdx * TXT_CHUNK_SIZE + 1}~${Math.min((cIdx + 1) * TXT_CHUNK_SIZE, text.length)}자]`;
-            const r = await callClaude(
-              sysBase,
-              `다음 내용에서 핵심을 추출하세요${chunkLabel}:\n${chunks[cIdx]}`,
-              { returnFull: true }
-            );
-            const tag = r.truncated ? "⚠️ " : "";
-            chunkResults.push(`━━━ ${tag}청크 ${cIdx + 1}/${totalChunks} ━━━\n${r.text}`);
-            if (r.truncated) anyTruncated = true;
-          }
-          result = chunkResults.join("\n\n");
-          if (anyTruncated) {
-            result = "⚠️ [경고] 일부 청크에서 응답이 토큰 한도에 닿아 잘렸을 수 있습니다 (위 ⚠️ 표시 청크). 저장 전 검수 필수.\n\n" + result;
-          }
-        }
-      }
-
-      setAnalyzed(result);
-    } catch(e) {
-      setError(`분석 실패: ${e.message}`);
-    } finally {
-      setLoading(false);
-      setAnalyzeStep("");
-    }
-  };
-
-  const [conflictQueue, setConflictQueue] = useState([]);
-  const [currentConflict, setCurrentConflict] = useState(null);
-
-  useEffect(() => {
-    if (!currentConflict && conflictQueue.length > 0) {
-      setCurrentConflict(conflictQueue[0]);
-      setConflictQueue(q => q.slice(1));
-    }
-  }, [conflictQueue, currentConflict]);
-
-  const handleConflictResolve = async () => {
-    setCurrentConflict(null);
-  };
-
-  // 불량 사진 패턴 추출 (10장 이상 누적 시 자동 트리거)
-  const extractDefectPattern = async () => {
-    try {
-      const data = await loadDefectImageData(role);
-      if (data.length === 0) return;
-
-      const dataText = data.map((d, i) =>
-        `${i + 1}. ${d.content.replace(/\[파일: [^\]]+\]/g, '').slice(0, 300)}`
-      ).join("\n\n");
-
-      const sys = `당신은 불량 패턴 분석 전문가입니다. 아래 ${data.length}장의 불량 사진 분석 결과들을 보고 공통된 패턴을 일반화해서 추출하세요.
-
-[불량 사진 분석 결과들]
-${dataText.slice(0, 8000)}
-
-다음 형식으로 한국어 요약 작성:
-[자주 발생하는 불량 유형] (Top 3)
-[공통 발생 부위]
-[추정 공통 원인]
-[권장 점검 포인트]
-
-전체 500자 이내로 간결하게.`;
-
-      const pattern = await callClaude(sys, "불량 패턴을 일반화하세요.");
-      await saveDefectPattern(role, pattern);
-
-      // UI 갱신
-      const info = await loadDefectImageCount(role);
-      setDefectInfo(info);
-    } catch (e) {
-      console.error("불량 패턴 추출 실패:", e);
-    }
-  };
-
-  const save = async () => {
-    if (!analyzed) return;
-    setSaving(true);
-
-    // 정상 저장 완료 후 입력 초기화 헬퍼
-    const resetInputs = () => {
-      if (preview) URL.revokeObjectURL(preview);
-      setFile(null);
-      setPreview("");
-      setAnalyzed("");
-      setImageType("");
-      setRecommendedCategory("");
-      setUploadedImageUrl("");
-      setPdfDoc(null);
-      setPdfPageCount(0);
-      setPdfImageUrls([]);
-      setPdfMode("text");
-      setPdfPageResults([]);
-      setPageExpanded({});
-      setError("");
-      setSaveProgress({ current: 0, total: 0 });
-      if (fileRef.current) fileRef.current.value = "";
-    };
-
-    try {
-      // ─── 분기 1: PDF Vision 모드 — 페이지별 N개 row 저장 (v19) ───
-      if (isPDF && pdfMode === "vision" && pdfPageResults.length > 0) {
-        const valid = pdfPageResults.filter(p => !p.isError && p.content && p.content.trim());
-        if (valid.length === 0) {
-          setError("저장 가능한 페이지가 없습니다 (모두 분석 실패)");
-          setSaving(false);
-          return;
-        }
-
-        setSaveProgress({ current: 0, total: valid.length });
-
-        // 페이지별 충돌 검사는 일괄 학습 흐름과 일관 — 건너뛰고 모두 저장
-        // (자동 점검에서 사후 감지됨, Common 패턴)
-        let okCount = 0;
-        let failCount = 0;
-        for (let i = 0; i < valid.length; i++) {
-          const p = valid[i];
-          setSaveProgress({ current: i + 1, total: valid.length });
-
-          const contentTagged = `[파일: ${file.name}] [PDF 페이지 ${p.pageNum}/${pdfPageCount}]\n${p.content}`;
-          const sourceMeta = buildSourceMeta(
-            file.name,
-            String(p.pageNum),
-            p.section,
-            p.imageUrl  // 직접 업로드는 PDF 자체 URL 없으므로 페이지별 이미지 URL 사용
-          );
-
-          try {
-            const ok = await saveToSheet(role, category, contentTagged, sourceMeta);
-            if (ok) okCount++; else failCount++;
-          } catch (e) {
-            failCount++;
-            console.error(`페이지 ${p.pageNum} 저장 실패:`, e);
-          }
-        }
-
-        if (okCount > 0 && failCount === 0) {
-          resetInputs();
-        } else if (okCount > 0) {
-          alert(`${okCount}개 페이지 저장됨 / ${failCount}개 실패`);
-          resetInputs();
-        } else {
-          setError("페이지 저장 실패");
-          return;
-        }
-
-        setSaved(true);
-        setTimeout(() => setSaved(false), 3000);
-        return;
-      }
-
-      // ─── 분기 2: 단일 이미지 / PDF 텍스트 모드 / 텍스트 파일 — 1 row 저장 (v18 흐름 + v19 sourceMeta) ───
-      const contentToSave = `[파일: ${file.name}] ${analyzed}`;
-
-      // 단일 row의 sourceMeta 빌드 (v19)
-      // - 이미지: page 빈 칸 / section은 Vision 응답에서 추출 / url은 Drive 업로드 URL
-      // - PDF 텍스트 모드: page 빈 칸(전체) / section은 응답에서 추출 / url 빈 칸 (직접 업로드 PDF는 Drive에 없음)
-      // - 텍스트 파일: meta 모두 빈 칸 (sourceMeta=null)
-      let sourceMeta = null;
-      if (isImage) {
-        const section = parseChapterFromAnalysis(analyzed);
-        sourceMeta = buildSourceMeta(file.name, "", section, uploadedImageUrl);
-      } else if (isPDF && pdfMode === "text") {
-        const section = parseChapterFromAnalysis(analyzed);
-        sourceMeta = buildSourceMeta(file.name, "", section, "");
-      }
-
-      // 충돌 검사 (v24: 같은 source_file row 제외)
-      const conflict = await checkConflict(role, category, contentToSave, sourceMeta ? sourceMeta.file : "");
-      if (conflict) {
-        setConflictQueue([{ category, content: contentToSave, conflict, sourceMeta }]);
-      } else {
-        await saveToSheet(role, category, contentToSave, sourceMeta);
-
-        // 불량 사진이고 누적 임계 도달 시 패턴 추출 (백그라운드)
-        if (imageType === "불량 사진") {
-          const newCount = (defectInfo.count || 0) + 1;
-          if (newCount >= DEFECT_PATTERN_THRESHOLD && newCount % DEFECT_PATTERN_THRESHOLD === 0) {
-            extractDefectPattern(); // await 안 함
-          }
-          setDefectInfo({ ...defectInfo, count: newCount });
-        }
-
-        resetInputs();
-      }
-
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-    } catch { setError("저장 실패"); }
-    finally { setSaving(false); }
-  };
-
-  return (
-    <div>
-      <div style={{ marginBottom:16 }}>
-        <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>📄 문서·사진 학습</div>
-        <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
-          PDF, 사진, 텍스트 파일을 업로드하면 AI가 핵심 내용을 추출해요
-        </div>
-      </div>
-
-      {/* 지원 형식 (v24: 자동학습과 통일된 안내 — 직접 업로드 가능한 형식만 표시) */}
-      <div style={{ display:"flex", gap:6, marginBottom:8, flexWrap:"wrap" }}>
-        {[
-          { label:"PDF", color:"#ef4444" },
-          { label:"JPG/PNG", color:"#f97316" },
-          { label:"TXT/CSV/MD", color:"#a78bfa" },
-        ].map(t => (
-          <span key={t.label} style={{
-            background:`${t.color}15`, border:`1px solid ${t.color}30`,
-            color:t.color, borderRadius:5, padding:"2px 10px",
-            fontSize:10, fontWeight:800,
-          }}>{t.label}</span>
-        ))}
-      </div>
-
-      {/* PPT/Excel 안내 (v24: PDF 변환 권장 → 자동학습 폴더 안내로 변경) */}
-      <div style={{
-        fontSize:10, color:"#64748b", marginBottom:14, lineHeight:1.5,
-        padding:"6px 10px", background:"rgba(15,23,42,0.5)",
-        border:"1px solid rgba(51,65,85,0.3)", borderRadius:6,
-      }}>
-        💡 PPT·Excel 파일은 <b>학습자료 폴더에 올려주세요</b> — 자동학습이 PDF 변환·청크 분석으로 처리합니다
-      </div>
-
-      {/* 파일 업로드 */}
-      <div onClick={() => fileRef.current?.click()} style={{
-        border:`2px dashed ${file ? roleInfo.color : "rgba(71,85,105,0.6)"}`,
-        borderRadius:12, padding:"28px 20px", textAlign:"center",
-        cursor:"pointer", marginBottom:14,
-        background: file ? `${roleInfo.color}05` : "rgba(15,23,42,0.4)",
-        transition:"all 0.2s",
-      }}>
-        <input ref={fileRef} type="file"
-          accept=".pdf,.txt,.csv,.md,.jpg,.jpeg,.png"
-          onChange={handleFile} style={{ display:"none" }}/>
-        {preview ? (
-          <img src={preview} alt="미리보기"
-            style={{ maxHeight:150, maxWidth:"100%", borderRadius:8, marginBottom:8 }}/>
-        ) : (
-          <div style={{ fontSize:36, marginBottom:8 }}>{file ? "📄" : "📂"}</div>
-        )}
-        {file ? (
-          <>
-            <div style={{ fontSize:13, color:roleInfo.color, fontWeight:700 }}>{file.name}</div>
-            <div style={{ fontSize:10, color:"#475569", marginTop:2 }}>
-              {(file.size/1024).toFixed(1)}KB · 클릭하여 변경
-            </div>
-          </>
-        ) : (
-          <>
-            <div style={{ fontSize:13, color:"#94a3b8" }}>클릭하여 파일 선택</div>
-            <div style={{ fontSize:10, color:"#475569", marginTop:2 }}>PDF, 사진, TXT/CSV/MD</div>
-          </>
-        )}
-      </div>
-
-      {/* 불량 사진 누적 정보 */}
-      {defectInfo.count > 0 && (
-        <div style={{
-          background: defectInfo.hasPattern ? "rgba(52,211,153,0.06)" : "rgba(245,158,11,0.06)",
-          border: `1px solid ${defectInfo.hasPattern ? "rgba(52,211,153,0.25)" : "rgba(245,158,11,0.25)"}`,
-          borderRadius:8, padding:"9px 13px", marginBottom:12,
-          fontSize:11, color:"#94a3b8", lineHeight:1.6,
-        }}>
-          <span style={{ color: defectInfo.hasPattern ? "#34d399" : "#fbbf24", fontWeight:700 }}>
-            {defectInfo.hasPattern ? "✅ 불량 패턴 학습됨" : `📸 불량 사진 ${defectInfo.count}장 누적`}
-          </span>
-          {!defectInfo.hasPattern && defectInfo.count < DEFECT_PATTERN_THRESHOLD && (
-            <span> · {DEFECT_PATTERN_THRESHOLD - defectInfo.count}장 더 모이면 자동 패턴 추출</span>
-          )}
-        </div>
-      )}
-
-      {/* PDF 모드 선택 (Step 5-B) */}
-      {isPDF && pdfPageCount > 0 && (
-        <div style={{
-          background:"rgba(15,23,42,0.6)",
-          border:`1px solid ${roleInfo.color}30`,
-          borderRadius:10, padding:"14px 16px", marginBottom:12,
-        }}>
-          <div style={{ fontSize:12, color:"#cbd5e1", fontWeight:700, marginBottom:4 }}>
-            📄 PDF 분석 방식 선택
-          </div>
-          <div style={{ fontSize:10.5, color:"#64748b", marginBottom:10 }}>
-            {pdfPageCount}페이지 · {(file.size/1024).toFixed(0)}KB
-            {pdfPageCount > 30 && (
-              <span style={{ color:"#fbbf24", marginLeft:6, fontWeight:700 }}>
-                ⚠️ 페이지 수가 많습니다
-              </span>
-            )}
-          </div>
-
-          {/* 옵션 2개 */}
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
-            {/* 텍스트 추출 */}
-            <div onClick={() => setPdfMode("text")} style={{
-              padding:"10px 12px", cursor:"pointer",
-              background: pdfMode === "text" ? `${roleInfo.color}15` : "rgba(8,14,26,0.7)",
-              border: `1.5px solid ${pdfMode === "text" ? roleInfo.color : "rgba(51,65,85,0.5)"}`,
-              borderRadius:8, transition:"all 0.15s",
-            }}>
-              <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:4 }}>
-                <div style={{
-                  width:14, height:14, borderRadius:"50%",
-                  border:`2px solid ${pdfMode === "text" ? roleInfo.color : "#475569"}`,
-                  background: pdfMode === "text" ? roleInfo.color : "transparent",
-                }}/>
-                <span style={{ fontSize:11.5, fontWeight:700,
-                  color: pdfMode === "text" ? roleInfo.color : "#94a3b8" }}>
-                  📝 텍스트 추출
-                </span>
-              </div>
-              <div style={{ fontSize:10, color:"#64748b", lineHeight:1.5 }}>
-                {calcTextExtractCost(pdfPageCount).label}
-                <br/>
-                ⚡ {estimateTime(pdfPageCount, "text")} · 전체 페이지
-                <br/>
-                <span style={{ color:"#34d399" }}>✓ 텍스트 PDF에 적합</span>
-                <br/>
-                <span style={{ color:"#f87171" }}>✗ 그림/표 시각 정보 손실</span>
-              </div>
-            </div>
-
-            {/* 그림 분석 */}
-            <div onClick={() => setPdfMode("vision")} style={{
-              padding:"10px 12px", cursor:"pointer",
-              background: pdfMode === "vision" ? `${roleInfo.color}15` : "rgba(8,14,26,0.7)",
-              border: `1.5px solid ${pdfMode === "vision" ? roleInfo.color : "rgba(51,65,85,0.5)"}`,
-              borderRadius:8, transition:"all 0.15s",
-            }}>
-              <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:4 }}>
-                <div style={{
-                  width:14, height:14, borderRadius:"50%",
-                  border:`2px solid ${pdfMode === "vision" ? roleInfo.color : "#475569"}`,
-                  background: pdfMode === "vision" ? roleInfo.color : "transparent",
-                }}/>
-                <span style={{ fontSize:11.5, fontWeight:700,
-                  color: pdfMode === "vision" ? roleInfo.color : "#94a3b8" }}>
-                  🖼️ 그림 분석
-                </span>
-              </div>
-              <div style={{ fontSize:10, color:"#64748b", lineHeight:1.5 }}>
-                {calcVisionCost(pdfPageCount).label}
-                <br/>
-                ⏱️ {estimateTime(pdfPageCount, "vision")} · 전체 페이지
-                <br/>
-                <span style={{ color:"#34d399" }}>✓ 시각 정보 보존, 스캔 PDF OK</span>
-                <br/>
-                <span style={{ color:"#34d399" }}>✓ 페이지별 드라이브 저장</span>
-              </div>
-            </div>
-          </div>
-
-          {pdfPageCount > 30 && pdfMode === "vision" && (
-            <div style={{
-              marginTop:8, padding:"7px 10px",
-              background:"rgba(251,191,36,0.08)",
-              border:"1px solid rgba(251,191,36,0.3)",
-              borderRadius:6, fontSize:10.5, color:"#fbbf24",
-            }}>
-              ⚠️ {pdfPageCount}페이지 그림 분석 시 비용이 큽니다. 텍스트 추출 모드가 가능하면 그쪽을 권장합니다.
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* 이미지 유형 자동 판단 결과 표시 */}
-      {imageType && (
-        <div style={{
-          background:`${roleInfo.color}06`, border:`1px solid ${roleInfo.color}25`,
-          borderRadius:8, padding:"10px 13px", marginBottom:12,
-        }}>
-          <div style={{ fontSize:10, color:roleInfo.color, fontWeight:800, marginBottom:4 }}>
-            🎯 AI 자동 판단
-          </div>
-          <div style={{ fontSize:12, color:"#cbd5e1" }}>
-            <strong>이미지 유형:</strong> {imageType}
-            {recommendedCategory && (
-              <> · <strong>추천 카테고리:</strong> {recommendedCategory}</>
-            )}
-          </div>
-          {recommendedCategory && recommendedCategory !== category && (
-            <div style={{ fontSize:10, color:"#fbbf24", marginTop:4 }}>
-              ⚠️ 카테고리를 변경하셨습니다 (자동 추천: {recommendedCategory})
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* 카테고리 선택 */}
-      <div style={{ marginBottom:14 }}>
-        <div style={{ fontSize:10, color:"#475569", fontWeight:800, letterSpacing:1.2, marginBottom:6 }}>
-          저장 카테고리 {recommendedCategory && <span style={{ color:roleInfo.color, marginLeft:4 }}>(AI 추천: {recommendedCategory})</span>}
-        </div>
-        <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-          {CATEGORIES.map(cat => (
-            <button key={cat} onClick={() => setCategory(cat)} style={{
-              padding:"5px 12px",
-              background: category===cat ? `${roleInfo.color}20` : "rgba(30,41,59,0.6)",
-              border:`1px solid ${category===cat ? roleInfo.color : "rgba(51,65,85,0.5)"}`,
-              borderRadius:6, color: category===cat ? roleInfo.color : "#64748b",
-              fontSize:11, fontWeight:700, cursor:"pointer",
-            }}>{cat}</button>
-          ))}
-        </div>
-      </div>
-
-      {/* 분석 버튼 */}
-      <button onClick={analyze} disabled={!file || loading} style={{
-        padding:"10px 18px", marginBottom:14,
-        background: file&&!loading ? `linear-gradient(135deg,${roleInfo.color},${roleInfo.color}99)` : "rgba(51,65,85,0.3)",
-        border:"none", borderRadius:8,
-        color: file&&!loading ? "#fff" : "#374151",
-        fontSize:13, fontWeight:700,
-        cursor: file&&!loading ? "pointer" : "not-allowed",
-        display:"inline-flex", alignItems:"center", gap:8,
-      }}>
-        {loading ? <><Spinner/>{analyzeStep || "분석 중..."}</> : "🔍 AI 분석"}
-      </button>
-
-      {error && (
-        <div style={{
-          padding:"9px 13px", background:"rgba(239,68,68,0.08)",
-          border:"1px solid rgba(239,68,68,0.25)", borderRadius:8,
-          fontSize:11, color:"#fca5a5", marginBottom:12,
-        }}>{error}</div>
-      )}
-
-      {/* 분석 결과 */}
-      {analyzed && (
-        <div style={{ marginBottom:14 }}>
-          {/* v19: PDF Vision 모드면 페이지별 카드 UI, 그 외는 기존 textarea */}
-          {(isPDF && pdfMode === "vision" && pdfPageResults.length > 0) ? (
-            <>
-              <div style={{ fontSize:10, color:roleInfo.color, fontWeight:800, marginBottom:8 }}>
-                🤖 페이지별 분석 결과 ({pdfPageResults.length}페이지 · 저장 카테고리: {category})
-              </div>
-              <div style={{
-                fontSize:10, color:"#64748b", marginBottom:10, padding:"6px 10px",
-                background:"rgba(15,23,42,0.5)", borderRadius:6,
-                border:"1px solid rgba(51,65,85,0.3)", lineHeight:1.5,
-              }}>
-                💡 각 페이지는 시트에 별도 행으로 저장됩니다. 카드를 클릭해 펼치면 내용 검토·편집 가능.
-                저장 시 분석 실패 페이지는 자동 건너뜁니다.
-              </div>
-
-              {pdfPageResults.map(p => {
-                const isOpen = !!pageExpanded[p.pageNum];
-                const borderColor = p.isError ? "rgba(239,68,68,0.35)" : `${roleInfo.color}30`;
-                return (
-                  <div key={p.pageNum} style={{
-                    background:"rgba(15,23,42,0.55)",
-                    border:`1px solid ${borderColor}`,
-                    borderRadius:8, marginBottom:6, overflow:"hidden",
-                  }}>
-                    {/* 카드 헤더 */}
-                    <div
-                      onClick={() => setPageExpanded(pe => ({ ...pe, [p.pageNum]: !pe[p.pageNum] }))}
-                      style={{
-                        padding:"9px 12px", cursor:"pointer",
-                        display:"flex", alignItems:"center", gap:8,
-                        background: isOpen ? "rgba(30,41,59,0.5)" : "transparent",
-                        transition:"background 0.15s",
-                      }}
-                    >
-                      <span style={{
-                        fontSize:11, fontWeight:800, color:roleInfo.color,
-                        minWidth:55,
-                      }}>📄 p.{p.pageNum}</span>
-                      {p.section && (
-                        <span style={{
-                          fontSize:10, padding:"1px 7px",
-                          background:`${roleInfo.color}15`, color:roleInfo.color,
-                          borderRadius:4, fontWeight:700,
-                          whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
-                          maxWidth:150,
-                        }} title={p.section}>📑 {p.section}</span>
-                      )}
-                      <span style={{
-                        flex:1, fontSize:11, color:"#94a3b8",
-                        overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap",
-                      }}>
-                        {p.isError ? <span style={{ color:"#f87171" }}>⚠️ {p.errorMsg}</span> : (p.summary || "(핵심 정보 미추출)")}
-                      </span>
-                      <span style={{
-                        fontSize:10, color:"#64748b",
-                        transform: isOpen ? "rotate(180deg)" : "rotate(0)",
-                        transition:"transform 0.2s",
-                      }}>▼</span>
-                    </div>
-
-                    {/* 카드 본문 (펼친 상태) */}
-                    {isOpen && (
-                      <div style={{
-                        padding:"4px 12px 10px",
-                        borderTop:"1px solid rgba(51,65,85,0.4)",
-                      }}>
-                        <textarea
-                          value={p.content}
-                          onChange={e => {
-                            const newContent = e.target.value;
-                            setPdfPageResults(arr => arr.map(item =>
-                              item.pageNum === p.pageNum ? { ...item, content: newContent } : item
-                            ));
-                          }}
-                          rows={10}
-                          style={{
-                            width:"100%", background:"rgba(8,14,26,0.7)",
-                            border:"1px solid rgba(51,65,85,0.4)",
-                            borderRadius:6, color:"#dde4f0",
-                            padding:"8px 10px", fontSize:11.5, lineHeight:1.65,
-                            outline:"none", resize:"vertical", marginTop:6,
-                            fontFamily:"inherit", boxSizing:"border-box",
-                            maxHeight:400,
-                          }}
-                        />
-                        <div style={{
-                          display:"flex", alignItems:"center", justifyContent:"space-between",
-                          marginTop:6, fontSize:10, color:"#64748b",
-                        }}>
-                          <span>{(p.content || "").length}자 · 시트 1행으로 저장됨</span>
-                          {p.imageUrl && (
-                            <a href={p.imageUrl} target="_blank" rel="noopener noreferrer" style={{
-                              color:"#93c5fd", fontSize:10, textDecoration:"underline",
-                            }}>🔗 페이지 이미지</a>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-
-              {/* 진행률 표시 (저장 중일 때) */}
-              {saving && saveProgress.total > 0 && (
-                <div style={{
-                  margin:"10px 0",
-                  background:"rgba(15,23,42,0.6)",
-                  border:`1px solid ${roleInfo.color}40`,
-                  borderRadius:8, padding:"10px 12px",
-                }}>
-                  <div style={{ fontSize:11, color:"#cbd5e1", marginBottom:6 }}>
-                    저장 중... {saveProgress.current}/{saveProgress.total} 페이지
-                  </div>
-                  <div style={{
-                    height:6, background:"rgba(51,65,85,0.5)", borderRadius:3, overflow:"hidden",
-                  }}>
-                    <div style={{
-                      height:"100%",
-                      width: saveProgress.total > 0
-                        ? `${(saveProgress.current/saveProgress.total)*100}%` : "0%",
-                      background:`linear-gradient(90deg,${roleInfo.color},${roleInfo.color}99)`,
-                      transition:"width 0.3s",
-                    }}/>
-                  </div>
-                </div>
-              )}
-
-              <SaveBtn onClick={save} saving={saving} saved={saved}/>
-            </>
-          ) : (
-            <>
-              <div style={{
-                background:`${roleInfo.color}06`, border:`1px solid ${roleInfo.color}25`,
-                borderRadius:10, padding:"13px 15px", marginBottom:10,
-              }}>
-                <div style={{ fontSize:10, color:roleInfo.color, fontWeight:800, marginBottom:7 }}>
-                  🤖 AI 분석 결과 ({category})
-                </div>
-                <textarea
-                  value={analyzed}
-                  onChange={e => setAnalyzed(e.target.value)}
-                  rows={4}
-                  style={{
-                    width:"100%", background:"transparent",
-                    border:"none", color:"#dde4f0",
-                    fontSize:12.5, lineHeight:1.75, outline:"none",
-                    resize:"vertical", fontFamily:"inherit",
-                    boxSizing:"border-box",
-                  }}
-                />
-                <div style={{ fontSize:9, color:"#374151", marginTop:4 }}>
-                  내용을 직접 수정할 수 있어요
-                </div>
-              </div>
-
-              {/* 드라이브 업로드 상태 (이미지인 경우만) */}
-              {isImage && (
-                <div style={{
-                  background: uploadedImageUrl ? "rgba(52,211,153,0.06)" : "rgba(239,68,68,0.06)",
-                  border: `1px solid ${uploadedImageUrl ? "rgba(52,211,153,0.3)" : "rgba(239,68,68,0.25)"}`,
-                  borderRadius:8, padding:"9px 13px", marginBottom:10,
-                  fontSize:11, lineHeight:1.6,
-                }}>
-                  {uploadedImageUrl ? (
-                    <>
-                      <span style={{ color:"#34d399", fontWeight:700 }}>✅ 드라이브에 저장됨</span>
-                      <a href={uploadedImageUrl} target="_blank" rel="noopener noreferrer" style={{
-                        color:"#93c5fd", marginLeft:8, fontSize:10.5, textDecoration:"underline",
-                      }}>
-                        🔗 원본 이미지 보기
-                      </a>
-                    </>
-                  ) : (
-                    <>
-                      <span style={{ color:"#fca5a5", fontWeight:700 }}>⚠️ 드라이브 업로드 실패</span>
-                      <span style={{ color:"#94a3b8", marginLeft:6, fontSize:10.5 }}>
-                        (분석 결과는 그대로 저장되며, URL만 누락됨)
-                      </span>
-                    </>
-                  )}
-                </div>
-              )}
-
-              <SaveBtn onClick={save} saving={saving} saved={saved}/>
-            </>
-          )}
-        </div>
-      )}
-
-      {currentConflict && (
-        <ConflictDialog
-          role={role}
-          category={currentConflict.category}
-          newContent={currentConflict.content}
-          conflict={currentConflict.conflict}
-          onResolve={handleConflictResolve}
-          onCancel={handleConflictResolve}
-        />
-      )}
-    </div>
-  );
-}
-
-// ─── STEP 5: 학습 현황 ────────────────────────────────────────────────────────
-// ─── 검색 매치 하이라이트 헬퍼 ─────────────────────────────────────────────
-function highlightMatch(text, query) {
-  if (!text || !query) return text;
-  const idx = text.toLowerCase().indexOf(query.toLowerCase());
-  if (idx === -1) return text;
-  return (
-    <>
-      {text.slice(0, idx)}
-      <mark style={{
-        background:"rgba(251,191,36,0.3)",
-        color:"#fbbf24",
-        padding:"1px 2px", borderRadius:2,
-      }}>
-        {text.slice(idx, idx + query.length)}
-      </mark>
-      {text.slice(idx + query.length)}
-    </>
-  );
-}
-
-// ─── 학습 보관함 (TabLibrary): 검색 / 필터 / 정렬 / 열람 / 편집 / 삭제 ────
-function TabLibrary({ role, roleInfo, knowledge, onReload, loading }) {
-  const CATEGORIES = ["공장정보", "업무역할", "판단기준", "협업방식", "교정사례"];
-
-  const [searchQuery, setSearchQuery] = useState("");
-  const [debouncedQuery, setDebouncedQuery] = useState("");
-  const [categoryFilter, setCategoryFilter] = useState("전체");
-  const [sortMode, setSortMode] = useState("recent"); // recent | category | length
-  const [pageSize, setPageSize] = useState(20);
-
-  // 편집/삭제 state
-  // editingKey: 편집 중인 항목 식별자 (category|content), null이면 편집 모드 아님
-  const [editingKey, setEditingKey] = useState(null);
-  const [editText, setEditText] = useState("");
-  const [savingEdit, setSavingEdit] = useState(false);
-  // deleteTarget: 삭제 확인 모달용 항목 객체, null이면 모달 안 뜸
-  const [deleteTarget, setDeleteTarget] = useState(null);
-  const [deletingNow, setDeletingNow] = useState(false);
-
-  // 항목 식별자 생성 (category + content로 유니크 식별 - Apps Script도 동일 방식 매칭)
-  const itemKey = (item) => `${item.category}|${item.content}`;
-
-  // 편집 시작
-  const startEdit = (item) => {
-    setEditingKey(itemKey(item));
-    setEditText(item.content || "");
-  };
-
-  // 편집 취소
-  const cancelEdit = () => {
-    setEditingKey(null);
-    setEditText("");
-  };
-
-  // 편집 저장
-  const saveEdit = async (item) => {
-    const newContent = editText.trim();
-    if (!newContent) return;
-    if (newContent === (item.content || "").trim()) {
-      cancelEdit();
-      return;
-    }
-    setSavingEdit(true);
-    try {
-      await replaceKnowledge(role, item.category, item.content, newContent);
-      cancelEdit();
-      await onReload();
-    } catch (e) {
-      console.error("[TabLibrary] 편집 저장 실패:", e);
-      alert("편집 저장 실패. 다시 시도해 주세요.");
-    } finally {
-      setSavingEdit(false);
-    }
-  };
-
-  // 삭제 확인
-  const confirmDelete = async () => {
-    if (!deleteTarget) return;
-    setDeletingNow(true);
-    try {
-      await deleteKnowledge(role, deleteTarget.category, deleteTarget.content);
-      setDeleteTarget(null);
-      await onReload();
-    } catch (e) {
-      console.error("[TabLibrary] 삭제 실패:", e);
-      alert("삭제 실패. 다시 시도해 주세요.");
-    } finally {
-      setDeletingNow(false);
-    }
-  };
-
-  // ─── 백업/내보내기 ────────────────────────────────────────────
-  // 파일 다운로드 트리거 (브라우저 표준 패턴)
-  const triggerDownload = (content, mimeType, filename) => {
-    const blob = new Blob([content], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
-
-  // YYYYMMDD-HHmm 형식 (파일명용)
-  const timestampForFilename = () => {
-    const d = new Date();
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
-  };
-
-  // JSON 내보내기 (메타데이터 포함, 복원/이전용)
-  const exportJSON = () => {
-    const payload = {
-      version: "1.0",
-      app: "Factory Engineer AI 학습앱",
-      role,
-      role_label: roleInfo.label,
-      exported_at: new Date().toISOString(),
-      total_count: knowledge.length,
-      items: knowledge.map(k => ({
-        category: k.category,
-        content: k.content,
-        updated_at: k.updated_at || null,
-      })),
-    };
-    const json = JSON.stringify(payload, null, 2);
-    const filename = `learning-${role}-${timestampForFilename()}.json`;
-    triggerDownload(json, "application/json;charset=utf-8", filename);
-  };
-
-  // CSV 내보내기 (Excel 호환)
-  // - BOM 포함하여 한글이 Excel에서 깨지지 않도록 함
-  // - 컴마/따옴표/줄바꿈은 표준 CSV 이스케이프
-  const escapeCsvField = (val) => {
-    const s = (val == null ? "" : String(val));
-    if (/[",\n\r]/.test(s)) {
-      return `"${s.replace(/"/g, '""')}"`;
-    }
-    return s;
-  };
-
-  const exportCSV = () => {
-    const header = ["category", "content", "updated_at"];
-    const lines = [header.join(",")];
-    knowledge.forEach(k => {
-      lines.push([
-        escapeCsvField(k.category),
-        escapeCsvField(k.content),
-        escapeCsvField(k.updated_at),
-      ].join(","));
-    });
-    // BOM(\uFEFF) 추가 — Excel이 UTF-8로 인식하도록
-    const csv = "\uFEFF" + lines.join("\r\n");
-    const filename = `learning-${role}-${timestampForFilename()}.csv`;
-    triggerDownload(csv, "text/csv;charset=utf-8", filename);
-  };
-
-  // 디바운스 (입력 200ms 멈추면 필터링)
-  useEffect(() => {
-    const t = setTimeout(() => setDebouncedQuery(searchQuery.trim()), 200);
-    return () => clearTimeout(t);
-  }, [searchQuery]);
-
-  // 검색어 변경 시 페이지 사이즈 리셋
-  useEffect(() => {
-    setPageSize(20);
-  }, [debouncedQuery, categoryFilter, sortMode]);
-
-  // 카테고리별 카운트 (필터 칩 표시용)
-  const categoryCounts = useMemo(() => {
-    const counts = { "전체": knowledge.length };
-    CATEGORIES.forEach(c => {
-      counts[c] = knowledge.filter(k => k.category === c).length;
-    });
-    return counts;
-  }, [knowledge]);
-
-  // 필터링 + 정렬
-  const filteredItems = useMemo(() => {
-    let items = knowledge;
-
-    if (categoryFilter !== "전체") {
-      items = items.filter(k => k.category === categoryFilter);
-    }
-
-    if (debouncedQuery) {
-      const q = debouncedQuery.toLowerCase();
-      items = items.filter(k =>
-        (k.content || "").toLowerCase().includes(q) ||
-        (k.category || "").toLowerCase().includes(q)
-      );
-    }
-
-    items = [...items];
-    if (sortMode === "recent") {
-      items.sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));
-    } else if (sortMode === "category") {
-      items.sort((a, b) => (a.category || "").localeCompare(b.category || ""));
-    } else if (sortMode === "length") {
-      items.sort((a, b) => (b.content || "").length - (a.content || "").length);
-    }
-
-    return items;
-  }, [knowledge, categoryFilter, debouncedQuery, sortMode]);
-
-  const visibleItems = filteredItems.slice(0, pageSize);
-  const hasMore = filteredItems.length > pageSize;
-
-  return (
-    <div style={{ padding:"16px 18px" }}>
-      {/* 헤더 */}
-      <div style={{ marginBottom:14 }}>
-        <div style={{
-          display:"flex", alignItems:"center", justifyContent:"space-between",
-          gap:8, flexWrap:"wrap",
-        }}>
-          <div>
-            <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>
-              📚 학습 보관함
-            </div>
-            <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
-              학습된 내용을 검색·열람·관리합니다 · 전체 {knowledge.length}건
-            </div>
-          </div>
-          {/* 내보내기 버튼 그룹 */}
-          {knowledge.length > 0 && (
-            <div style={{ display:"flex", gap:6 }}>
-              <button
-                onClick={exportJSON}
-                title="JSON 형식으로 다운로드 (복원·이전용 권장)"
-                style={{
-                  background:"rgba(167,139,250,0.1)",
-                  border:"1px solid rgba(167,139,250,0.35)",
-                  borderRadius:6, padding:"6px 10px",
-                  color:"#a78bfa", fontSize:11, fontWeight:600,
-                  cursor:"pointer",
-                  display:"flex", alignItems:"center", gap:4,
-                }}
-              >💾 JSON</button>
-              <button
-                onClick={exportCSV}
-                title="CSV 형식으로 다운로드 (Excel 열람용)"
-                style={{
-                  background:"rgba(52,211,153,0.1)",
-                  border:"1px solid rgba(52,211,153,0.35)",
-                  borderRadius:6, padding:"6px 10px",
-                  color:"#34d399", fontSize:11, fontWeight:600,
-                  cursor:"pointer",
-                  display:"flex", alignItems:"center", gap:4,
-                }}
-              >📊 CSV</button>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* 검색 박스 */}
-      <div style={{ position:"relative", marginBottom:12 }}>
-        <input
-          type="text"
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder="🔍 검색어를 입력하세요"
-          style={{
-            width:"100%", padding:"11px 14px",
-            paddingRight: searchQuery ? 36 : 14,
-            background:"rgba(15,23,42,0.6)",
-            border:"1px solid rgba(51,65,85,0.5)",
-            borderRadius:10, color:"#e2e8f0",
-            fontSize:13, outline:"none",
-            boxSizing:"border-box",
-          }}
-        />
-        {searchQuery && (
-          <button onClick={() => setSearchQuery("")} style={{
-            position:"absolute", right:10, top:"50%", transform:"translateY(-50%)",
-            background:"transparent", border:"none", color:"#64748b",
-            cursor:"pointer", fontSize:18, lineHeight:1,
-          }}>×</button>
-        )}
-      </div>
-
-      {/* 카테고리 필터 칩 */}
-      <div style={{
-        display:"flex", flexWrap:"wrap", gap:6, marginBottom:10,
-      }}>
-        {["전체", ...CATEGORIES].map(cat => {
-          const isActive = categoryFilter === cat;
-          const count = categoryCounts[cat] || 0;
-          const disabled = count === 0 && cat !== "전체";
-          return (
-            <button
-              key={cat}
-              onClick={() => setCategoryFilter(cat)}
-              disabled={disabled}
-              style={{
-                padding:"6px 11px",
-                background: isActive ? roleInfo.color : "rgba(30,41,59,0.5)",
-                border:`1px solid ${isActive ? roleInfo.color : "rgba(51,65,85,0.5)"}`,
-                borderRadius:14,
-                color: isActive ? "#fff" : "#94a3b8",
-                fontSize:11, fontWeight: isActive ? 700 : 500,
-                cursor: disabled ? "not-allowed" : "pointer",
-                opacity: disabled ? 0.4 : 1,
-              }}
-            >
-              {cat} {count}
-            </button>
-          );
-        })}
-      </div>
-
-      {/* 정렬 + 결과 카운트 */}
-      <div style={{
-        display:"flex", justifyContent:"space-between", alignItems:"center",
-        marginBottom:12, fontSize:11, color:"#64748b",
-      }}>
-        <select
-          value={sortMode}
-          onChange={(e) => setSortMode(e.target.value)}
-          style={{
-            background:"rgba(15,23,42,0.6)",
-            border:"1px solid rgba(51,65,85,0.5)",
-            borderRadius:6, padding:"5px 8px",
-            color:"#cbd5e1", fontSize:11, cursor:"pointer",
-          }}
-        >
-          <option value="recent">최신순</option>
-          <option value="category">카테고리순</option>
-          <option value="length">내용 길이순</option>
-        </select>
-        <span>표시: {filteredItems.length}건</span>
-      </div>
-
-      {/* 결과 카드 목록 */}
-      {filteredItems.length === 0 ? (
-        <div style={{
-          padding:"40px 20px", textAlign:"center", color:"#64748b",
-          background:"rgba(15,23,42,0.4)", borderRadius:10, fontSize:12,
-        }}>
-          {debouncedQuery
-            ? `"${debouncedQuery}" 일치 항목 없음`
-            : (knowledge.length === 0 ? "아직 학습된 내용이 없습니다" : "표시할 항목이 없습니다")}
-        </div>
-      ) : (
-        <>
-          {visibleItems.map((item, i) => {
-            const isEditing = editingKey === itemKey(item);
-            return (
-            <div key={item.id || `${item.updated_at}-${i}`} style={{
-              padding:"12px 14px",
-              marginBottom:8,
-              background:"rgba(30,41,59,0.4)",
-              border:`1px solid ${isEditing ? roleInfo.color : "rgba(51,65,85,0.4)"}`,
-              borderLeft:`3px solid ${roleInfo.color}`,
-              borderRadius:8,
-            }}>
-              <div style={{
-                display:"flex", alignItems:"center", gap:8, marginBottom:6,
-                flexWrap:"wrap",
-              }}>
-                <span style={{
-                  background:`${roleInfo.color}15`,
-                  color: roleInfo.color,
-                  padding:"2px 7px", borderRadius:4,
-                  fontSize:10, fontWeight:700,
-                }}>
-                  {item.category}
-                </span>
-                {item.updated_at && (
-                  <span style={{ fontSize:10, color:"#64748b" }}>
-                    {String(item.updated_at).slice(0, 10)}
-                  </span>
-                )}
-                {/* 편집/삭제 버튼 (편집 중이 아닐 때만) */}
-                {!isEditing && (
-                  <div style={{ marginLeft:"auto", display:"flex", gap:6 }}>
-                    <button
-                      onClick={() => startEdit(item)}
-                      title="편집"
-                      style={{
-                        background:"rgba(51,65,85,0.4)",
-                        border:"1px solid rgba(51,65,85,0.5)",
-                        borderRadius:5, padding:"3px 8px",
-                        color:"#94a3b8", fontSize:10, cursor:"pointer",
-                      }}
-                    >✏️ 편집</button>
-                    <button
-                      onClick={() => setDeleteTarget(item)}
-                      title="삭제"
-                      style={{
-                        background:"rgba(239,68,68,0.1)",
-                        border:"1px solid rgba(239,68,68,0.3)",
-                        borderRadius:5, padding:"3px 8px",
-                        color:"#f87171", fontSize:10, cursor:"pointer",
-                      }}
-                    >🗑️</button>
-                  </div>
-                )}
-              </div>
-
-              {/* 편집 모드 / 일반 모드 분기 */}
-              {isEditing ? (
-                <div>
-                  <textarea
-                    value={editText}
-                    onChange={(e) => setEditText(e.target.value)}
-                    rows={Math.min(10, Math.max(3, Math.ceil(editText.length / 50)))}
-                    style={{
-                      width:"100%", padding:"8px 10px",
-                      background:"rgba(15,23,42,0.7)",
-                      border:`1px solid ${roleInfo.color}50`,
-                      borderRadius:6, color:"#e2e8f0",
-                      fontSize:12, fontFamily:"inherit", lineHeight:1.6,
-                      resize:"vertical", outline:"none", boxSizing:"border-box",
-                    }}
-                    autoFocus
-                  />
-                  <div style={{ display:"flex", gap:6, marginTop:8, justifyContent:"flex-end" }}>
-                    <button
-                      onClick={cancelEdit}
-                      disabled={savingEdit}
-                      style={{
-                        background:"rgba(51,65,85,0.4)",
-                        border:"1px solid rgba(51,65,85,0.5)",
-                        borderRadius:6, padding:"6px 12px",
-                        color:"#94a3b8", fontSize:11,
-                        cursor: savingEdit ? "not-allowed" : "pointer",
-                      }}
-                    >취소</button>
-                    <button
-                      onClick={() => saveEdit(item)}
-                      disabled={savingEdit || !editText.trim()}
-                      style={{
-                        background: savingEdit || !editText.trim()
-                          ? "rgba(51,65,85,0.3)"
-                          : roleInfo.color,
-                        border:"none", borderRadius:6,
-                        padding:"6px 14px",
-                        color: savingEdit || !editText.trim() ? "#475569" : "#fff",
-                        fontSize:11, fontWeight:700,
-                        cursor: savingEdit || !editText.trim() ? "not-allowed" : "pointer",
-                        display:"flex", alignItems:"center", gap:6,
-                      }}
-                    >
-                      {savingEdit ? <><Spinner/>저장 중</> : "저장"}
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div style={{
-                  fontSize:12, color:"#cbd5e1", lineHeight:1.6,
-                  wordBreak:"break-word", whiteSpace:"pre-wrap",
-                }}>
-                  {highlightMatch(item.content, debouncedQuery)}
-                </div>
-              )}
-            </div>
-            );
-          })}
-
-          {/* 더 보기 */}
-          {hasMore && (
-            <button
-              onClick={() => setPageSize(p => p + 20)}
-              style={{
-                width:"100%", padding:"10px",
-                background:"rgba(51,65,85,0.3)",
-                border:"1px solid rgba(51,65,85,0.4)",
-                borderRadius:8, color:"#94a3b8",
-                fontSize:12, cursor:"pointer", marginTop:6,
-              }}
-            >
-              ↓ 더 보기 (남은 {filteredItems.length - pageSize}건)
-            </button>
-          )}
-        </>
-      )}
-
-      {/* 새로고침 */}
-      <button onClick={onReload} disabled={loading} style={{
-        width:"100%", padding:"10px", marginTop:14,
-        background:"rgba(51,65,85,0.3)", border:"1px solid rgba(51,65,85,0.4)",
-        borderRadius:8, color:"#64748b", fontSize:11, cursor:"pointer",
-        display:"flex", alignItems:"center", justifyContent:"center", gap:8,
-      }}>
-        {loading ? <><Spinner/>로딩 중...</> : "🔄 최신 데이터 불러오기"}
-      </button>
-
-      {/* 삭제 확인 모달 */}
-      {deleteTarget && (
-        <div style={{
-          position:"fixed", inset:0,
-          background:"rgba(0,0,0,0.7)", zIndex:1000,
-          display:"flex", alignItems:"center", justifyContent:"center",
-          padding:20,
-        }} onClick={() => !deletingNow && setDeleteTarget(null)}>
-          <div onClick={(e) => e.stopPropagation()} style={{
-            background:"#0f172a",
-            border:"1px solid rgba(239,68,68,0.4)",
-            borderRadius:12, padding:"20px 22px",
-            maxWidth:420, width:"100%",
-            boxShadow:"0 20px 50px rgba(0,0,0,0.6)",
-          }}>
-            <div style={{ fontSize:14, fontWeight:800, color:"#f1f5f9", marginBottom:8 }}>
-              🗑️ 학습 항목 삭제
-            </div>
-            <div style={{ fontSize:11.5, color:"#94a3b8", marginBottom:14, lineHeight:1.6 }}>
-              아래 항목을 영구 삭제합니다. 이 동작은 되돌릴 수 없습니다.
-            </div>
-            <div style={{
-              padding:"10px 12px",
-              background:"rgba(15,23,42,0.7)",
-              border:"1px solid rgba(51,65,85,0.4)",
-              borderLeft:`3px solid ${roleInfo.color}`,
-              borderRadius:6, marginBottom:16,
-              fontSize:11, color:"#cbd5e1", lineHeight:1.6,
-              maxHeight:140, overflowY:"auto",
-              wordBreak:"break-word", whiteSpace:"pre-wrap",
-            }}>
-              <span style={{
-                background:`${roleInfo.color}15`, color: roleInfo.color,
-                padding:"1px 6px", borderRadius:3,
-                fontSize:9.5, fontWeight:700, marginRight:6,
-              }}>{deleteTarget.category}</span>
-              {deleteTarget.content}
-            </div>
-            <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
-              <button
-                onClick={() => setDeleteTarget(null)}
-                disabled={deletingNow}
-                style={{
-                  background:"rgba(51,65,85,0.4)",
-                  border:"1px solid rgba(51,65,85,0.5)",
-                  borderRadius:6, padding:"8px 16px",
-                  color:"#94a3b8", fontSize:12,
-                  cursor: deletingNow ? "not-allowed" : "pointer",
-                }}
-              >취소</button>
-              <button
-                onClick={confirmDelete}
-                disabled={deletingNow}
-                style={{
-                  background: deletingNow
-                    ? "rgba(239,68,68,0.3)"
-                    : "linear-gradient(135deg,#ef4444,#dc2626)",
-                  border:"none", borderRadius:6,
-                  padding:"8px 16px",
-                  color:"#fff", fontSize:12, fontWeight:700,
-                  cursor: deletingNow ? "not-allowed" : "pointer",
-                  display:"flex", alignItems:"center", gap:6,
-                }}
-              >
-                {deletingNow ? <><Spinner/>삭제 중</> : "삭제"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function TabStatus({ role, roleInfo, knowledge, onReload, loading, autoConflicts = [], autoCheckBusy = false, onResolveAutoConflict, onStartRelearn, relearning = false, relearnProgress = { current:0, total:0, currentFile:"" } }) {
-  const progress = calcProgress(knowledge);
-  const [scanning, setScanning] = useState(false);
-  const [scanResults, setScanResults] = useState(null); // { conflicts: [...], scannedAt: timestamp }
-  const [resolving, setResolving] = useState(null); // 현재 처리 중인 충돌 인덱스
-
-  const CATEGORIES_TO_SCAN = ["공장정보", "업무역할", "판단기준", "협업방식", "교정사례"];
-
-  // ─── 품질 진단 분석 (메모이제이션) ────────────────────────────────────
-  // knowledge 또는 scanResults 변경 시에만 재계산
-  const qualityReport = useMemo(() => {
-    if (!knowledge || knowledge.length === 0) return null;
-
-    // 1. 카테고리별 항목 수
-    const byCategory = {};
-    CATEGORIES_TO_SCAN.forEach(c => {
-      byCategory[c] = knowledge.filter(k => k.category === c).length;
-    });
-    const totalItems = knowledge.length;
-    const maxCategoryCount = Math.max(...Object.values(byCategory), 1);
-
-    // 2. 빈/약한 카테고리 (5건 미만)
-    const weakCategories = CATEGORIES_TO_SCAN.filter(c => byCategory[c] < 5);
-    const emptyCategories = CATEGORIES_TO_SCAN.filter(c => byCategory[c] === 0);
-
-    // 3. 평균 항목 길이 (단답형 감지)
-    const lengths = knowledge.map(k => (k.content || "").length);
-    const avgLen = lengths.reduce((a, b) => a + b, 0) / lengths.length;
-    const shortItems = knowledge.filter(k => (k.content || "").length < 30);
-    const shortRatio = totalItems > 0 ? (shortItems.length / totalItems) * 100 : 0;
-
-    // 4. 최근 활동 (30일 이내 갱신된 항목)
-    const now = new Date();
-    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    const recentItems = knowledge.filter(k => {
-      if (!k.updated_at) return false;
-      const d = new Date(k.updated_at);
-      return !isNaN(d.getTime()) && d >= thirtyDaysAgo;
-    });
-    const stalecategories = CATEGORIES_TO_SCAN.filter(c => {
-      const items = knowledge.filter(k => k.category === c);
-      if (items.length === 0) return false;
-      // 해당 카테고리 항목 모두가 30일 이상 갱신 안 됐는지
-      return !items.some(k => {
-        if (!k.updated_at) return false;
-        const d = new Date(k.updated_at);
-        return !isNaN(d.getTime()) && d >= thirtyDaysAgo;
-      });
-    });
-
-    // 5. 미해결 충돌 (수동 풀 스캔 + 자동 점검 통합)
-    const manualUnresolved = scanResults
-      ? scanResults.conflicts.filter(c => !c.resolved).length
-      : 0;
-    const autoUnresolved = (autoConflicts || []).filter(c => !c.resolved).length;
-    const unresolvedConflicts = (scanResults || autoConflicts.length > 0)
-      ? manualUnresolved + autoUnresolved
-      : null;
-
-    // 6. 종합 품질 점수 (0~100)
-    // - 카테고리 균형도 (30점): 가장 적은 카테고리가 평균의 몇 % 인가
-    // - 분량 적정성 (25점): 평균 길이 100자 기준
-    // - 단답형 비율 (15점): 단답형이 적을수록 좋음
-    // - 최근 활동 (15점): 30일 내 갱신 비율
-    // - 충돌 정리 (15점): 미해결 0이면 만점, scan 안 했으면 중간 점수
-    const balanceScore = Math.round(
-      (Math.min(...Object.values(byCategory)) / Math.max(maxCategoryCount, 1)) * 30
-    );
-    const lengthScore = Math.min(25, Math.round((avgLen / 100) * 25));
-    const conciseScore = Math.round(15 * (1 - shortRatio / 100));
-    const freshScore = totalItems > 0
-      ? Math.round((recentItems.length / totalItems) * 15)
-      : 0;
-    const conflictScore = unresolvedConflicts == null
-      ? 8 // 검사 안 함 — 중간 점수
-      : (unresolvedConflicts === 0 ? 15 : Math.max(0, 15 - unresolvedConflicts * 3));
-    const totalScore = balanceScore + lengthScore + conciseScore + freshScore + conflictScore;
-
-    // 7. 추천 액션
-    const recommendations = [];
-    if (emptyCategories.length > 0) {
-      recommendations.push(`"${emptyCategories[0]}" 카테고리가 비어 있음 — 학습 추가 필요`);
-    } else if (weakCategories.length > 0) {
-      recommendations.push(`"${weakCategories[0]}" 카테고리 보강 권장 (현재 ${byCategory[weakCategories[0]]}건)`);
-    }
-    if (shortRatio > 20) {
-      recommendations.push(`단답형 항목이 ${shortRatio.toFixed(0)}% — 더 자세히 입력 권장`);
-    }
-    if (stalecategories.length > 0) {
-      recommendations.push(`"${stalecategories[0]}" 30일째 갱신 없음 — 최신화 검토`);
-    }
-    if (unresolvedConflicts && unresolvedConflicts > 0) {
-      if (autoUnresolved > 0) {
-        recommendations.push(`자동 감지된 충돌 ${autoUnresolved}건 — 아래 "자동 감지 결과"에서 검토`);
-      }
-      if (manualUnresolved > 0) {
-        recommendations.push(`수동 검사 미해결 ${manualUnresolved}건 — 아래 "데이터 정리"에서 검토`);
-      }
-    }
-    if (unresolvedConflicts == null && totalItems >= 10) {
-      recommendations.push(`"전체 검사"를 실행해 중복/충돌을 확인해 보세요`);
-    }
-
-    // 빈약 자동학습 항목 감지 (Step 7-11 v2)
-    // 헬퍼: isWeakAutoItem (다중 신호 기반)
-    // - v10 이전 프롬프트 표지 ([시각 설명] 블록) → 강한 신호
-    // - 분량 < 500자 → 짧은 빈약
-    // - 페이지당 평균 < 150자 → 정보 밀도 낮음
-    const weakAutoItems = knowledge.filter(k => isWeakAutoItem(k.content));
-    if (weakAutoItems.length > 0) {
-      recommendations.push(`빈약 자동학습 항목 ${weakAutoItems.length}건 — 아래 "재학습"으로 품질 개선 가능`);
-    }
-
-    if (recommendations.length === 0) {
-      recommendations.push(`✨ 학습 상태 양호 — 꾸준히 업데이트하세요`);
-    }
-
-    return {
-      totalScore, byCategory, totalItems, maxCategoryCount,
-      weakCategories, emptyCategories, stalecategories,
-      avgLen, shortItems, shortRatio,
-      recentItems, unresolvedConflicts,
-      weakAutoItems,
-      recommendations,
-      breakdown: { balanceScore, lengthScore, conciseScore, freshScore, conflictScore },
-    };
-  }, [knowledge, scanResults, autoConflicts]);
-
-  // 품질 점수 색상
-  const qualityColor = (score) => {
-    if (score >= 80) return "#34d399"; // green
-    if (score >= 60) return "#fbbf24"; // amber
-    if (score >= 40) return "#fb923c"; // orange
-    return "#f87171"; // red
-  };
-
-  // 카테고리별 풀 검사 (Step 3 수동 검사)
-  const startFullScan = async () => {
-    setScanning(true);
-    setScanResults(null);
-    try {
-      const allConflicts = [];
-
-      for (const category of CATEGORIES_TO_SCAN) {
-        const items = knowledge.filter(k => k.category === category);
-        if (items.length < 2) continue; // 비교할 데이터 부족
-
-        // 너무 많으면 최근 30건까지만
-        const targets = items.slice(-30);
-        const targetsText = targets.map((it, i) => `${i + 1}. ${it.content}`).join("\n");
-
-        const sys = `당신은 학습 데이터 검증자입니다. 아래 ${category} 카테고리 항목들 중 서로 중복(같은 의미)이거나 충돌(같은 주제이지만 내용 다름)하는 쌍을 찾아주세요.
-
-[항목들]
-${targetsText}
-
-[판단 기준]
-- duplicate: 같은 의미를 다른 표현으로 작성
-- conflict: 같은 주제인데 수치/절차/기준이 다름
-
-JSON으로만 답하세요. 충돌 없으면 빈 배열.
-
-응답 형식:
-{"pairs":[{"a":1,"b":3,"type":"duplicate|conflict","reason":"한 줄 사유"}]}`;
-
-        try {
-          const raw = await callClaude(sys, "검사 결과를 JSON으로 답하세요.");
-          const parsed = safeJSON(raw);
-
-          if (parsed.pairs && Array.isArray(parsed.pairs)) {
-            for (const pair of parsed.pairs) {
-              if (pair.a >= 1 && pair.a <= targets.length &&
-                  pair.b >= 1 && pair.b <= targets.length && pair.a !== pair.b) {
-                allConflicts.push({
-                  category,
-                  itemA: targets[pair.a - 1],
-                  itemB: targets[pair.b - 1],
-                  type: pair.type || "conflict",
-                  reason: pair.reason || "",
-                  resolved: false,
-                });
-              }
-            }
-          }
-        } catch {
-          // 카테고리별 검사 실패해도 다음 진행
-          continue;
-        }
-      }
-
-      setScanResults({
-        conflicts: allConflicts,
-        scannedAt: new Date().toLocaleTimeString("ko-KR"),
-      });
-    } catch (e) {
-      alert("검사 실패: " + e.message);
-    } finally {
-      setScanning(false);
-    }
-  };
-
-  // 충돌 해결 처리 (A 유지 / B 유지 / 둘 다 / 건너뛰기)
-  const resolveConflict = async (idx, choice) => {
-    setResolving(idx);
-    try {
-      const c = scanResults.conflicts[idx];
-      if (choice === "keep_a") {
-        // A 유지 → B 삭제
-        await deleteKnowledge(role, c.category, c.itemB.content);
-      } else if (choice === "keep_b") {
-        // B 유지 → A 삭제
-        await deleteKnowledge(role, c.category, c.itemA.content);
-      }
-      // keep_both / skip은 둘 다 유지 (아무것도 안 함)
-
-      // 해당 항목 처리됨 표시
-      setScanResults(r => ({
-        ...r,
-        conflicts: r.conflicts.map((cf, i) =>
-          i === idx ? { ...cf, resolved: true, resolvedAs: choice } : cf
-        ),
-      }));
-    } catch (e) {
-      alert("처리 실패: " + e.message);
-    } finally {
-      setResolving(null);
-    }
-  };
-
-  return (
-    <div>
-      <div style={{ marginBottom:16 }}>
-        <div style={{ fontSize:15, fontWeight:800, color:"#f1f5f9" }}>🧠 학습 현황</div>
-        <div style={{ fontSize:11, color:"#475569", marginTop:3 }}>
-          구글 시트에 저장된 학습 내용 및 수준
-        </div>
-      </div>
-
-      {/* 전체 학습도 */}
-      <div style={{
-        background:`${roleInfo.color}08`, border:`1px solid ${roleInfo.color}25`,
-        borderRadius:12, padding:"16px 18px", marginBottom:16, textAlign:"center",
-      }}>
-        <div style={{ fontSize:36, fontWeight:900, color:roleInfo.color, marginBottom:4 }}>
-          {progress["전체"]}%
-        </div>
-        <div style={{ fontSize:11, color:"#64748b" }}>{roleInfo.label} 전체 학습도</div>
-      </div>
-
-      {/* 항목별 */}
-      {["공장정보","업무역할","판단기준","협업방식","교정사례"].map(cat => (
-        <ProgressBar key={cat} label={cat} value={progress[cat]||0} color={roleInfo.color}/>
-      ))}
-
-      {/* ─── 품질 진단 ─── */}
-      {qualityReport && (
-        <div style={{
-          marginTop:18, padding:"14px 16px",
-          background:"rgba(15,23,42,0.5)",
-          border:"1px solid rgba(51,65,85,0.4)",
-          borderRadius:10,
-        }}>
-          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
-            <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1" }}>
-              📊 학습 품질 진단
-            </div>
-            <div style={{
-              padding:"3px 10px",
-              background: `${qualityColor(qualityReport.totalScore)}20`,
-              border: `1px solid ${qualityColor(qualityReport.totalScore)}50`,
-              borderRadius:12,
-              color: qualityColor(qualityReport.totalScore),
-              fontSize:11, fontWeight:800,
-            }}>
-              {qualityReport.totalScore}/100
-            </div>
-          </div>
-
-          {/* 점수 막대 */}
-          <div style={{
-            height:6, background:"rgba(51,65,85,0.4)", borderRadius:3,
-            overflow:"hidden", marginBottom:14,
-          }}>
-            <div style={{
-              width:`${qualityReport.totalScore}%`, height:"100%",
-              background: qualityColor(qualityReport.totalScore),
-              transition:"width 0.4s ease",
-            }}/>
-          </div>
-
-          {/* 카테고리 균형도 */}
-          <div style={{ marginBottom:14 }}>
-            <div style={{ fontSize:10.5, color:"#94a3b8", fontWeight:700, marginBottom:6 }}>
-              📊 카테고리 균형도
-            </div>
-            {CATEGORIES_TO_SCAN.map(cat => {
-              const count = qualityReport.byCategory[cat];
-              const pct = qualityReport.maxCategoryCount > 0
-                ? (count / qualityReport.maxCategoryCount) * 100
-                : 0;
-              const isWeak = count < 5;
-              return (
-                <div key={cat} style={{ marginBottom:5, display:"flex", alignItems:"center", gap:8 }}>
-                  <div style={{ fontSize:10, color:"#94a3b8", width:60, flexShrink:0 }}>{cat}</div>
-                  <div style={{
-                    flex:1, height:6, background:"rgba(51,65,85,0.3)",
-                    borderRadius:3, overflow:"hidden",
-                  }}>
-                    <div style={{
-                      width:`${pct}%`, height:"100%",
-                      background: isWeak ? "#f87171" : roleInfo.color,
-                      opacity: count === 0 ? 0.3 : 1,
-                    }}/>
-                  </div>
-                  <div style={{
-                    fontSize:9.5, color: isWeak ? "#f87171" : "#64748b",
-                    width:30, textAlign:"right", flexShrink:0,
-                  }}>{count}건</div>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* 데이터 건강도 지표 그리드 */}
-          <div style={{
-            display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:14,
-          }}>
-            <div style={{
-              padding:"8px 10px",
-              background:"rgba(30,41,59,0.5)",
-              borderRadius:6, borderLeft:"3px solid #34d399",
-            }}>
-              <div style={{ fontSize:9, color:"#64748b", marginBottom:2 }}>평균 분량</div>
-              <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1" }}>
-                {Math.round(qualityReport.avgLen)}<span style={{ fontSize:9, color:"#64748b", fontWeight:400 }}>자</span>
-              </div>
-            </div>
-            <div style={{
-              padding:"8px 10px",
-              background:"rgba(30,41,59,0.5)",
-              borderRadius:6,
-              borderLeft: `3px solid ${qualityReport.shortRatio > 20 ? "#fb923c" : "#34d399"}`,
-            }}>
-              <div style={{ fontSize:9, color:"#64748b", marginBottom:2 }}>단답형 비율</div>
-              <div style={{
-                fontSize:13, fontWeight:700,
-                color: qualityReport.shortRatio > 20 ? "#fb923c" : "#cbd5e1",
-              }}>
-                {qualityReport.shortRatio.toFixed(0)}<span style={{ fontSize:9, color:"#64748b", fontWeight:400 }}>%</span>
-              </div>
-            </div>
-            <div style={{
-              padding:"8px 10px",
-              background:"rgba(30,41,59,0.5)",
-              borderRadius:6, borderLeft:"3px solid #a78bfa",
-            }}>
-              <div style={{ fontSize:9, color:"#64748b", marginBottom:2 }}>최근 30일 갱신</div>
-              <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1" }}>
-                {qualityReport.recentItems.length}<span style={{ fontSize:9, color:"#64748b", fontWeight:400 }}>/{qualityReport.totalItems}건</span>
-              </div>
-            </div>
-            <div style={{
-              padding:"8px 10px",
-              background:"rgba(30,41,59,0.5)",
-              borderRadius:6,
-              borderLeft: `3px solid ${
-                qualityReport.unresolvedConflicts == null ? "#64748b"
-                  : qualityReport.unresolvedConflicts === 0 ? "#34d399"
-                  : "#f87171"
-              }`,
-            }}>
-              <div style={{ fontSize:9, color:"#64748b", marginBottom:2 }}>미해결 충돌</div>
-              <div style={{
-                fontSize:13, fontWeight:700,
-                color: qualityReport.unresolvedConflicts == null ? "#64748b"
-                  : qualityReport.unresolvedConflicts === 0 ? "#34d399"
-                  : "#f87171",
-              }}>
-                {qualityReport.unresolvedConflicts == null
-                  ? "—"
-                  : <>{qualityReport.unresolvedConflicts}<span style={{ fontSize:9, color:"#64748b", fontWeight:400 }}>건</span></>
-                }
-              </div>
-            </div>
-          </div>
-
-          {/* 추천 액션 */}
-          <div style={{
-            padding:"10px 12px",
-            background:"rgba(167,139,250,0.06)",
-            border:"1px solid rgba(167,139,250,0.2)",
-            borderRadius:8,
-          }}>
-            <div style={{ fontSize:10.5, color:"#a78bfa", fontWeight:700, marginBottom:6 }}>
-              💡 추천 다음 행동
-            </div>
-            {qualityReport.recommendations.map((rec, i) => (
-              <div key={i} style={{
-                fontSize:11, color:"#cbd5e1", lineHeight:1.6,
-                paddingLeft: rec.startsWith("✨") ? 0 : 12,
-                position:"relative",
-              }}>
-                {!rec.startsWith("✨") && (
-                  <span style={{
-                    position:"absolute", left:0, top:0,
-                    color:"#a78bfa",
-                  }}>→</span>
-                )}
-                {rec}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <button onClick={onReload} disabled={loading} style={{
-        width:"100%", padding:"10px", marginTop:8,
-        background:"rgba(51,65,85,0.3)", border:"1px solid rgba(51,65,85,0.4)",
-        borderRadius:8, color:"#64748b", fontSize:12, cursor:"pointer",
-        display:"flex", alignItems:"center", justifyContent:"center", gap:8,
-      }}>
-        {loading ? <><Spinner/>로딩 중...</> : "🔄 최신 데이터 불러오기"}
-      </button>
-
-      {/* ─── 빈약 데이터 재학습 (Step 7-11) ─── */}
-      {qualityReport && qualityReport.weakAutoItems && qualityReport.weakAutoItems.length > 0 && (
-        <div style={{
-          marginTop:18, padding:"14px 16px",
-          background:"rgba(99,102,241,0.05)",
-          border:"1px solid rgba(99,102,241,0.25)",
-          borderRadius:10,
-        }}>
-          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
-            <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1" }}>
-              🔄 빈약 학습 데이터 재학습
-            </div>
-            <span style={{
-              background:"rgba(99,102,241,0.15)",
-              border:"1px solid rgba(99,102,241,0.3)",
-              borderRadius:10, padding:"2px 8px",
-              fontSize:9.5, fontWeight:700, color:"#a5b4fc",
-            }}>{qualityReport.weakAutoItems.length}건</span>
-          </div>
-          <div style={{ fontSize:10.5, color:"#64748b", marginBottom:10, lineHeight:1.6 }}>
-            200자 제한 시기에 학습된 빈약한 자동학습 항목들을 Drive 폴더 원본으로 다시 분석하여
-            품질을 개선합니다. (현재 v10 프롬프트 적용, 청크 분할 자동)
-          </div>
-
-          {relearning ? (
-            <div>
-              <div style={{ fontSize:11, color:"#cbd5e1", marginBottom:6 }}>
-                ⏳ {relearnProgress.current}/{relearnProgress.total} — {relearnProgress.currentFile || "준비 중..."}
-              </div>
-              <div style={{
-                height:6, background:"rgba(51,65,85,0.4)", borderRadius:3, overflow:"hidden",
-              }}>
-                <div style={{
-                  width: relearnProgress.total > 0
-                    ? `${(relearnProgress.current / relearnProgress.total) * 100}%` : "0%",
-                  height:"100%", background:"#a5b4fc",
-                  transition:"width 0.3s ease",
-                }}/>
-              </div>
-            </div>
-          ) : (
-            <button
-              onClick={onStartRelearn}
-              style={{
-                width:"100%", padding:"10px",
-                background:"rgba(99,102,241,0.15)",
-                border:"1px solid rgba(99,102,241,0.4)",
-                borderRadius:6, color:"#a5b4fc",
-                fontSize:12, fontWeight:700, cursor:"pointer",
-              }}
-            >📥 재학습 시작 ({qualityReport.weakAutoItems.length}건)</button>
-          )}
-        </div>
-      )}
-
-      {/* ─── 자동 감지 결과 (Step 7-4) ─── */}
-      {(autoConflicts.length > 0 || autoCheckBusy) && (
-        <div style={{
-          marginTop:18, padding:"14px 16px",
-          background:"rgba(245,158,11,0.05)",
-          border:"1px solid rgba(245,158,11,0.25)",
-          borderRadius:10,
-        }}>
-          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
-            <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1" }}>
-              ⚡ 자동 감지 결과
-            </div>
-            {autoCheckBusy && (
-              <span style={{
-                background:"rgba(100,116,139,0.15)",
-                border:"1px solid rgba(100,116,139,0.3)",
-                borderRadius:10, padding:"2px 8px",
-                fontSize:9.5, fontWeight:700, color:"#94a3b8",
-                display:"flex", alignItems:"center", gap:4,
-              }}><Spinner/>점검 중</span>
-            )}
-          </div>
-          <div style={{ fontSize:10.5, color:"#64748b", marginBottom:10, lineHeight:1.6 }}>
-            새로 추가된 학습 항목과 기존 항목 간 중복/충돌을 자동으로 검사한 결과입니다.
-            (브라우저 세션에만 저장 · 새로고침 시 초기화)
-          </div>
-
-          {autoConflicts.length === 0 && !autoCheckBusy ? null : autoConflicts.length === 0 ? (
-            <div style={{ fontSize:11, color:"#94a3b8", textAlign:"center", padding:"10px 0" }}>
-              현재 검사 진행 중...
-            </div>
-          ) : (
-            autoConflicts.map((c, idx) => (
-              <div key={idx} style={{
-                background:"rgba(15,23,42,0.6)",
-                border:`1px solid ${c.resolved ? "rgba(52,211,153,0.4)" : "rgba(245,158,11,0.3)"}`,
-                borderRadius:8, padding:"12px 14px", marginBottom:10,
-                opacity: c.resolved ? 0.6 : 1,
-              }}>
-                <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8, flexWrap:"wrap" }}>
-                  <span style={{
-                    background: c.type === "duplicate" ? "rgba(167,139,250,0.2)" : "rgba(245,158,11,0.2)",
-                    color: c.type === "duplicate" ? "#a78bfa" : "#fbbf24",
-                    padding:"2px 7px", borderRadius:4, fontSize:9, fontWeight:800,
-                  }}>{c.type === "duplicate" ? "중복" : "충돌"}</span>
-                  <span style={{ fontSize:10, color:"#64748b" }}>
-                    {c.itemA.category}
-                    {c.itemA.category !== c.itemB.category && ` ↔ ${c.itemB.category}`}
-                  </span>
-                  {c.resolved && (
-                    <span style={{ marginLeft:"auto", fontSize:10, color:"#34d399", fontWeight:700 }}>
-                      ✓ 처리됨
-                    </span>
-                  )}
-                </div>
-
-                {c.reason && (
-                  <div style={{ fontSize:10.5, color:"#94a3b8", marginBottom:8, fontStyle:"italic" }}>
-                    {c.reason}
-                  </div>
-                )}
-
-                <div style={{ marginBottom:6 }}>
-                  <div style={{ fontSize:9.5, color:"#64748b", fontWeight:700, marginBottom:3 }}>새 항목 (A)</div>
-                  <div style={{
-                    fontSize:11, color:"#cbd5e1",
-                    background:"rgba(30,41,59,0.5)", padding:"6px 9px", borderRadius:5,
-                    borderLeft:`2px solid ${roleInfo.color}`,
-                    lineHeight:1.5, wordBreak:"break-word", whiteSpace:"pre-wrap",
-                  }}>{c.itemA.content}</div>
-                </div>
-                <div style={{ marginBottom:c.resolved ? 0 : 8 }}>
-                  <div style={{ fontSize:9.5, color:"#64748b", fontWeight:700, marginBottom:3 }}>기존 항목 (B)</div>
-                  <div style={{
-                    fontSize:11, color:"#cbd5e1",
-                    background:"rgba(30,41,59,0.5)", padding:"6px 9px", borderRadius:5,
-                    borderLeft:"2px solid rgba(100,116,139,0.5)",
-                    lineHeight:1.5, wordBreak:"break-word", whiteSpace:"pre-wrap",
-                  }}>{c.itemB.content}</div>
-                </div>
-
-                {!c.resolved && onResolveAutoConflict && (
-                  <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-                    <button
-                      onClick={() => onResolveAutoConflict(idx, "skip")}
-                      style={{
-                        flex:1, padding:"6px 8px",
-                        background:"rgba(51,65,85,0.4)",
-                        border:"1px solid rgba(51,65,85,0.5)",
-                        borderRadius:5, color:"#94a3b8", fontSize:10,
-                        cursor:"pointer", fontWeight:600,
-                      }}
-                    >건너뛰기</button>
-                    <button
-                      onClick={async () => {
-                        // 새 항목 삭제 (B 유지)
-                        try {
-                          await deleteKnowledge(role, c.itemA.category, c.itemA.content);
-                          onResolveAutoConflict(idx, "keep_b");
-                          await onReload();
-                        } catch (e) { alert("처리 실패"); }
-                      }}
-                      style={{
-                        flex:1, padding:"6px 8px",
-                        background:"rgba(239,68,68,0.1)",
-                        border:"1px solid rgba(239,68,68,0.3)",
-                        borderRadius:5, color:"#f87171", fontSize:10,
-                        cursor:"pointer", fontWeight:600,
-                      }}
-                    >A 삭제</button>
-                    <button
-                      onClick={async () => {
-                        // 기존 항목 삭제 (A 유지)
-                        try {
-                          await deleteKnowledge(role, c.itemB.category, c.itemB.content);
-                          onResolveAutoConflict(idx, "keep_a");
-                          await onReload();
-                        } catch (e) { alert("처리 실패"); }
-                      }}
-                      style={{
-                        flex:1, padding:"6px 8px",
-                        background:"rgba(239,68,68,0.1)",
-                        border:"1px solid rgba(239,68,68,0.3)",
-                        borderRadius:5, color:"#f87171", fontSize:10,
-                        cursor:"pointer", fontWeight:600,
-                      }}
-                    >B 삭제</button>
-                  </div>
-                )}
-              </div>
-            ))
-          )}
-        </div>
-      )}
-
-      {/* 데이터 정리 (풀 검사) */}
-      <div style={{
-        marginTop:18, padding:"14px 16px",
-        background:"rgba(167,139,250,0.05)",
-        border:"1px solid rgba(167,139,250,0.2)",
-        borderRadius:10,
-      }}>
-        <div style={{ fontSize:13, fontWeight:700, color:"#cbd5e1", marginBottom:4 }}>
-          🔍 학습 데이터 정리
-        </div>
-        <div style={{ fontSize:10.5, color:"#64748b", marginBottom:10, lineHeight:1.6 }}>
-          카테고리별 중복/충돌을 한꺼번에 검토합니다. (약 30초~1분 소요)
-        </div>
-        <button onClick={startFullScan} disabled={scanning || knowledge.length < 2} style={{
-          width:"100%", padding:"10px",
-          background: scanning || knowledge.length < 2 ? "rgba(51,65,85,0.3)" : "linear-gradient(135deg,#a78bfa,#7c3aed)",
-          border:"none", borderRadius:8,
-          color: scanning || knowledge.length < 2 ? "#475569" : "#fff",
-          fontSize:12, fontWeight:700,
-          cursor: scanning || knowledge.length < 2 ? "not-allowed" : "pointer",
-          display:"flex", alignItems:"center", justifyContent:"center", gap:8,
-        }}>
-          {scanning ? <><Spinner/>검사 중...</> : "🔎 전체 검사 시작"}
-        </button>
-
-        {/* 검사 결과 표시 */}
-        {scanResults && (
-          <div style={{ marginTop:14 }}>
-            <div style={{ fontSize:11, color:"#94a3b8", marginBottom:10 }}>
-              {scanResults.conflicts.length === 0
-                ? `✅ 검사 완료 (${scanResults.scannedAt}) — 정리할 항목 없음`
-                : `⚠️ ${scanResults.conflicts.length}쌍의 중복/충돌 발견 (${scanResults.scannedAt})`
-              }
-            </div>
-
-            {scanResults.conflicts.map((c, idx) => (
-              <div key={idx} style={{
-                background:"rgba(15,23,42,0.6)",
-                border:`1px solid ${c.resolved ? "rgba(52,211,153,0.4)" : "rgba(245,158,11,0.3)"}`,
-                borderRadius:8, padding:"12px 14px", marginBottom:10,
-                opacity: c.resolved ? 0.6 : 1,
-              }}>
-                <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
-                  <span style={{
-                    background: c.type === "duplicate" ? "rgba(167,139,250,0.2)" : "rgba(245,158,11,0.2)",
-                    color: c.type === "duplicate" ? "#a78bfa" : "#fbbf24",
-                    padding:"2px 7px", borderRadius:4, fontSize:9, fontWeight:800,
-                  }}>{c.type === "duplicate" ? "중복" : "충돌"}</span>
-                  <span style={{ fontSize:10, color:"#64748b" }}>{c.category}</span>
-                  {c.resolved && (
-                    <span style={{ marginLeft:"auto", fontSize:10, color:"#34d399", fontWeight:700 }}>
-                      ✓ 처리됨 ({c.resolvedAs === "keep_a" ? "A 유지" :
-                                c.resolvedAs === "keep_b" ? "B 유지" :
-                                c.resolvedAs === "keep_both" ? "둘 다" : "건너뜀"})
-                    </span>
-                  )}
-                </div>
-
-                {c.reason && (
-                  <div style={{ fontSize:10.5, color:"#94a3b8", marginBottom:8, fontStyle:"italic" }}>
-                    {c.reason}
-                  </div>
-                )}
-
-                <div style={{ marginBottom:6 }}>
-                  <div style={{ fontSize:9.5, color:"#64748b", fontWeight:700, marginBottom:3 }}>A</div>
-                  <div style={{
-                    background:"rgba(8,14,26,0.6)", padding:"7px 10px",
-                    borderRadius:5, fontSize:11, color:"#cbd5e1", lineHeight:1.5,
-                  }}>{c.itemA.content}</div>
-                </div>
-                <div style={{ marginBottom: c.resolved ? 0 : 10 }}>
-                  <div style={{ fontSize:9.5, color:"#64748b", fontWeight:700, marginBottom:3 }}>B</div>
-                  <div style={{
-                    background:"rgba(8,14,26,0.6)", padding:"7px 10px",
-                    borderRadius:5, fontSize:11, color:"#cbd5e1", lineHeight:1.5,
-                  }}>{c.itemB.content}</div>
-                </div>
-
-                {!c.resolved && (
-                  <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:5 }}>
-                    <button onClick={() => resolveConflict(idx, "keep_a")}
-                      disabled={resolving === idx} style={smallBtnStyle("#34d399")}>
-                      A 유지
-                    </button>
-                    <button onClick={() => resolveConflict(idx, "keep_b")}
-                      disabled={resolving === idx} style={smallBtnStyle("#3b82f6")}>
-                      B 유지
-                    </button>
-                    <button onClick={() => resolveConflict(idx, "keep_both")}
-                      disabled={resolving === idx} style={smallBtnStyle("#a78bfa")}>
-                      둘 다 유지
-                    </button>
-                    <button onClick={() => resolveConflict(idx, "skip")}
-                      disabled={resolving === idx} style={smallBtnStyle("#64748b")}>
-                      건너뛰기
-                    </button>
-                  </div>
-                )}
-              </div>
-            ))}
-
-            {scanResults.conflicts.length > 0 && (
-              <div style={{ fontSize:10, color:"#64748b", marginTop:6, textAlign:"center" }}>
-                💡 처리 후 "최신 데이터 불러오기"로 새로고침하세요
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* 저장된 내용 */}
-      {knowledge.length > 0 && (
-        <div style={{ marginTop:20 }}>
-          <div style={{ fontSize:10, color:"#374151", fontWeight:700, letterSpacing:1, marginBottom:10 }}>
-            📋 저장된 학습 내용 ({knowledge.length}건)
-          </div>
-          {knowledge.map((k,i) => {
-            // [이미지URL] https://... 패턴 추출
-            const urlMatch = k.content && k.content.match(/\[이미지URL\]\s*(https?:\/\/[^\s\n]+)/);
-            const imageUrl = urlMatch ? urlMatch[1] : null;
-            // URL 라인을 제외한 나머지 텍스트 (가독성을 위해)
-            const contentWithoutUrl = imageUrl
-              ? k.content.replace(/\[이미지URL\]\s*https?:\/\/[^\s\n]+\n?/, "")
-              : k.content;
-
-            return (
-              <div key={i} style={{
-                background:"rgba(8,14,26,0.7)", border:"1px solid rgba(51,65,85,0.3)",
-                borderRadius:8, padding:"10px 13px", marginBottom:7,
-              }}>
-                <div style={{
-                  display:"flex", alignItems:"center", gap:8, marginBottom:4,
-                }}>
-                  <div style={{ fontSize:10, color:roleInfo.color, fontWeight:700 }}>
-                    {k.category}
-                  </div>
-                  {imageUrl && (
-                    <a href={imageUrl} target="_blank" rel="noopener noreferrer" style={{
-                      fontSize:10, color:"#93c5fd", textDecoration:"none",
-                      background:"rgba(59,130,246,0.12)", padding:"2px 7px",
-                      borderRadius:4, border:"1px solid rgba(59,130,246,0.25)",
-                    }}>
-                      🖼️ 이미지 보기
-                    </a>
-                  )}
-                </div>
-                <div style={{ fontSize:11.5, color:"#94a3b8", lineHeight:1.6,
-                  whiteSpace:"pre-wrap" }}>
-                  {contentWithoutUrl}
-                </div>
-                <div style={{ fontSize:9.5, color:"#374151", marginTop:4 }}>{k.updated_at}</div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {knowledge.length === 0 && !loading && (
-        <div style={{ textAlign:"center", padding:"30px 0", color:"#374151" }}>
-          <div style={{ fontSize:32, marginBottom:8 }}>📭</div>
-          <div style={{ fontSize:12 }}>아직 학습된 내용이 없어요</div>
-          <div style={{ fontSize:10, marginTop:4 }}>STEP 1~3을 진행하면 여기에 쌓입니다</div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── 전체 학습 대시보드 (에이전트 선택 화면용) ────────────────────────────────
-function HomeDashboard() {
-  const [data, setData] = useState([]);
-  const [selected, setSelected] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-
-  const fetchData = async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const raw = await loadAllProgress();
-      if (raw.length === 0) {
-        setError("데이터를 불러올 수 없습니다");
-        setLoading(false);
-        return;
-      }
-      const merged = raw.map(a => ({
-        ...a,
-        line: DASHBOARD_AGENT_META[a.role]?.line || "공통",
-        roleType: DASHBOARD_AGENT_META[a.role]?.role || "-",
-        agentColor: DASHBOARD_AGENT_META[a.role]?.color || "#94a3b8",
-      }));
-      setData(merged);
-    } catch (e) {
-      setError(`로드 실패: ${e.message}`);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => { fetchData(); }, []);
-
-  const enriched = data.length > 0
-    ? data.map(a => ({ ...a, ...calcDashboardScore(a) }))
-        .sort((a, b) => b.totalScore - a.totalScore)
-    : [];
-
-  if (loading && enriched.length === 0) {
-    return (
-      <div style={{ textAlign:"center", padding:"40px 0", color:"#64748b" }}>
-        <Spinner/>
-        <div style={{ marginTop:10, fontSize:12 }}>학습 데이터 로딩 중...</div>
-      </div>
-    );
+/** PLC 태그 인덱스 검색 — 이름/주소 매칭. */
+function searchPlcTagIndex(question, plcIdx) {
+  if (!plcIdx) return { byName: [], byAddress: [] };
+  const byName = plcIdx.by_name || {};
+  const byAddress = plcIdx.by_address || {};
+
+  const addrCands = extractPlcAddressCandidates(question)
+    .filter(function(s) { return /^%/.test(s); }); // %주소만
+  // 태그 이름 후보 — CamelCase 또는 snake_case (5자+)
+  const nameCandsRaw = (question.match(/\b[a-zA-Z][\w_]{4,}\b/g) || []);
+  const nameCands = [];
+  const seenName = {};
+  for (var i = 0; i < nameCandsRaw.length; i++) {
+    const n = nameCandsRaw[i];
+    if (!seenName[n]) { seenName[n] = true; nameCands.push(n); }
   }
 
-  if (error && enriched.length === 0) {
-    return (
-      <div style={{ textAlign:"center", padding:"30px 0" }}>
-        <div style={{ fontSize:24, marginBottom:6 }}>⚠️</div>
-        <div style={{ fontSize:12, color:"#ef4444", marginBottom:12 }}>{error}</div>
-        <button onClick={fetchData} style={{
-          padding:"7px 16px", background:"rgba(59,130,246,0.15)",
-          border:"1px solid rgba(59,130,246,0.3)", borderRadius:7,
-          color:"#93c5fd", fontSize:11, fontWeight:700, cursor:"pointer",
-        }}>🔄 다시 시도</button>
-      </div>
-    );
+  const result = { byName: [], byAddress: [] };
+
+  // 1) 주소 매칭
+  for (var i = 0; i < addrCands.length && result.byAddress.length < 3; i++) {
+    const a = addrCands[i];
+    if (byAddress[a]) {
+      const names = byAddress[a];
+      const detail = names.slice(0, 5).map(function(n) {
+        return { name: n, data: byName[n] || {} };
+      });
+      result.byAddress.push({ address: a, names: names, samples: detail });
+    }
   }
 
-  // 통계
-  const avgScore = Math.round(enriched.reduce((s, a) => s + a.totalScore, 0) / enriched.length);
-  const cellAgents = enriched.filter(a => a.line === "Cell");
-  const elecAgents = enriched.filter(a => a.line === "Elec");
-  const cellAvg = cellAgents.length > 0
-    ? Math.round(cellAgents.reduce((s, a) => s + a.totalScore, 0) / cellAgents.length) : 0;
-  const elecAvg = elecAgents.length > 0
-    ? Math.round(elecAgents.reduce((s, a) => s + a.totalScore, 0) / elecAgents.length) : 0;
-  const totalItems = enriched.reduce((s, a) => s + (a.itemCount || 0), 0);
-  const totalCorrections = enriched.reduce((s, a) => s + (a.correctionCount || 0), 0);
-
-  const sel = selected || enriched[0];
-  const maxItem = Math.max(...enriched.map(a => a.itemCount || 0), 1);
-
-  return (
-    <div style={{ textAlign:"left" }}>
-      {/* KPI 5개 */}
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(5, 1fr)", gap:6, marginBottom:18 }}>
-        <KpiCard label="전체" value={avgScore} suffix="점" color="#a78bfa" />
-        <KpiCard label="Cell" value={cellAvg} suffix="점" color={LINE_COLORS.Cell} />
-        <KpiCard label="Elec" value={elecAvg} suffix="점" color={LINE_COLORS.Elec} />
-        <KpiCard label="학습" value={totalItems} suffix="건" color="#34d399" />
-        <KpiCard label="교정" value={totalCorrections} suffix="건" color="#fbbf24" />
-      </div>
-
-      {/* 종합 순위 */}
-      <div style={{ marginBottom:18 }}>
-        <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:8, letterSpacing:1 }}>
-          🏆 종합 순위
-        </div>
-        <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-          {enriched.map((a, idx) => (
-            <RankRow key={a.role} rank={idx+1} agent={a}
-              isSelected={sel?.role === a.role}
-              onClick={() => setSelected(a)} />
-          ))}
-        </div>
-      </div>
-
-      {/* 선택된 에이전트 상세 */}
-      {sel && (
-        <div style={{ marginBottom:18 }}>
-          <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:8, letterSpacing:1 }}>
-            🔍 {sel.role} 상세 · {sel.line} · {sel.roleType}
-          </div>
-          <div style={{
-            background:"rgba(15,23,42,0.6)",
-            border:`1px solid ${sel.agentColor}25`,
-            borderRadius:10, padding:14,
-          }}>
-            <ProgressBar label={`학습 항목 (${sel.itemCount}건)`} value={sel.itemScore} color={sel.agentColor} />
-            <ProgressBar label={`내용 총량 (${sel.contentLength.toLocaleString()}자)`} value={sel.contentScore} color={sel.agentColor} />
-            <ProgressBar label={`카테고리 (${sel.categoryCount}종)`} value={sel.categoryScore} color={sel.agentColor} />
-            <ProgressBar label={`교정 사례 (${sel.correctionCount}건)`} value={sel.correctionScore} color={sel.agentColor} />
-            <ProgressBar label={`최신성 (최근 30일 ${sel.recentRate}%)`} value={sel.freshnessScore} color={sel.agentColor} />
-
-            <div style={{
-              marginTop:8, paddingTop:8,
-              borderTop:"1px solid rgba(51,65,85,0.4)",
-              display:"flex", justifyContent:"space-between", fontSize:10,
-            }}>
-              <span style={{ color:"#64748b" }}>마지막 업데이트</span>
-              <span style={{ color:"#cbd5e1", fontWeight:700 }}>
-                {sel.lastUpdate || "데이터 없음"}
-              </span>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 학습 항목 비교 */}
-      <div style={{ marginBottom:14 }}>
-        <div style={{ fontSize:11, color:"#64748b", fontWeight:700, marginBottom:8, letterSpacing:1 }}>
-          📈 학습 항목 수
-        </div>
-        <div style={{
-          background:"rgba(15,23,42,0.5)", border:"1px solid rgba(51,65,85,0.3)",
-          borderRadius:10, padding:12,
-        }}>
-          {enriched.map(a => (
-            <div key={a.role} style={{ marginBottom:7 }}>
-              <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
-                <span style={{ fontSize:10.5, color:"#cbd5e1", fontWeight:600 }}>
-                  <span style={{ color: a.agentColor, marginRight:5 }}>●</span>{a.role}
-                </span>
-                <span style={{ fontSize:10.5, color: a.agentColor, fontWeight:700 }}>
-                  {a.itemCount}건
-                </span>
-              </div>
-              <div style={{ height:5, background:"rgba(51,65,85,0.5)", borderRadius:3 }}>
-                <div style={{
-                  height:"100%", borderRadius:3,
-                  width:`${(a.itemCount/maxItem)*100}%`,
-                  background:`linear-gradient(90deg, ${a.agentColor}, ${a.agentColor}99)`,
-                  transition:"width 0.5s ease",
-                }}/>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* 지표 설명 */}
-      <div style={{
-        background:"rgba(8,14,26,0.6)", border:"1px solid rgba(51,65,85,0.3)",
-        borderRadius:8, padding:"10px 12px", fontSize:9.5, color:"#64748b",
-        lineHeight:1.7,
-      }}>
-        <div style={{ fontWeight:700, color:"#94a3b8", marginBottom:5 }}>📖 평가 지표 (5개 평균, 절대평가)</div>
-        <div>• <b style={{ color:"#cbd5e1" }}>학습 항목</b>: 등록된 row 수 (목표 300건)</div>
-        <div>• <b style={{ color:"#cbd5e1" }}>내용 총량</b>: content 글자수 합계 (목표 80,000자)</div>
-        <div>• <b style={{ color:"#cbd5e1" }}>카테고리</b>: unique category 개수 (목표 5종)</div>
-        <div>• <b style={{ color:"#cbd5e1" }}>교정 사례</b>: 교정사례 카테고리 row 수 (목표 60건)</div>
-        <div>• <b style={{ color:"#cbd5e1" }}>최신성</b>: 최근 30일 내 업데이트 비율 (목표 70%, 가중치 0.5배)</div>
-      </div>
-    </div>
-  );
+  // 2) 이름 매칭 (정확 우선, 부분 매칭은 보조)
+  for (var i = 0; i < nameCands.length && result.byName.length < 5; i++) {
+    const cand = nameCands[i];
+    // 정확 매칭
+    if (byName[cand]) {
+      result.byName.push({ name: cand, data: byName[cand], matchType: "exact" });
+      continue;
+    }
+    // 부분 매칭 — 후보 길이 7자+만 (노이즈 차단)
+    if (cand.length >= 7) {
+      const candLow = cand.toLowerCase();
+      const keys = Object.keys(byName);
+      for (var ki = 0; ki < keys.length; ki++) {
+        if (keys[ki].toLowerCase().indexOf(candLow) >= 0) {
+          result.byName.push({ name: keys[ki], data: byName[keys[ki]], matchType: "partial", matchedBy: cand });
+          break;
+        }
+      }
+    }
+  }
+  return result;
 }
 
-// 대시보드 - KPI 카드
-function KpiCard({ label, value, suffix, color }) {
-  return (
-    <div style={{
-      background:"rgba(15,23,42,0.7)",
-      border:"1px solid rgba(51,65,85,0.4)",
-      borderLeft:`3px solid ${color}`,
-      borderRadius:7, padding:"8px 10px",
-    }}>
-      <div style={{ fontSize:9, color:"#64748b", fontWeight:700, marginBottom:2,
-        letterSpacing:1, textTransform:"uppercase" }}>{label}</div>
-      <div style={{ display:"flex", alignItems:"baseline", gap:3 }}>
-        <span style={{ fontSize:18, fontWeight:800, color:"#f1f5f9" }}>{value}</span>
-        <span style={{ fontSize:10, color:"#475569" }}>{suffix}</span>
-      </div>
-    </div>
-  );
+/** 알람 검색 결과 → LLM 컨텍스트 텍스트. */
+function formatAlarmContext(alarmResult) {
+  if (!alarmResult) return "";
+  if (alarmResult.byId.length === 0 && alarmResult.byTrigger.length === 0 && alarmResult.byText.length === 0) return "";
+  const lines = ["", "## [HMI 알람 조회 결과] (hmi_alarm_index — 9048 알람)",
+    "WinCC HMI 알람 인덱스에서 검색한 결과입니다.",
+    "답변 시 'ⓘ 출처: WinCC 자동 조회 (HMI 알람 인덱스)' 라벨을 붙이세요.",
+    ""];
+
+  // ID 매칭
+  for (var i = 0; i < alarmResult.byId.length; i++) {
+    const m = alarmResult.byId[i];
+    lines.push("### 알람 ID " + m.id);
+    lines.push("  텍스트: " + (m.data.text || "?"));
+    lines.push("  클래스: " + (m.data.class || "?"));
+    lines.push("  트리거 태그: " + (m.data.trigger_tag || "?") + " (bit " + (m.data.trigger_bit || "?") + ")");
+    if (m.data.priority) lines.push("  우선순위: " + m.data.priority);
+    if (m.data.info_text) lines.push("  Info: " + m.data.info_text);
+    lines.push("");
+  }
+  // Trigger tag 역추적
+  for (var i = 0; i < alarmResult.byTrigger.length; i++) {
+    const m = alarmResult.byTrigger[i];
+    lines.push("### Trigger tag: " + m.trigger + " → 알람 " + m.total + "개 트리거");
+    const showN = Math.min(m.samples.length, 10);
+    for (var si = 0; si < showN; si++) {
+      const s = m.samples[si];
+      lines.push("  - ID " + s.id + ": " + (s.data.text || "?")
+        + " (bit " + (s.data.trigger_bit || "?") + ", " + (s.data.class || "?") + ")");
+    }
+    if (m.total > showN) lines.push("  ... 외 " + (m.total - showN) + "개");
+    lines.push("");
+  }
+  // 텍스트 키워드 검색
+  for (var i = 0; i < alarmResult.byText.length; i++) {
+    const m = alarmResult.byText[i];
+    lines.push("### 키워드 '" + m.keyword + "' 매칭: " + m.total + "개 알람");
+    for (var si = 0; si < m.samples.length; si++) {
+      const s = m.samples[si];
+      lines.push("  - ID " + s.id + ": " + (s.data.text || "?") + " (" + (s.data.class || "?") + ")");
+    }
+    if (m.total > m.samples.length) lines.push("  ... 외 " + (m.total - m.samples.length) + "개");
+    lines.push("");
+  }
+  return lines.join("\n");
 }
 
-// 대시보드 - 순위 행
-function RankRow({ rank, agent, isSelected, onClick }) {
-  return (
-    <div onClick={onClick} style={{
-      display:"grid",
-      gridTemplateColumns:"24px 1fr auto auto",
-      gap:10, alignItems:"center", padding:"8px 10px",
-      background: isSelected ? "rgba(51,65,85,0.5)" : "rgba(8,14,26,0.6)",
-      border: `1px solid ${isSelected ? agent.agentColor : "rgba(51,65,85,0.35)"}`,
-      borderRadius:7, cursor:"pointer", transition:"all 0.15s",
-    }}>
-      <div style={{
-        width:22, height:22, borderRadius:11,
-        background: rank <= 3 ? "#fbbf24" : "rgba(71,85,105,0.6)",
-        color: rank <= 3 ? "#1e293b" : "#cbd5e1",
-        display:"flex", alignItems:"center", justifyContent:"center",
-        fontSize:11, fontWeight:800,
-      }}>{rank}</div>
-      <div>
-        <div style={{ fontSize:12, fontWeight:700, color:"#f1f5f9" }}>{agent.role}</div>
-        <div style={{ fontSize:9.5, color:"#64748b" }}>
-          <span style={{ color: agent.agentColor }}>●</span> {agent.line} · {agent.roleType}
-        </div>
-      </div>
-      <div style={{
-        fontSize:9, padding:"2px 7px", borderRadius:9,
-        background: SCORE_COLOR(agent.totalScore) + "25",
-        color: SCORE_COLOR(agent.totalScore), fontWeight:700,
-      }}>{SCORE_LABEL(agent.totalScore)}</div>
-      <div style={{
-        fontSize:16, fontWeight:800, color:"#f1f5f9",
-        minWidth:32, textAlign:"right",
-      }}>{agent.totalScore}</div>
-    </div>
-  );
+/** PLC 태그 검색 결과 → LLM 컨텍스트 텍스트. */
+function formatPlcTagContext(plcResult) {
+  if (!plcResult) return "";
+  if (plcResult.byName.length === 0 && plcResult.byAddress.length === 0) return "";
+  const lines = ["", "## [PLC 태그 조회 결과] (plc_tag_index — 2020 태그 + 942 상수)",
+    "WinCC PLC Tag 사전에서 검색한 결과입니다.",
+    "답변 시 'ⓘ 출처: WinCC 자동 조회 (PLC 태그 인덱스)' 라벨을 붙이세요.",
+    ""];
+
+  for (var i = 0; i < plcResult.byName.length; i++) {
+    const m = plcResult.byName[i];
+    lines.push("### 태그: " + m.name + (m.matchType === "partial" ? "  (검색어: " + m.matchedBy + ")" : ""));
+    if (m.data.kind) lines.push("  종류: " + m.data.kind);
+    if (m.data.path) lines.push("  경로: " + m.data.path);
+    if (m.data.data_type) lines.push("  타입: " + m.data.data_type);
+    if (m.data.address) lines.push("  주소: " + m.data.address);
+    if (m.data.value) lines.push("  값: " + m.data.value);
+    if (m.data.comment) lines.push("  코멘트: " + m.data.comment);
+    lines.push("");
+  }
+  for (var i = 0; i < plcResult.byAddress.length; i++) {
+    const m = plcResult.byAddress[i];
+    lines.push("### 주소: " + m.address + " → 태그 " + m.names.length + "개");
+    for (var si = 0; si < m.samples.length; si++) {
+      const s = m.samples[si];
+      lines.push("  - " + s.name + ": " + (s.data.comment || "(코멘트 없음)")
+        + " [" + (s.data.data_type || "?") + "]");
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+// ──────────────────────────────────────────────────────────────────
+
+/**
+ * KB 항목마다 src_NNN id를 부여하여 (1) LLM에 줄 컨텍스트 텍스트와
+ * (2) id→출처메타 맵(srcMap)을 함께 만든다.
+ * sources[]는 LLM이 아니라 코드가 srcMap에서 조립 → URL 환각 방지.
+ */
+function buildKbContextAndSources(items, agent) {
+  const srcMap = {};
+  const blocks = [];
+  items.forEach(function (it, idx) {
+    const id = "src_" + String(idx + 1).padStart(3, "0");
+    const fileName = it.source_file || "(출처 미상)";
+    const section = it.source_section || "";
+    const title = section ? (fileName + " / " + section) : fileName;
+    srcMap[id] = {
+      id: id,
+      type: inferSourceType(fileName),
+      agent: agent,
+      title: title,
+      link: it.source_url || "",
+    };
+    const pageInfo = it.source_page ? (" (페이지 " + it.source_page + ")") : "";
+    blocks.push("[" + id + "] 출처: " + title + pageInfo + "\n" + it.content);
+  });
+  return { kbContext: blocks.join("\n\n---\n\n"), srcMap: srcMap };
 }
 
-// ─── 메인 앱 ─────────────────────────────────────────────────────────────────
-const TABS = [
-  { id:0, icon:"💬", label:"채팅 학습" },
-  { id:1, icon:"📋", label:"업무 규칙" },
-  { id:2, icon:"🎯", label:"상황 교정" },
-  { id:3, icon:"📄", label:"문서·사진" },
-  { id:4, icon:"📚", label:"보관함" },
-  { id:5, icon:"🧠", label:"학습 현황" },
-];
+/**
+ * 파일명으로 출처 타입 추론 (§5-5: scl|manual|pdf|ppt|spec).
+ * 정확도가 완벽하지 않아도 별도 앱 배지색 용도라 무방. 기본값 manual.
+ */
+function inferSourceType(filename) {
+  const f = String(filename || "").toLowerCase();
+  if (/\.scl$|\.awl$|\bscl\b|fb_|fc_|\bob_|\bdb_/.test(f)) return "scl";
+  if (/\.pdf$/.test(f)) return "pdf";
+  if (/\.pptx?$/.test(f)) return "ppt";
+  if (/spec|사양|규격|specification/.test(f)) return "spec";
+  if (/manual|매뉴얼|정비|guide/.test(f)) return "manual";
+  return "manual";
+}
 
-export default function App() {
-  const role = getRole();
-  const roleInfo = role ? ROLE_CONFIG[role] : null;
-  const [tab, setTab] = useState(0);
-  const [knowledge, setKnowledge] = useState([]);
-  const [loadingKB, setLoadingKB] = useState(false);
-  const [showDashboard, setShowDashboard] = useState(false);
+/**
+ * system / user 프롬프트 조립. PLC 규칙·다국어·출처마커·출력스키마를 system에 명시.
+ */
+function buildQueryPrompts(opts) {
+  let langInstruction;
+  if (opts.lang === "ko") langInstruction = "반드시 한국어로 answer를 작성하세요.";
+  else if (opts.lang === "en") langInstruction = "Write the answer strictly in English.";
+  else if (opts.lang === "id") langInstruction = "Tulis seluruh answer dalam Bahasa Indonesia.";
+  else langInstruction = "answer는 사용자 질문과 동일한 언어로 작성하세요 (한국어→한국어, Bahasa→Bahasa, English→English). 입력 언어를 자동 감지하세요.";
 
-  // ─── 학습자료 폴더 동기화 (Step 5-C) ───
-  const [folderScan, setFolderScan] = useState({ roleFiles: [], commonFiles: [] });
-  const [scanning, setScanning] = useState(false);
-  const [showSyncDialog, setShowSyncDialog] = useState(false);
-  const [syncingFiles, setSyncingFiles] = useState(false);
-  const [syncProgress, setSyncProgress] = useState({ current: 0, total: 0, currentFile: "" });
-  const [syncResult, setSyncResult] = useState(null);
-  const [showPdfModeDialog, setShowPdfModeDialog] = useState(false); // PDF 모드 선택 모달
-  const [syncPdfMode, setSyncPdfMode] = useState("auto"); // "auto" | "vision"
-  // v26: 백그라운드 학습 (수준 A-2) — Wake Lock(화면 꺼짐 방지) + 이탈 경고
-  const wakeLockRef = useRef(null);                              // 현재 보유한 WakeLockSentinel
-  const [wakeLockUnsupported, setWakeLockUnsupported] = useState(false); // 브라우저 미지원 안내용
-
-  // ─── 일관성 자동 점검 (Step 7-4) ───
-  // autoConflicts: 자동 감지된 충돌/중복 (세션 메모리에만 보관, 브라우저 재시작 시 초기화)
-  const [autoConflicts, setAutoConflicts] = useState([]);
-  // 마지막으로 검사한 시점의 knowledge 스냅샷 (signature 비교용)
-  const lastCheckedSignatureRef = useRef(null);
-  // 현재 점검 진행 중인지 (중복 호출 방지)
-  const checkingRef = useRef(false);
-  const [autoCheckBusy, setAutoCheckBusy] = useState(false);
-
-  // ─── 빈약 데이터 재학습 (Step 7-11) ─────────────────────────────────
-  // 상태: 모달 표시, 진행률, 결과
-  const [showRelearnDialog, setShowRelearnDialog] = useState(false);
-  const [relearning, setRelearning] = useState(false);
-  const [relearnProgress, setRelearnProgress] = useState({ current: 0, total: 0, currentFile: "" });
-  const [relearnResult, setRelearnResult] = useState(null);
-  const relearnCancelRef = useRef(false);
-
-  // 빈약 항목에서 파일명 추출 (v14: prefix별 명시 패턴, 공백 허용)
-  // 시트의 실제 prefix 형태:
-  //   [자동학습-제작사양서/220421 OHT 제작 사양서 v1.3.pdf] ← 공백 포함
-  //   [파일: 1000228935.jpg]
-  //   [PDF: my-file.pdf - 그림 분석, 11페이지]
-  // 공통: 대괄호 ] 가 종료자. 그 안에 공백 허용.
-  const extractFilenameFromWeakItem = (content) => {
-    if (!content) return null;
-    const head = content.slice(0, 500);
-    // 3가지 prefix 패턴별 매칭 (대괄호 안 ] 직전까지)
-    const patterns = [
-      /\[자동학습-([^\]]+?\.(?:pdf|png|jpg|jpeg))\]/i,
-      /\[파일:\s*([^\]]+?\.(?:pdf|png|jpg|jpeg))\s*\]/i,
-      /\[PDF:\s*([^\]\s]+(?:\s+[^\]\s]+)*?\.pdf)/i,
+  // v13: 지식 사용 정책 — PLC_KNOWLEDGE_MODE에 따라 분기 (별도 앱 논의 1·2번)
+  let knowledgePolicy;
+  let sourceMarkerExtra = null;
+  if (PLC_KNOWLEDGE_MODE === "strict") {
+    knowledgePolicy = [
+      "## 지식 사용 정책 (strict 모드 — 폐쇄형)",
+      "- 아래 [학습 자료]에 있는 내용만 사용하세요. 학습 자료에 없는 내용은 절대 언급하지 마세요.",
+      "- 일반 지식·외부 상식·추정으로 보충하지 마세요.",
+      "- 학습 자료에서 답을 찾을 수 없으면 status를 \"not_found\"로 하세요.",
     ];
-    for (const pat of patterns) {
-      const m = head.match(pat);
-      if (m) {
-        let fname = m[1].trim();
-        // subPath 제거 — basename만
-        fname = fname.split("/").pop().split("\\").pop();
-        return fname.trim();
+  } else {
+    // v16: hybrid 4단계 출처 라벨링 — 표준 매뉴얼 지식까지 적극 답변 + 사용자가 출처 신뢰도 판단 가능
+    knowledgePolicy = [
+      "## 지식 사용 정책 (hybrid 모드 — 4단계 출처 라벨링)",
+      "",
+      "판단 기준은 '출처 유무'가 아니라 '확실성'입니다. 확실히 아는 것은 답하되, 답변의 출처를 아래 4단계로 명시하세요.",
+      "",
+      "### 4단계 출처 카테고리",
+      "(1) KB 기반 — 우리 공장 학습 자료([학습 자료] 섹션)",
+      "(1.5) Signal Graph & WinCC 자동 조회 — XML/WinCC 기반 인덱스 (v17/v20/v21/v23)",
+      "    → 다음 섹션 중 user message에 실제로 존재할 때만 사용 (없으면 인용하지 마세요).",
+      "    · [신호 그래프 조회 결과] — Coil/Contact 신호의 SET 위치 (global_signal_graph, 4626 신호)",
+      "    · [블록 인덱스 조회 결과] — 블록 내 모든 변수·타입 인덱스 (block_signals_index, 671 블록)",
+      "    · [타입 인덱스 조회 결과] — 타입별 전 공장 위치 (global_type_index, 1242 타입)",
+      "    · [HMI 알람 조회 결과] — WinCC 알람 ID/text/trigger_tag (hmi_alarm_index, 9048 알람)",
+      "    · [PLC 태그 조회 결과] — PLC 태그 사전 name/address/comment (plc_tag_index, 2962 태그·상수)",
+      "    · [회로 역추적 결과] — 신호 의존 체인 재귀 추적 트리 + 외부 입력 leaf (v23 신규)",
+      "    → KB 기반과 동일 신뢰도. TIA Portal XML / WinCC TIA export에서 자동 추출.",
+      "    → 답변 시 알람 ID·텍스트·트리거 태그·PLC 주소·코멘트 등을 정확히 인용하세요.",
+      "    → 회로 역추적 섹션이 있으면 그 안의 '처리 룰'을 반드시 따르세요 (요약·외부 입력 정리·NOT 자연어 해석·KB 결합).",
+      "    → answer 끝에 어느 인덱스를 썼는지 라벨을 붙이세요:",
+      "      · 신호: 'ⓘ 출처: Signal Graph 자동 조회 (XML 기반 - 신호 인덱스)'",
+      "      · 블록: 'ⓘ 출처: Signal Graph 자동 조회 (XML 기반 - 블록 인덱스)'",
+      "      · 타입: 'ⓘ 출처: Signal Graph 자동 조회 (XML 기반 - 타입 인덱스)'",
+      "      · 알람: 'ⓘ 출처: WinCC 자동 조회 (HMI 알람 인덱스)'",
+      "      · PLC 태그: 'ⓘ 출처: WinCC 자동 조회 (PLC 태그 인덱스)'",
+      "      · 회로 역추적: 'ⓘ 출처: 회로 역추적 (Signal Graph 자동 추적)'",
+      "      · 둘 이상 사용 시 조합: 'ⓘ 출처: Signal Graph + WinCC 자동 조회 (신호 + 알람 인덱스)' 등",
+      "    → 해당 섹션이 없으면 (1.5)는 사용 불가. (1)(2)(3)(4) 중에서 답하세요.",
+      "(2) 표준 매뉴얼 기반 — 지멘스/제조사 공식 매뉴얼의 표준 정보",
+      "    예: 표준 Sinamics 결함 코드(F31137, F07410 등), Siemens S7 표준 OB(OB80, OB121 등), 표준 통신 프로토콜(PROFINET, OPC UA 등)",
+      "(3) 일반 PLC/산업 표준 — 제조사 무관한 일반 산업 개념",
+      "    예: TON 타이머 동작 원리, edge trigger, retentive 변수, RS/SR 플립플롭 등",
+      "(4) 정보 없음 — 어디에도 해당 안 됨 → status=\"not_found\"",
+      "",
+      "### 답변 우선순위",
+      "KB 검색 → 있으면 (1) → 없지만 표준 매뉴얼 정보면 (2) → 일반 산업 표준이면 (3) → 공장 특화인데 KB 없으면 (4).",
+      "",
+      "### 표준 vs 공장 특화 구분 — 매우 중요",
+      "**답해야 함 (KB 없어도 (2)(3)으로 답):**",
+      "- 표준 Sinamics/지멘스 결함 코드 (F로 시작하는 표준 코드)",
+      "- 표준 PLC 개념 (TON, edge trigger, OB80, retentive, RS/SR 등)",
+      "- 표준 통신 프로토콜 (PROFINET, OPC UA, PROFIsafe 등)",
+      "- 일반 트러블슈팅 패턴",
+      "**답하면 안 됨 (KB 없으면 반드시 (4) not_found):**",
+      "- 우리 공장 자체 신호명 (예: \"500_Control Nodes\".safety Release)",
+      "- 호기별 파라미터 설정값",
+      "- 자체 정의 알람 코드 (우리 공장만의 E0xxx 등)",
+      "- 우리 공장 사례·이력·회로 구조",
+      "공장 특화 정보를 표준 매뉴얼 지식으로 추측해 답하면 사용자를 오도합니다. 이 경우 반드시 (4) not_found로 응답하세요.",
+      "",
+      "### 출처 라벨 표기 (필수)",
+      "(1) KB 기반: 본문 문장 끝에 [src_xxx] 마커를 붙이고 used_source_ids에 담으세요 (기존과 동일).",
+      "(2) 표준 매뉴얼 기반: answer 마지막에 빈 줄 한 줄 + 아래 형식의 라벨을 그대로 붙이세요:",
+      "    ⓘ 출처: [제조사명] [규격/제품명] 표준 매뉴얼 기반",
+      "       (KB에 학습된 우리 공장 자료 아님 / 정확한 페이지·문서 인용 어려움)",
+      "(3) 일반 산업 표준: answer 마지막에 빈 줄 한 줄 + 아래 라벨을 붙이세요:",
+      "    ⓘ 출처: PLC 일반 표준 지식",
+      "(4) not_found: answer는 '해당 정보를 확인할 수 없어 추측으로 답변하지 않습니다' 취지. structured={}, used_source_ids=[].",
+      "",
+      "(2)(3)일 때는 used_source_ids를 비우세요(가짜 src를 만들지 마세요).",
+      "근거 없는 추정은 금지입니다. 불확실하면 그 부분을 '확실하지 않음 / 현장 확인 필요'로 명시하세요.",
+      "",
+      "### 답변 예시",
+      "[예시 — 표준 결함 코드 (2)]",
+      "질문: F31137이 뭐야?",
+      "answer 필드 값:",
+      "\"F31137은 Sinamics 드라이브의 모터 인코더 위치 결정 시 내부 결함을 나타내는 표준 결함 코드입니다. 주요 원인: 인코더 케이블 불량, 인코더 자체 결함, 인코더 전원 문제, DRIVE-CLiQ 통신 문제 등.\\n\\nⓘ 출처: 지멘스 Sinamics 표준 매뉴얼 기반\\n   (KB에 학습된 우리 공장 자료 아님 / 정확한 페이지·문서 인용 어려움)\"",
+      "",
+      "[예시 — 일반 PLC 개념 (3)]",
+      "질문: TON 타이머 동작 원리?",
+      "answer 필드 값:",
+      "\"TON(On-Delay) 타이머는 입력 IN이 OFF→ON으로 바뀌는 edge에서 타이머를 시작하고, 설정 시간(PT) 경과 후 출력 Q가 ON됩니다. 입력이 OFF로 바뀌면 즉시 리셋됩니다.\\n\\nⓘ 출처: PLC 일반 표준 지식\"",
+    ];
+    sourceMarkerExtra = null; // v16: 새 정책이 (2)(3) 라벨로 명확하므로 별도 안내 불필요
+  }
+
+  let system = [
+    "당신은 " + opts.role + " PLC 분석 전문가입니다. 대상 호기: " + opts.equipment + ".",
+    "정비 직원의 질문을 받아 정밀하게 분석합니다.",
+    "",
+  ];
+  system = system.concat(knowledgePolicy);
+  system = system.concat([
+    "- not_found일 때는 answer에 '해당 정보를 확인할 수 없어 추측으로 답변하지 않습니다'라는 취지를 사용자 언어로 적고, structured는 {}, used_source_ids는 [] 로 두세요.",
+    "",
+    "## 분석 스타일 (analysis 모드)",
+    "- 회로/인터락 구조를 구체적으로, 점검 순서를 명확한 단계로 제시하세요.",
+    "- 디바이스/메모리 코드(M120, I0.7, Q5.2 등), 알람 코드·알람명(E0234, Stacker Vacuum Interlock 등), 출처 제목(title)은 절대 번역하지 말고 원문 그대로 유지하세요. 설명 문장만 사용자 언어로 작성합니다.",
+    "",
+    "## 출처 인용 규칙",
+    "- [학습 자료]의 각 항목에는 [src_001] 같은 id가 붙어 있습니다.",
+    "- [학습 자료]를 근거로 한 문장 끝에 해당 id를 [src_001] 형식으로 표기하세요.",
+    "- recommended_checks 중 학습 자료가 근거인 항목에는 source_id를 넣으세요.",
+    "- 실제로 인용한 학습 자료 id만 used_source_ids에 담으세요. 없는 id를 지어내지 마세요.",
+  ]);
+  if (sourceMarkerExtra) system.push(sourceMarkerExtra);
+  system = system.concat([
+    "",
+    langInstruction,
+    "",
+    "## 출력 형식 — 매우 중요",
+    "반드시 유효한 JSON 객체 하나만 출력하세요. 코드펜스(```), 머리말, 설명 문장, 후행 텍스트를 절대 붙이지 마세요. 응답의 첫 글자는 { 이고 마지막 글자는 } 여야 합니다.",
+    "JSON 구조:",
+    "{",
+    '  "status": "ok" 또는 "not_found",',
+    '  "answer": "자연어 분석. 학습 자료 근거 문장 끝에 [src_xxx] 마커. **굵게** 강조 가능",',
+    '  "structured": {',
+    '    "alarm_code": "알람 질문일 때만 (예: E0234). 아니면 이 필드 생략",',
+    '    "alarm_meaning": "알람명 (선택)",',
+    '    "interlocks": [ { "device": "M120", "comment": "안전 도어 닫힘", "input": "I0.7 / SX-12" } ],',
+    '    "recommended_checks": [ { "order": 1, "action": "SX-12 센서 점검", "source_id": "src_003" } ]',
+    "  },",
+    '  "used_source_ids": ["src_001", "src_003"]',
+    "}",
+    "structured의 각 하위 필드는 해당 정보가 있을 때만 넣고, 없으면 생략하세요(빈 배열 허용).",
+  ]);
+  system = system.join("\n");
+
+  const parts = [];
+  if (opts.previousTurns && opts.previousTurns.length > 0) {
+    parts.push("## 직전 대화 (후속 질문 참고용)");
+    parts.push(JSON.stringify(opts.previousTurns));
+    parts.push("");
+  }
+  parts.push("## 학습 자료");
+  parts.push(opts.hasKb ? opts.kbContext : "(이 에이전트에 학습된 자료가 없습니다.)");
+  parts.push("");
+  // v17: Signal Graph 자동 조회 결과 (있을 때만)
+  if (opts.signalContext) {
+    parts.push(opts.signalContext);
+    parts.push("");
+  }
+  parts.push("## 질문");
+  parts.push(opts.question);
+
+  return { system: system, userMsg: parts.join("\n") };
+}
+
+/**
+ * Anthropic Messages API 직접 호출 (UrlFetchApp). text 블록만 합쳐 반환.
+ */
+function callClaudeAPI(apiKey, systemPrompt, userMessage) {
+  const payload = {
+    model: PLC_QUERY_MODEL,
+    max_tokens: PLC_QUERY_MAX_TOKENS,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userMessage }],
+  };
+  // v19: 일시적 API 장애 자동 재시도 (Anthropic 500/502/503/504, 429, fetch 예외)
+  //   - 즉시 시도 → 실패 시 2초 대기 후 재시도 → 또 실패 시 4초 대기 후 재시도 (총 3회)
+  //   - 200은 즉시 성공 종료. 4xx 클라이언트 오류(401, 400 등)는 재시도 무의미 → 즉시 throw
+  const RETRYABLE_CODES = [429, 500, 502, 503, 504];
+  const MAX_ROUNDS = 3;
+  const WAIT_MS = [0, 2000, 4000];
+
+  let lastError = null;
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    if (WAIT_MS[round] > 0) {
+      Logger.log("[callClaudeAPI] 라운드 " + (round + 1) + "/" + MAX_ROUNDS + " — " + WAIT_MS[round] + "ms 대기 후 재시도");
+      Utilities.sleep(WAIT_MS[round]);
+    }
+    let res;
+    try {
+      res = UrlFetchApp.fetch(ANTHROPIC_API_URL, {
+        method: "post",
+        contentType: "application/json",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": ANTHROPIC_VERSION,
+        },
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true,
+      });
+    } catch (fetchErr) {
+      // fetch 자체 실패 (네트워크 오류·타임아웃 등) → 재시도
+      lastError = "fetch 예외: " + fetchErr.message;
+      Logger.log("[callClaudeAPI] fetch 예외 라운드 " + (round + 1) + ": " + fetchErr.message);
+      continue;
+    }
+    const code = res.getResponseCode();
+    const body = res.getContentText();
+    if (code === 200) {
+      const json = JSON.parse(body);
+      const text = (json.content || [])
+        .filter(function (b) { return b.type === "text"; })
+        .map(function (b) { return b.text; })
+        .join("\n");
+      // 진단용 최소 로그 — stop_reason이 max_tokens면 응답 잘림(=max_tokens 상향 필요) 신호
+      if (json.stop_reason === "max_tokens") {
+        Logger.log("[callClaudeAPI] ⚠️ stop_reason=max_tokens — 응답 잘림 가능 (output_tokens="
+          + ((json.usage && json.usage.output_tokens) || "?") + ")");
       }
+      return text;
+    }
+    // 재시도 가능한 코드면 다음 라운드로
+    if (RETRYABLE_CODES.indexOf(code) >= 0) {
+      lastError = "Anthropic API " + code + ": " + String(body).slice(0, 300);
+      Logger.log("[callClaudeAPI] HTTP " + code + " 라운드 " + (round + 1) + " — 재시도 예정");
+      continue;
+    }
+    // 그 외 코드 (401, 400 등 클라이언트 오류) — 재시도 무의미, 즉시 throw
+    throw new Error("Anthropic API " + code + ": " + String(body).slice(0, 300));
+  }
+  // 3회 모두 실패
+  throw new Error("Anthropic API 재시도 " + MAX_ROUNDS + "회 모두 실패. 마지막 오류: " + lastError);
+}
+
+/**
+ * LLM 응답 텍스트에서 JSON 객체 추출 (코드펜스/잡설 제거 후 parse).
+ */
+function extractJson(text) {
+  if (!text) return null;
+  let s = String(text).trim();
+  s = s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const first = s.indexOf("{");
+  const last = s.lastIndexOf("}");
+  if (first >= 0 && last > first) s = s.slice(first, last + 1);
+  try {
+    return JSON.parse(s);
+  } catch (e) {
+    // v14: 폴백 — 원문에서 첫 { ~ 마지막 } 블록을 정규식으로 재추출 후 재시도
+    const m = String(text).match(/\{[\s\S]*\}/);
+    if (m) {
+      try { return JSON.parse(m[0]); } catch (e2) { return null; }
     }
     return null;
-  };
+  }
+}
 
-  // 재학습 실행
-  // - weakItems: 시트의 빈약 항목 배열
-  // - 폴더 스캔 결과(folderScan)에서 파일명 매칭
-  // - 매칭된 파일을 새 학습 흐름으로 다시 분석 → saveToSheet (청크 분할 자동 적용)
-  // - 학습 성공 시 기존 빈약 항목 deleteKnowledge로 삭제
-  const startRelearn = async (weakItems) => {
-    setRelearning(true);
-    relearnCancelRef.current = false;
-    setRelearnResult(null);
-
-    // 재학습 전용 폴더 스캔 (Step 7-11 v6)
-    // - scan_learning_folder는 Processed_Files 필터링으로 이미 학습된 파일을 제외함
-    // - 재학습은 정작 그 파일들이 필요하므로 _all 액션 사용
-    // - 기존 folderScan state(학습 화면용)는 무시하고 항상 새로 스캔
-    const scan = await scanLearningFolderAll(role);
-    const allFolderFiles = [...(scan.roleFiles || []), ...(scan.commonFiles || [])];
-
-    // 빈약 항목별 매칭 (v13: basename 비교 — subPath/대소문자 영향 없도록)
-    const matched = []; // { weakItem, file }
-    const notFound = []; // weakItem (Drive에 파일 없음)
-    const getBasename = (p) => (p || "").split("/").pop().split("\\").pop().trim();
-    for (const w of weakItems) {
-      const fname = extractFilenameFromWeakItem(w.content);
-      if (!fname) {
-        notFound.push({ item: w, reason: "파일명 추출 불가" });
-        continue;
-      }
-      const fnameBase = getBasename(fname).toLowerCase();
-      const file = allFolderFiles.find(f => getBasename(f.filename).toLowerCase() === fnameBase);
-      if (!file) {
-        notFound.push({ item: w, reason: `Drive에 '${fname}' 없음` });
-        continue;
-      }
-      matched.push({ weakItem: w, file });
+/**
+ * 사용된 src id만 순서대로 sources[]로 조립 (중복 제거).
+ */
+function assembleSources(usedIds, srcMap) {
+  const seen = {};
+  const out = [];
+  usedIds.forEach(function (id) {
+    if (srcMap[id] && !seen[id]) {
+      seen[id] = true;
+      out.push(srcMap[id]);
     }
+  });
+  return out;
+}
 
-    setRelearnProgress({ current: 0, total: matched.length, currentFile: "" });
+/**
+ * 테스트 함수 — 에디터에서 직접 실행. 스크립트 속성 확인 + E0234 샘플 질의.
+ * (실행 → 로그 확인. 외부 URL 호출 아니므로 배포 불필요.)
+ */
+function testPlcQuery() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty("PLC_QUERY_TOKEN");
+  console.log("PLC_QUERY_TOKEN:", token ? "YES" : "NO (프로젝트 설정에서 등록 필요)");
+  console.log("ANTHROPIC_API_KEY:", props.getProperty("ANTHROPIC_API_KEY") ? "YES" : "NO (등록 필요)");
+  if (!token) { console.log("토큰 미설정 — 테스트 중단"); return; }
+  const result = handleQuery({
+    path: "query",
+    token: token,
+    data: {
+      agent: "cell_plc", mode: "analysis", equipment: "CL01", lang: "auto",
+      input: { kind: "text", text: "E0234 왜 떴어?", photo_ocr: null },
+      context: { previous_turns: [] },
+    },
+  });
+  console.log("Result:", result.getContent());
+}
 
-    let successCount = 0;
-    let failCount = 0;
-    const errors = [];
+/**
+ * not_found 동작 확인용 — 학습 안 됐을 법한 질문.
+ */
+function testPlcQueryNotFound() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty("PLC_QUERY_TOKEN");
+  if (!token) { console.log("PLC_QUERY_TOKEN 미설정"); return; }
+  const result = handleQuery({
+    path: "query", token: token,
+    data: {
+      agent: "cell_plc", mode: "analysis", equipment: "CL01", lang: "auto",
+      input: { kind: "text", text: "존재하지 않는 알람코드 ZZZ9999 설명해줘", photo_ocr: null },
+      context: { previous_turns: [] },
+    },
+  });
+  console.log("Result:", result.getContent());
+}
 
-    for (let i = 0; i < matched.length; i++) {
-      if (relearnCancelRef.current) break;
+// ════════════════════════════════════════════════════════════════════════════
+// ★ v22 추가 블록 (Queue #14 Step 2) — 인증·권한·감사 인프라 + Drive 다운로드 primitive
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 📍 대상 프로젝트: Factory Agent KB (학습앱 백엔드)
+//
+// 【사용법】 기존 v21 코드는 한 줄도 지우지 말고, 파일 맨 끝에 이 블록 전체를 붙여넣으세요.
+//           (Step 2는 함수·시트·상수만 신설. doPost/doGet·기존 함수는 무수정.
+//            권한 게이트 enforce는 Step 3에서 프론트가 토큰을 보내기 시작할 때 켭니다.
+//            → 이 블록을 붙이고 배포해도 기존 학습앱·논의앱·PLC Agent는 그대로 작동.)
+//
+// 【v22 (2026-06-04) 추가 내용】
+//   - User_Permissions / Audit_Log 시트 신설 (ensure 함수, 기존 ensureProcessedFilesSheet 패턴)
+//   - verifyIdToken()        : Google ID 토큰을 tokeninfo로 검증 (aud/exp/iss/email)
+//   - checkUserPermission()  : User_Permissions 조회 → ISE/FSE/Manager 역할별 허용 판정
+//   - logAudit()             : Audit_Log 1행 append
+//   - authorizeRequest()     : verify + permission 통합 게이트 (Step 3에서 doPost가 호출. 지금은 정의만)
+//   - ACTION_PERMISSIONS     : 액션 → 필요 권한(read/write/manager) 매핑
+//   - downloadDriveImageAsBase64() / deleteDriveFile() : Drive 우회 사진 처리 primitive
+//   - setupPermissionsInitial() : ★1회 실행★ — 시트 2개 생성 + Manager 1행 등록
+//
+// 【Step 2 실행 순서】
+//   1. 이 블록을 v21 코드 맨 끝에 붙여넣기 → Ctrl+S 저장
+//   2. 상단 함수 선택 박스에서 setupPermissionsInitial 선택 → ▶ 실행 → (첫 실행 시 권한 승인)
+//      → 실행 로그에 "✅ 초기 Manager 등록 완료: potato2509@gmail.com" 확인
+//   3. 배포: 배포 → 배포 관리 → 편집 → 새 버전 → 배포
+//      ※ Step 2는 doPost/doGet 동작을 바꾸지 않으므로 외부 URL 동작은 동일.
+//        그래도 버전 정렬 위해 재배포 권장. (게이트가 실제로 켜지는 Step 3에선 재배포 필수)
 
-      const { weakItem, file } = matched[i];
-      setRelearnProgress({ current: i + 1, total: matched.length, currentFile: file.filename });
+// ── 상수 ──────────────────────────────────────────────────────────────
+const USER_PERMISSIONS_SHEET = "User_Permissions";
+const AUDIT_LOG_SHEET = "Audit_Log";
 
-      try {
-        // 1. 파일 다운로드
-        const fetchResult = await fetchDriveFile(file.fileId);
-        if (!fetchResult.success) {
-          failCount++;
-          errors.push(`${file.filename}: 다운로드 실패 — ${fetchResult.error}`);
-          continue;
-        }
-        const fileData = fetchResult.data;
-        const isImageFile = (fileData.mimetype || "").startsWith("image/");
-        const isPdfFile = (fileData.mimetype || "").includes("pdf") ||
-                          (file.filename || "").toLowerCase().endsWith(".pdf");
+// plc-drive 프로젝트 OAuth 클라이언트 ID (프론트가 보낼 ID 토큰의 aud 검증용)
+const OAUTH_CLIENT_ID = "830951335500-mr71tivgr98at2ovvqcv16rdd8gvbi9n.apps.googleusercontent.com";
+const TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo";
 
-        // v19: 저장할 row 배열 — 이미지는 1개, PDF Vision은 페이지 수만큼
-        //   각 원소: { content, sourceMeta }
-        let rowsToSave = [];
-        let category = weakItem.category || "공장정보"; // 기존 카테고리 유지
+const INITIAL_MANAGER_EMAIL = "potato2509@gmail.com";
 
-        if (isImageFile) {
-          // 단일 이미지 재학습 (v19: 5블록 + sourceMeta)
-          const folderHint = file.subPath ? `\n폴더 경로: ${file.subPath}` : "";
-          const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
-이 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.${folderHint}
+// 액션 → 필요 권한 매핑 (결정 Q3 / 사양 v3 3계층)
+//   "read"    = 활성 등록 사용자(ISE 이상)면 누구나
+//   "write"   = FSE 이상. 대상 에이전트(data.role)가 있으면 그 role이 FSE의 assigned_agents에 포함돼야.
+//               Manager는 전부 통과. data.role 없는 쓰기(회의록 등)는 FSE 이상이면 통과.
+//   "manager" = Manager 전용 (Step 3에서 추가될 관리 액션용)
+const ACTION_PERMISSIONS = {
+  // 조회 (read)
+  get_knowledge: "read", get_minutes: "read", get_all_progress: "read",
+  get_summary: "read", count_since_summary: "read", get_category_items: "read",
+  count_defect_images: "read", get_defect_image_data: "read",
+  scan_learning_folder: "read", scan_learning_folder_all: "read",
+  get_drive_file: "read", get_common_knowledge: "read",
+  // 쓰기 (write)
+  save_knowledge: "write", replace_knowledge: "write", delete_knowledge: "write",
+  save_summary: "write", save_defect_pattern: "write", save_common_knowledge: "write",
+  mark_file_processed: "write", upload_image: "write", save_minutes: "write",
+  // Manager 전용 (Step 3 신규 액션 — 미리 매핑)
+  manage_permissions: "manager", get_audit_log: "manager",
+};
 
-이미지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계·수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
+// ── 시트 보장 (기존 ensureProcessedFilesSheet 패턴) ───────────────────
+function ensureUserPermissionsSheet() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  let sheet = ss.getSheetByName(USER_PERMISSIONS_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(USER_PERMISSIONS_SHEET);
+    // 사양 v3 §7 — 8개 컬럼
+    sheet.appendRow([
+      "email", "name", "role", "assigned_agents",
+      "active", "created_at", "created_by", "notes",
+    ]);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
 
-다음 5블록 형식:
-[추출 텍스트] (이미지의 실제 내용. 구체값 빠뜨리지 말 것)
-[핵심 정보] (이 이미지가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
-[챕터/섹션] (이미지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)
-[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
-          const analyzed = await callClaudeVision(sys, "이 이미지를 분석하세요.", fileData.base64, fileData.mimetype);
-          const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
-          if (catMatch && ["공장정보","업무역할","판단기준","협업방식","교정사례"].includes(catMatch[1])) {
-            category = catMatch[1];
-          }
-          const newContent = `[파일: ${file.filename}] ${analyzed}`;
-          const section = parseChapterFromAnalysis(analyzed);
-          const sourceMeta = buildSourceMeta(file.filename, "", section, file.url);
-          rowsToSave.push({ content: newContent, sourceMeta });
-        } else if (isPdfFile) {
-          // PDF 재학습 (v19): 목차 파싱 → 페이지별 4블록 → 페이지별 row N개 저장
-          // - 카테고리는 기존 weakItem.category 유지 (재학습이므로)
-          if (!window.pdfjsLib) {
-            await loadPdfjs();
-          }
-          const pdf = await window.pdfjsLib.getDocument({ data: base64ToUint8Array(fileData.base64) }).promise;
-          const pageCount = pdf.numPages;
-          const outlineMap = await extractPdfOutline(pdf);
-          let lastSection = "";
+function ensureAuditLogSheet() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  let sheet = ss.getSheetByName(AUDIT_LOG_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(AUDIT_LOG_SHEET);
+    sheet.appendRow(["timestamp", "email", "action", "target", "result", "detail"]);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
 
-          for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
-            if (relearnCancelRef.current) break;
-            const pageBase64 = await pdfPageToBase64(pdf, pageNum);
-            const folderHint = file.subPath ? `\n폴더 경로: ${file.subPath}` : "";
-            const pagePrompt = `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pageCount} 분석.${folderHint}
-
-페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 항목명·대수·사양·비고 등 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
-
-다음 4블록 형식:
-[추출 텍스트] (페이지의 실제 내용. 구체값 빠뜨리지 말 것)
-[핵심 정보] (이 페이지가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일, 페이지 번호 등이 보이면 기재)
-[챕터/섹션] (페이지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)`;
-
-            let pageRes = "";
-            let isError = false;
-            try {
-              pageRes = await callClaudeVision(pagePrompt, "이 PDF 페이지를 분석하세요.", pageBase64, "image/jpeg");
-            } catch (e) {
-              isError = true;
-              pageRes = `(분석 실패: ${e.message || "알 수 없는 오류"})`;
-            }
-
-            if (isError) continue; // 분석 실패 페이지는 row 만들지 않음
-
-            // 챕터 결정: 목차 → Vision → 직전 페이지 상속 → 빈 칸
-            let section = outlineMap[pageNum] || "";
-            if (!section) section = parseChapterFromAnalysis(pageRes);
-            if (!section) section = lastSection;
-            if (section) lastSection = section;
-
-            const pageContent = `[파일: ${file.filename}] [PDF 페이지 ${pageNum}/${pageCount}]\n${pageRes}`;
-            const sourceMeta = buildSourceMeta(
-              file.filename,
-              String(pageNum),
-              section,
-              file.url ? `${file.url}#page=${pageNum}` : ""
-            );
-            rowsToSave.push({ content: pageContent, sourceMeta });
-          }
-        } else {
-          failCount++;
-          errors.push(`${file.filename}: 지원 안 되는 형식`);
-          continue;
-        }
-
-        if (rowsToSave.length === 0) {
-          failCount++;
-          errors.push(`${file.filename}: 분석 결과 없음`);
-          continue;
-        }
-
-        // 2. 기존 빈약 항목 + 같은 파일의 동료 row 모두 삭제 (v14)
-        //    한 파일이 시트에 여러 row로 분리 저장된 구조 반영
-        //    - 메타 row, [종합 요약] row, [페이지N] row 등 동료들 모두 정리
-        //    - 식별: 같은 파일명이 content에 포함된 모든 row (백워드 호환)
-        try {
-          await deleteKnowledge(role, weakItem.category, weakItem.content);
-
-          // 같은 파일의 동료 row들도 삭제
-          const companionRows = knowledge.filter(k => {
-            if (!k.content || k.content === weakItem.content) return false;
-            return k.content.includes(file.filename);
-          });
-          for (const companion of companionRows) {
-            try {
-              await deleteKnowledge(role, companion.category, companion.content);
-              console.log(`[재학습] 동료 row 삭제: ${companion.content.slice(0, 60)}...`);
-            } catch (compErr) {
-              console.warn("[재학습] 동료 row 삭제 실패:", compErr);
-            }
-          }
-        } catch (delErr) {
-          console.warn("[재학습] 기존 항목 삭제 실패 (계속 진행):", delErr);
-        }
-
-        // 3. 새 학습 결과 저장 (v19: 페이지별 N개 row + sourceMeta)
-        let rowOkCount = 0;
-        for (const row of rowsToSave) {
-          try {
-            const ok = await saveToSheet(role, category, row.content, row.sourceMeta);
-            if (ok) rowOkCount++;
-          } catch (saveErr) {
-            console.error(`[재학습] row 저장 실패:`, saveErr);
-          }
-        }
-        if (rowOkCount > 0) {
-          successCount++;
-        } else {
-          failCount++;
-          errors.push(`${file.filename}: 모든 row 저장 실패`);
-        }
-
-      } catch (e) {
-        failCount++;
-        errors.push(`${file.filename}: ${e.message || "알 수 없는 오류"}`);
-        console.error("[재학습] 처리 실패:", file.filename, e);
-      }
+// ── User_Permissions 조회 ─────────────────────────────────────────────
+/** email로 사용자 1명 레코드 반환. 없으면 null. (대소문자 무시) */
+function getUserRecord(email) {
+  const sheet = ensureUserPermissionsSheet();
+  if (sheet.getLastRow() < 2) return null;
+  const target = String(email || "").toLowerCase().trim();
+  if (!target) return null;
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 8).getValues();
+  for (var i = 0; i < rows.length; i++) {
+    if (String(rows[i][0] || "").toLowerCase().trim() === target) {
+      return {
+        email: rows[i][0], name: rows[i][1], role: rows[i][2],
+        assigned_agents: rows[i][3], active: rows[i][4],
+        created_at: rows[i][5], created_by: rows[i][6], notes: rows[i][7],
+      };
     }
-
-    // 완료 — 결과 보고
-    setRelearnResult({
-      total: matched.length,
-      success: successCount,
-      failed: failCount,
-      notFound: notFound,
-      errors,
-      cancelled: relearnCancelRef.current,
-    });
-    setRelearning(false);
-
-    // 시트 다시 로드
-    await loadKB();
-  };
-
-  const cancelRelearn = () => {
-    relearnCancelRef.current = true;
-  };
-
-  // base64 → Uint8Array (PDF 처리용)
-  const base64ToUint8Array = (b64) => {
-    const binStr = atob(b64);
-    const bytes = new Uint8Array(binStr.length);
-    for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
-    return bytes;
-  };
-
-  // loadKB — 캐시 우선 + 백그라운드 갱신 (Step 7-12)
-  // - 캐시 있으면 즉시 setKnowledge (사용자 체감 빠름)
-  // - 백그라운드에서 신선한 데이터 fetch → 차이 있으면 다시 setKnowledge
-  // - 캐시 없으면 일반 로드
-  const loadKB = async (forceFresh = false) => {
-    if (!role) return;
-
-    if (forceFresh) {
-      // 명시적 새로고침 — 캐시 무시
-      setLoadingKB(true);
-      try {
-        const fresh = await loadFromSheetFresh(role);
-        setKnowledge(fresh);
-      } catch {}
-      finally { setLoadingKB(false); }
-      return;
-    }
-
-    // 캐시 즉시 표시 (있으면)
-    const cached = readCache(role);
-    if (cached) {
-      setKnowledge(cached.data);
-      setLoadingKB(false);
-      // 백그라운드 갱신 (UI 블록 안 함)
-      (async () => {
-        try {
-          const fresh = await fetchKnowledgeFromSheet(role);
-          if (fresh.length > 0) {
-            writeCache(role, fresh);
-            // 데이터 달라졌으면 갱신 (단순 비교: 길이 또는 마지막 항목)
-            const lastCached = cached.data[cached.data.length - 1]?.content || "";
-            const lastFresh = fresh[fresh.length - 1]?.content || "";
-            if (fresh.length !== cached.data.length || lastFresh !== lastCached) {
-              setKnowledge(fresh);
-            }
-          }
-        } catch {}
-      })();
-      return;
-    }
-
-    // 캐시 없음 — 일반 로드
-    setLoadingKB(true);
-    try {
-      const data = await loadFromSheet(role);
-      setKnowledge(data);
-    } catch {}
-    finally { setLoadingKB(false); }
-  };
-
-  // ─── 일관성 자동 점검: knowledge 변경 감지 → 신규 항목 백그라운드 비교 ───
-  // 동작 원리:
-  // 1. knowledge가 처음 로드되면 lastCheckedSignature를 저장하고 점검 안 함 (기존 데이터)
-  // 2. 이후 knowledge가 늘어나면 새 항목들만 추출해 checkConsistencyForItem 호출
-  // 3. role이 바뀌면 autoConflicts와 signature 모두 초기화
-  useEffect(() => {
-    // 역할 변경 시 초기화
-    setAutoConflicts([]);
-    lastCheckedSignatureRef.current = null;
-    checkingRef.current = false;
-    setAutoCheckBusy(false);
-  }, [role]);
-
-  useEffect(() => {
-    if (!role || !knowledge || knowledge.length === 0) return;
-    if (checkingRef.current) return; // 진행 중이면 스킵
-
-    // signature: 항목 식별 (category|content|updated_at)
-    const buildSig = (k) => `${k.category}|${k.content}|${k.updated_at || ""}`;
-    const currentSigs = new Set(knowledge.map(buildSig));
-
-    // 첫 로드: signature만 저장하고 점검 X
-    if (lastCheckedSignatureRef.current === null) {
-      lastCheckedSignatureRef.current = currentSigs;
-      return;
-    }
-
-    // 신규 항목 추출
-    const newItems = knowledge.filter(k => !lastCheckedSignatureRef.current.has(buildSig(k)));
-    if (newItems.length === 0) {
-      // 추가된 항목 없음 (삭제만 일어났을 수 있음) → signature만 갱신
-      lastCheckedSignatureRef.current = currentSigs;
-      return;
-    }
-
-    // 백그라운드 점검 (non-blocking)
-    checkingRef.current = true;
-    setAutoCheckBusy(true);
-    (async () => {
-      try {
-        const allFindings = [];
-        // 신규 항목이 너무 많으면 최근 5건까지만 (대량 일괄 학습 시 토큰 폭주 방지)
-        const targets = newItems.slice(-5);
-        for (const item of targets) {
-          // 비교 대상은 점검 시점의 신규 외 기존 데이터
-          const existing = knowledge.filter(k => buildSig(k) !== buildSig(item));
-          const findings = await checkConsistencyForItem(item, existing);
-          if (findings.length > 0) allFindings.push(...findings);
-        }
-        if (allFindings.length > 0) {
-          setAutoConflicts(prev => {
-            // 같은 쌍 중복 추가 방지
-            const seen = new Set(prev.map(c =>
-              `${c.itemA.category}|${c.itemA.content}|${c.itemB.category}|${c.itemB.content}`
-            ));
-            const fresh = allFindings.filter(c =>
-              !seen.has(`${c.itemA.category}|${c.itemA.content}|${c.itemB.category}|${c.itemB.content}`)
-            );
-            return [...prev, ...fresh];
-          });
-        }
-      } catch (e) {
-        console.warn("[자동 점검] 실패:", e.message);
-      } finally {
-        lastCheckedSignatureRef.current = currentSigs;
-        checkingRef.current = false;
-        setAutoCheckBusy(false);
-      }
-    })();
-  }, [knowledge, role]);
-
-  // 충돌을 해결됨으로 표시 (TabStatus에서 사용)
-  const markAutoConflictResolved = (idx, resolvedAs) => {
-    setAutoConflicts(prev => prev.map((c, i) =>
-      i === idx ? { ...c, resolved: true, resolvedAs } : c
-    ));
-  };
-
-  // 학습자료 폴더 스캔 (학습 화면 진입 시 자동)
-  const doFolderScan = async () => {
-    if (!role) return;
-    setScanning(true);
-    try {
-      const result = await scanLearningFolder(role);
-      setFolderScan(result);
-    } catch {}
-    finally { setScanning(false); }
-  };
-
-  useEffect(() => { loadKB(); }, [role]);
-  useEffect(() => { doFolderScan(); }, [role]);
-
-  // ─── v26: 백그라운드 학습 (수준 A-2) ───────────────────────────────
-  // 화면 잠금/절전 시 브라우저가 탭을 멈추는 것을 Wake Lock으로 방지.
-  // 메뉴 이동은 SPA(tab state) 구조라 이미 학습이 끊기지 않음(App 컴포넌트 유지).
-  const requestWakeLock = async () => {
-    try {
-      if ("wakeLock" in navigator && navigator.wakeLock) {
-        wakeLockRef.current = await navigator.wakeLock.request("screen");
-        // OS가 자동 해제(탭 백그라운드 등)하면 ref 비움 → visibilitychange에서 재요청
-        wakeLockRef.current.addEventListener("release", () => { wakeLockRef.current = null; });
-      } else {
-        setWakeLockUnsupported(true);
-      }
-    } catch (e) {
-      // 권한 거부 등으로 요청 실패 — 학습은 계속 진행, 화면만 사용자가 켜두면 됨
-      console.warn("[v26 WakeLock] 요청 실패:", e && e.message);
-    }
-  };
-  const releaseWakeLock = async () => {
-    try {
-      if (wakeLockRef.current) { await wakeLockRef.current.release(); wakeLockRef.current = null; }
-    } catch (e) { /* 무시 */ }
-  };
-
-  // 학습 시작/종료에 맞춰 Wake Lock 자동 획득/해제 (startSync 본체는 안 건드림)
-  useEffect(() => {
-    if (syncingFiles) requestWakeLock();
-    else releaseWakeLock();
-  }, [syncingFiles]);
-
-  // 탭이 백그라운드 갔다 다시 보일 때 Wake Lock 재요청 (학습 중일 때만)
-  useEffect(() => {
-    const onVisibility = () => {
-      if (document.visibilityState === "visible" && syncingFiles && !wakeLockRef.current) {
-        requestWakeLock();
-      }
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => document.removeEventListener("visibilitychange", onVisibility);
-  }, [syncingFiles]);
-
-  // 학습 중 탭 닫기/새로고침 시 이탈 경고 (학습 중에만 활성)
-  useEffect(() => {
-    if (!syncingFiles) return;
-    const onBeforeUnload = (e) => { e.preventDefault(); e.returnValue = ""; };
-    window.addEventListener("beforeunload", onBeforeUnload);
-    return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [syncingFiles]);
-  // ──────────────────────────────────────────────────────────────────
-
-  // 새 파일 일괄 학습
-  // PDF가 포함되어 있으면 먼저 모달로 처리 방식 선택받은 후 진행
-  const requestSync = () => {
-    const allFiles = [
-      ...folderScan.roleFiles,
-      ...folderScan.commonFiles,
-    ];
-    const hasPdf = allFiles.some(f => (f.mimetype || "").includes("pdf") || (f.filename || "").toLowerCase().endsWith(".pdf"));
-    if (hasPdf) {
-      // PDF가 있으면 처리 방식 선택 모달
-      setShowPdfModeDialog(true);
-    } else {
-      // 이미지만 있으면 바로 진행
-      startSync();
-    }
-  };
-
-  const startSync = async () => {
-    setShowPdfModeDialog(false);
-    setSyncingFiles(true);
-    setSyncResult(null);
-    const allFilesRaw = [
-      ...folderScan.roleFiles.map(f => ({ ...f, source: "role" })),
-      ...folderScan.commonFiles.map(f => ({ ...f, source: "common" })),
-    ];
-    // v27: 큰 파일 사전 차단 (학습앱 다운로드 한계 ~50MB, 안전선 45MB)
-    //   - oversized: 한계 초과 → 학습 안 함 (사용자에게 안내, errors push는 아래에서)
-    //   - allFiles: 한계 이하만 실제 학습 대상
-    const oversized = allFilesRaw.filter(f => f.size && f.size > MAX_LEARN_FILE_SIZE);
-    const allFiles = allFilesRaw.filter(f => !f.size || f.size <= MAX_LEARN_FILE_SIZE);
-
-    // v27: 최신 KB 직접 로드 — 이어서 학습 시 이미 처리된 페이지 매칭용
-    //   (state는 비동기 갱신이라 학습 함수 내에서는 freshKnowledge 변수로 직접 참조)
-    let freshKnowledge = [];
-    try {
-      freshKnowledge = await loadFromSheetFresh(role);
-      setKnowledge(freshKnowledge); // 화면 표시용 state도 동기화
-    } catch (e) {
-      console.warn("[v27] 최신 KB 로드 실패 — 캐시된 knowledge로 폴백:", e && e.message);
-      freshKnowledge = knowledge || [];
-    }
-
-    setSyncProgress({ current: 0, total: allFiles.length, currentFile: "" });
-
-    let successCount = 0;
-    let failCount = 0;
-    let pdfTextCount = 0;
-    let pdfVisionCount = 0;
-    let pptConvertedCount = 0; // v21: PPT → PDF 자동 변환된 건수
-    let xlsxSheetCount = 0;    // v22: 학습된 XLSX 시트 수 (시트 단위)
-    let xlsxChunkCount = 0;    // v22: 학습된 XLSX 청크 수 (200행 단위)
-    let csvChunkCount = 0;     // v23: 학습된 CSV 청크 수 (200행 단위)
-    let textFileCount = 0;     // v23: 학습된 TXT/MD 파일 수
-    const errors = [];
-
-    // v27: 큰 파일 사전 안내 (실제 학습은 안 함, syncResult에 표시)
-    for (const big of oversized) {
-      const mb = (big.size / 1024 / 1024).toFixed(1);
-      errors.push(`${big.filename}: 파일 크기 ${mb}MB가 학습 한계(45MB)를 초과합니다. PDF는 페이지 분할, 텍스트형은 .txt로 변환 후 다시 올려주세요.`);
-    }
-
-    for (let i = 0; i < allFiles.length; i++) {
-      const f = allFiles[i];
-      // 진행 표시: 폴더 경로 + 파일명
-      const displayName = f.subPath ? `${f.subPath}/${f.filename}` : f.filename;
-      setSyncProgress({ current: i + 1, total: allFiles.length, currentFile: displayName });
-
-      try {
-        // 1. 파일 다운로드 (v21: Apps Script v11이 PPT를 자동으로 PDF 변환해서 반환)
-        const fetchResult = await fetchDriveFile(f.fileId);
-        if (!fetchResult.success) {
-          failCount++;
-          errors.push(`${displayName}: ${fetchResult.error}`);
-          console.error(`[Sync] 다운로드 실패: ${displayName}`, fetchResult.error);
-          continue;
-        }
-        const fileData = fetchResult.data;
-
-        // v21: PPT가 PDF로 변환된 경우 추적
-        //   - converted_from_pptx === true 면 fileData.mimetype은 "application/pdf"
-        //   - fileData.url은 변환된 PDF의 URL (원본 PPT URL이 아님)
-        //   - 학습 성공 후 PPT(f.fileId) + PDF(converted_pdf_file_id) 둘 다 processed 표시
-        const wasPptxConverted = !!fileData.converted_from_pptx;
-        const convertedPdfFileId = fileData.converted_pdf_file_id || null;
-        // 출처 표시·로깅용 원본 PPT 파일명 (변환 후 fileData.filename은 .pdf로 바뀌므로)
-        const originalPptxName = wasPptxConverted ? f.filename : null;
-        if (wasPptxConverted) {
-          pptConvertedCount++;
-          console.log(`[v21 PPT변환 활용] ${originalPptxName} → ${fileData.filename}`);
-        }
-        // processed 표시용 entries (학습 성공 후에만 호출)
-        const processedEntries = [{ fileId: f.fileId, filename: f.filename }];
-        if (wasPptxConverted && convertedPdfFileId) {
-          processedEntries.push({ fileId: convertedPdfFileId, filename: fileData.filename });
-        }
-
-        const isImageFile = (fileData.mimetype || "").startsWith("image/");
-        const isPdfFile = (fileData.mimetype || "").includes("pdf") || (f.filename || "").toLowerCase().endsWith(".pdf");
-        // v22: XLSX/XLS 감지 (mimetype 또는 확장자)
-        //   - mimetype: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet (xlsx)
-        //              application/vnd.ms-excel (xls)
-        const filenameLower = (f.filename || "").toLowerCase();
-        const isXlsxFile = (fileData.mimetype || "").includes("spreadsheetml")
-                        || (fileData.mimetype || "").includes("ms-excel")
-                        || filenameLower.endsWith(".xlsx")
-                        || filenameLower.endsWith(".xls");
-        // v23: CSV / TXT / MD 감지
-        const isCsvFile = (fileData.mimetype || "").includes("csv")
-                       || filenameLower.endsWith(".csv");
-        const isTextFile = !isCsvFile && (
-          (fileData.mimetype || "").startsWith("text/")
-          || filenameLower.endsWith(".txt")
-          || filenameLower.endsWith(".md")
-        );
-
-        if (isImageFile) {
-          // ─── 이미지 처리 (v19: 5블록 + sourceMeta) ───
-          const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
-          const sys = `당신은 ${roleInfo.label}(${role}) AI입니다.
-이 이미지에서 ${role} 업무 관련 핵심 내용을 추출하세요.${folderHint}
-
-이미지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계·수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출 — 셀 안의 모든 텍스트·숫자·단위 빠뜨리지 말 것.**
-
-다음 5블록 형식:
-[추출 텍스트] (이미지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
-[핵심 정보] (이 이미지가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
-[챕터/섹션] (이미지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)
-[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
-
-          const analyzed = await callClaudeVision(sys, "이 이미지를 분석하세요.", fileData.base64, fileData.mimetype);
-          const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
-          const recommendedCat = catMatch ? catMatch[1] : "판단기준";
-          const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
-          const content = `${sourceTag} [이미지URL] ${f.url}\n${analyzed}`;
-          // v19: sourceMeta (file/page=빈칸/section/url=Drive 이미지 URL)
-          const section = parseChapterFromAnalysis(analyzed);
-          const sourceMeta = buildSourceMeta(f.filename, "", section, f.url);
-          if (f.source === "common") {
-            await saveCommonKnowledge(recommendedCat, content, sourceMeta);
-          } else {
-            await saveToSheet(role, recommendedCat, content, sourceMeta);
-          }
-          // v21: PPT 변환 케이스는 이미지로 안 옴, processedEntries로 일관 처리
-          await markFileProcessedMany(f.source === "common" ? "_COMMON_" : role, processedEntries);
-          successCount++;
-        } else if (isPdfFile) {
-          // ─── PDF 처리 (학습앱 직접 업로드와 동일 로직) ───
-          // base64 → Blob → File로 변환해서 pdf.js에 전달
-          const byteChars = atob(fileData.base64);
-          const byteNumbers = new Array(byteChars.length);
-          for (let j = 0; j < byteChars.length; j++) {
-            byteNumbers[j] = byteChars.charCodeAt(j);
-          }
-          const byteArray = new Uint8Array(byteNumbers);
-          const blob = new Blob([byteArray], { type: "application/pdf" });
-          const fileObj = new File([blob], f.filename, { type: "application/pdf" });
-
-          const pdf = await loadPdfDocument(fileObj);
-          const pageCount = pdf.numPages;
-
-          let pdfResult = "";
-          let usedMode = "";
-
-          // 텍스트 추출 우선 모드면 먼저 시도
-          if (syncPdfMode === "auto") {
-            setSyncProgress({ current: i + 1, total: allFiles.length, currentFile: `${displayName} (텍스트 추출 시도...)` });
-            const fullText = await extractPdfText(pdf);
-
-            if (fullText && fullText.trim().length >= 50) {
-              // 텍스트 추출 성공 (v19: 5블록 형식)
-              const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트)` : "";
-              const sys = `${roleInfo.label}(${role}) AI입니다. PDF에서 추출한 텍스트입니다.${folderHint}
-한국어로 핵심 내용만 정리하되, 학습 가치 있는 구체 정보(수치·부품명·단계 등)는 빠뜨리지 마세요.
-표/구조가 있으면 살려서 정리하세요.
-
-다음 5블록 형식:
-[추출 텍스트] (원문에서 학습 가치 있는 내용. 1000자 이내 권장)
-[핵심 정보] (이 문서가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
-[챕터/섹션] (이 문서의 주요 챕터/섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)
-[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
-              const truncated = fullText.slice(0, 12000);
-              pdfResult = await callClaude(sys, `다음 PDF 내용에서 핵심을 추출하세요:\n\n${truncated}`);
-              pdfResult = `[PDF: ${f.filename} - 텍스트 추출, ${pageCount}페이지]\n${pdfResult}`;
-              usedMode = "text";
-              pdfTextCount++;
-            } else {
-              // 텍스트 부족 → 그림 분석으로 폴백
-              usedMode = "vision_fallback";
-            }
-          }
-
-          // 그림 분석 모드 (또는 폴백) — v19: 페이지별 N개 row 저장 + 챕터 보존
-          if (syncPdfMode === "vision" || usedMode === "vision_fallback") {
-            // 1) 목차 파싱
-            const outlineMap = await extractPdfOutline(pdf);
-
-            // 2) 페이지별 분석
-            const pagePayloads = []; // { pageNum, pageContent, section, isError, imageUrl }
-            const pageUrls = [];
-            let lastSection = "";
-            let firstPageRecommendedCat = ""; // 첫 페이지에서 추출 (PDF 전체 카테고리)
-
-            // v27: 이어서 학습 — 이미 KB에 row가 있는 페이지는 스킵 (페이지 단위 재개)
-            //   매칭: source_file(파일명) + source_page("N" 또는 "슬라이드 N")
-            //   학습 중간에 실패해도 다음 실행 시 안 된 페이지부터 자동 이어감
-            const currentFileNameForResume = wasPptxConverted ? originalPptxName : f.filename;
-            const processedPages = new Set(
-              freshKnowledge
-                .filter(k => k && k.source_file === currentFileNameForResume)
-                .map(k => k.source_page)
-                .filter(p => p)
-            );
-            let resumedSkipCount = 0; // 이번 학습에서 스킵된 페이지 수
-            if (processedPages.size > 0) {
-              console.log(`[v27 이어서학습] ${currentFileNameForResume}: 기존 ${processedPages.size}페이지 처리됨 → 신규만 학습`);
-            }
-
-            for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
-              // v27: 이어서 학습 — 이미 처리된 페이지면 스킵 (pagePayloads에 안 들어가 저장도 자연 제외)
-              const resumeKey = wasPptxConverted ? `슬라이드 ${pageNum}` : String(pageNum);
-              if (processedPages.has(resumeKey)) {
-                resumedSkipCount++;
-                continue;
-              }
-
-              setSyncProgress({
-                current: i + 1, total: allFiles.length,
-                currentFile: `${displayName} (페이지 ${pageNum}/${pageCount} 분석 중${processedPages.size > 0 ? `, 기존 ${processedPages.size}p 스킵` : ""}...)`,
-              });
-
-              const pageBase64 = await pdfPageToBase64(pdf, pageNum);
-              const pageFilename = `${f.filename.replace(/\.pdf$/i, "")}_p${pageNum}.jpg`;
-
-              // 드라이브 업로드
-              let pageUrl = "";
-              try {
-                const uploadResult = await uploadImageToDrive(role, pageFilename, pageBase64, "image/jpeg");
-                if (uploadResult && uploadResult.url) pageUrl = uploadResult.url;
-              } catch (e) { /* 업로드 실패해도 분석은 계속 */ }
-              pageUrls.push(pageUrl);
-
-              // Vision 분석 (v19: 4블록, 첫 페이지만 [추천 카테고리]까지 5블록)
-              const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath}` : "";
-              const isFirstPage = pageNum === 1;
-              const pagePrompt = isFirstPage
-                ? `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pageCount} 분석.${folderHint}
-
-페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출.**
-
-다음 5블록 형식:
-[추출 텍스트] (페이지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
-[핵심 정보] (이 페이지가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
-[챕터/섹션] (페이지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)
-[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나 (PDF 전체 카테고리)`
-                : `${roleInfo.label}(${role}) AI입니다. PDF 페이지 ${pageNum}/${pageCount} 분석.${folderHint}
-
-페이지가 매뉴얼·작업 지시서·도면·사양서·표 형식이면 단계 번호·구체 수치·버튼/레버 이름·부품명·치수를 빠짐없이 한국어로 추출. 글자수 제한 없음. **표가 있으면 헤더 행과 모든 데이터 행을 셀 단위로 짚어 추출.**
-
-다음 4블록 형식:
-[추출 텍스트] (페이지의 실제 내용. 단계·수치·버튼명·부품명·치수 등 구체값 빠뜨리지 말 것)
-[핵심 정보] (이 페이지가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
-[챕터/섹션] (페이지 상단·헤더 영역에 보이는 챕터 또는 섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)`;
-
-              let pageContent = "";
-              let isError = false;
-              try {
-                // v27: 자동 재시도(2초→4초, 총 3번 시도)로 일시적 Vision 실패 자동 복구
-                pageContent = await callClaudeVisionWithRetry(pagePrompt, "이 PDF 페이지를 분석하세요.", pageBase64, "image/jpeg");
-              } catch (e) {
-                isError = true;
-                pageContent = `(분석 실패: ${e.message || "알 수 없는 오류"})`;
-                // v27: 실패 페이지는 KB row를 안 만들므로, 다음 학습 실행 시 자동으로 재시도됨 (이어서 학습)
-              }
-
-              // 첫 페이지: 카테고리 추출 (PDF 전체 카테고리로 사용)
-              if (isFirstPage && !isError) {
-                const catMatch = pageContent.match(/\[추천 카테고리\]\s*([가-힣]+)/);
-                if (catMatch && ["공장정보","업무역할","판단기준","협업방식","교정사례"].includes(catMatch[1])) {
-                  firstPageRecommendedCat = catMatch[1];
-                }
-              }
-
-              // 챕터 결정: 목차 → Vision 응답 → 직전 페이지 상속 → 빈 칸
-              let section = outlineMap[pageNum] || "";
-              if (!section && !isError) {
-                section = parseChapterFromAnalysis(pageContent);
-              }
-              if (!section) section = lastSection;
-              if (section) lastSection = section;
-
-              pagePayloads.push({ pageNum, pageContent, section, isError, imageUrl: pageUrl });
-            }
-
-            // 3) PDF 전체 카테고리 결정 (첫 페이지 추천, 폴백: 판단기준)
-            const recommendedCat = firstPageRecommendedCat || "판단기준";
-
-            // 4) 페이지별 row 저장 (각 페이지 = 1 row)
-            // v21: PPT 변환 케이스 → 라벨/메타 분기
-            //   - sourceTag: 원본 PPT 파일명 유지 (사용자 시점에서 PPT 파일을 학습한 것)
-            //   - 라벨: "슬라이드 N/M" 형식
-            //   - sourceMeta.page: "슬라이드 N"
-            //   - sourceMeta.url: 변환된 PDF URL (fileData.url) + #page=N
-            const fallbackTag = usedMode === "vision_fallback" ? " (텍스트 부족으로 자동 전환)" : "";
-            const displayFileName = wasPptxConverted ? originalPptxName : f.filename;
-            const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${displayFileName}]` : `[자동학습-${displayFileName}]`;
-            const unitLabel = wasPptxConverted ? "슬라이드" : "PDF 페이지"; // 라벨
-            const pageBaseUrl = wasPptxConverted ? fileData.url : f.url; // 클릭 가능한 PDF URL
-            let pageOkCount = 0;
-            for (const p of pagePayloads) {
-              if (p.isError) continue; // 분석 실패 페이지 건너뜀
-              const pageContent = `${sourceTag} [${unitLabel} ${p.pageNum}/${pageCount}${fallbackTag}]\n${p.pageContent}`;
-              const sourceMeta = buildSourceMeta(
-                displayFileName,
-                wasPptxConverted ? `슬라이드 ${p.pageNum}` : String(p.pageNum),
-                p.section,
-                pageBaseUrl ? `${pageBaseUrl}#page=${p.pageNum}` : ""
-              );
-              try {
-                if (f.source === "common") {
-                  await saveCommonKnowledge(recommendedCat, pageContent, sourceMeta);
-                } else {
-                  await saveToSheet(role, recommendedCat, pageContent, sourceMeta);
-                }
-                pageOkCount++;
-              } catch (saveErr) {
-                console.error(`[Sync] ${unitLabel} ${p.pageNum} 저장 실패:`, saveErr);
-              }
-            }
-
-            // v21: PPT 변환 시 PPT + PDF 두 fileId 모두 processed 표시 (중복 학습 방지)
-            await markFileProcessedMany(f.source === "common" ? "_COMMON_" : role, processedEntries);
-            pdfVisionCount++;
-            if (pageOkCount > 0) {
-              successCount++;
-            } else if (resumedSkipCount === pageCount && pageCount > 0) {
-              // v27: 모든 페이지가 이미 학습된 상태 (이어서 학습으로 추가할 게 없음)
-              successCount++;
-              console.log(`[v27] ${displayName}: 모든 페이지 이미 학습됨 — 스킵`);
-            } else {
-              failCount++;
-              errors.push(`${displayName}: 모든 페이지 저장 실패`);
-            }
-            continue; // Vision 모드 처리 완료 — 아래 텍스트 모드 저장 분기 건너뜀
-          }
-
-          // 텍스트 모드 저장 (Vision 모드는 위에서 continue로 빠짐)
-          // v19: sourceMeta 추가 (page 빈 칸, section은 응답에서 추출, url=f.url)
-          // v21: PPT 변환 케이스 → displayFileName(원본 PPT명), url은 변환된 PDF URL
-          const catMatch = pdfResult.match(/\[추천 카테고리\]\s*([가-힣]+)/);
-          const recommendedCat = catMatch ? catMatch[1] : "판단기준";
-          const displayFileName = wasPptxConverted ? originalPptxName : f.filename;
-          const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${displayFileName}]` : `[자동학습-${displayFileName}]`;
-          const content = `${sourceTag}\n${pdfResult}`;
-          const section = parseChapterFromAnalysis(pdfResult);
-          // 텍스트 모드는 페이지 단위가 아닌 PDF 전체 1 row → page 빈 칸, url은 PDF URL (앵커 없음)
-          const sourceUrl = wasPptxConverted ? fileData.url : f.url;
-          const sourceMeta = buildSourceMeta(displayFileName, "", section, sourceUrl);
-
-          if (f.source === "common") {
-            await saveCommonKnowledge(recommendedCat, content, sourceMeta);
-          } else {
-            await saveToSheet(role, recommendedCat, content, sourceMeta);
-          }
-          // v21: PPT 변환 시 PPT + PDF 두 fileId 모두 processed 표시 (중복 학습 방지)
-          await markFileProcessedMany(f.source === "common" ? "_COMMON_" : role, processedEntries);
-          successCount++;
-        } else if (isXlsxFile) {
-          // ─── XLSX/XLS 처리 (v22) ───
-          // - 모든 시트 파싱 (빈 시트 자동 스킵)
-          // - 시트당 200행씩 청크 분할 → 청크별 Claude 호출 → 청크별 row 저장
-          // - source_file: 원본 XLSX 파일명 / source_page: "시트: xxx (N/M)" / source_url: XLSX URL (앵커 없음)
-          let xlsxSheets;
-          try {
-            xlsxSheets = await extractXlsxSheets(fileData.base64);
-          } catch (xlsxErr) {
-            failCount++;
-            errors.push(`${displayName}: XLSX 파싱 실패 - ${xlsxErr.message}`);
-            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-            continue;
-          }
-
-          if (xlsxSheets.length === 0) {
-            failCount++;
-            errors.push(`${displayName}: 데이터 있는 시트가 없음 (모든 시트 비어있음)`);
-            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-            continue;
-          }
-
-          const DATA_ROWS_PER_CHUNK = 200; // Q4-D: 200행씩 청크 분할
-          const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
-          let totalChunkOk = 0;
-          let totalChunkAttempt = 0;
-          let firstChunkRecommendedCat = ""; // 첫 청크에서 카테고리 결정 (XLSX 전체 카테고리)
-
-          for (const sheet of xlsxSheets) {
-            const chunks = chunkSheetRows(sheet.rows, DATA_ROWS_PER_CHUNK);
-            for (const chunk of chunks) {
-              totalChunkAttempt++;
-              const chunkLabel = chunk.totalChunks > 1
-                ? ` (${chunk.chunkIdx}/${chunk.totalChunks}, 행 ${chunk.startRow}~${chunk.endRow})`
-                : "";
-              setSyncProgress({
-                current: i + 1, total: allFiles.length,
-                currentFile: `${displayName} (시트: ${sheet.sheetName}${chunkLabel} 분석 중...)`,
-              });
-
-              const markdownTable = sheetRowsToMarkdownTable(chunk.rows);
-              const isFirstChunk = (firstChunkRecommendedCat === "");
-              // 첫 청크: 5블록 (추천 카테고리 포함) / 이후 청크: 4블록
-              const sys = isFirstChunk
-                ? `${roleInfo.label}(${role}) AI입니다. XLSX 시트 데이터 분석.${folderHint}
-파일: ${f.filename} / 시트: ${sheet.sheetName}${chunkLabel}
-
-표 데이터에서 학습 가치 있는 모든 정보(헤더·수치·항목명·단위·기준 등)를 빠짐없이 한국어로 정리하세요. 글자수 제한 없음 — 정보가 많으면 길게 쓰세요. **표의 모든 행과 열을 빠뜨리지 말고 학습 가치 있게 풀어쓰세요. 단순 나열이 아니라 의미 단위로 묶어 설명하세요.**
-
-다음 5블록 형식:
-[추출 텍스트] (시트의 실제 내용. 헤더, 카테고리별 항목, 수치·단위·기준 등 구체값 빠뜨리지 말 것)
-[핵심 정보] (이 시트가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (시트명, 작성자, Rev, 작성일이 보이면 기재)
-[챕터/섹션] (이 시트가 속하는 주제·섹션. 예: "Stack Vision 파라미터", "Self Inspection 기준". 명확하지 않으면 빈 칸)
-[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나 (XLSX 전체 카테고리)`
-                : `${roleInfo.label}(${role}) AI입니다. XLSX 시트 데이터 분석 (이어지는 청크).${folderHint}
-파일: ${f.filename} / 시트: ${sheet.sheetName}${chunkLabel}
-
-표 데이터에서 학습 가치 있는 모든 정보(헤더·수치·항목명·단위·기준 등)를 빠짐없이 한국어로 정리하세요. 글자수 제한 없음. **표의 모든 행과 열을 빠뜨리지 말고 학습 가치 있게 풀어쓰세요. 단순 나열이 아니라 의미 단위로 묶어 설명하세요.**
-
-다음 4블록 형식:
-[추출 텍스트] (시트의 실제 내용. 헤더, 카테고리별 항목, 수치·단위·기준 등 구체값 빠뜨리지 말 것)
-[핵심 정보] (이 청크가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (시트명·청크 범위 외 추가 메타가 있으면 기재)
-[챕터/섹션] (이 청크가 속하는 주제·섹션. 명확하지 않으면 빈 칸)`;
-
-              let analyzed = "";
-              try {
-                analyzed = await callClaude(sys, `다음 시트 데이터에서 핵심을 추출하세요:\n\n${markdownTable}`);
-              } catch (cErr) {
-                console.error(`[Sync XLSX] Claude 호출 실패 시트=${sheet.sheetName} 청크=${chunk.chunkIdx}/${chunk.totalChunks}:`, cErr);
-                continue; // 이 청크만 스킵
-              }
-
-              // 첫 청크: 카테고리 추출 → XLSX 전체 카테고리로 사용
-              if (isFirstChunk) {
-                const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
-                if (catMatch && ["공장정보","업무역할","판단기준","협업방식","교정사례"].includes(catMatch[1])) {
-                  firstChunkRecommendedCat = catMatch[1];
-                } else {
-                  firstChunkRecommendedCat = "판단기준"; // 폴백
-                }
-              }
-
-              const section = parseChapterFromAnalysis(analyzed);
-              const sourceTag = f.subPath
-                ? `[자동학습-${f.subPath}/${f.filename}]`
-                : `[자동학습-${f.filename}]`;
-              const content = `${sourceTag} [시트: ${sheet.sheetName}${chunkLabel}]\n${analyzed}`;
-              const sourceMeta = buildSourceMeta(
-                f.filename,
-                `시트: ${sheet.sheetName}${chunkLabel}`, // 예: "시트: 검사기준 (1/3, 행 1~200)"
-                section,
-                f.url || "" // Q5-가: XLSX 원본 URL (앵커 없음)
-              );
-
-              try {
-                if (f.source === "common") {
-                  await saveCommonKnowledge(firstChunkRecommendedCat, content, sourceMeta);
-                } else {
-                  await saveToSheet(role, firstChunkRecommendedCat, content, sourceMeta);
-                }
-                totalChunkOk++;
-              } catch (saveErr) {
-                console.error(`[Sync XLSX] 저장 실패 시트=${sheet.sheetName} 청크=${chunk.chunkIdx}:`, saveErr);
-              }
-            }
-          }
-
-          await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-          xlsxSheetCount += xlsxSheets.length;
-          xlsxChunkCount += totalChunkAttempt;
-          if (totalChunkOk > 0) {
-            successCount++;
-          } else {
-            failCount++;
-            errors.push(`${displayName}: 모든 청크 저장 실패 (${totalChunkAttempt}개 시도)`);
-          }
-        } else if (isCsvFile) {
-          // ─── CSV 처리 (v23) ───
-          // - SheetJS로 파싱 → XLSX 청크 분할 흐름 재사용 (200행 단위)
-          // - source_file: 원본 CSV 파일명 / source_page: "(N/M, 행 X~Y)" 형식 (시트명 없음)
-          let csvRows;
-          try {
-            csvRows = await extractCsvRows(fileData.base64);
-          } catch (csvErr) {
-            failCount++;
-            errors.push(`${displayName}: CSV 파싱 실패 - ${csvErr.message}`);
-            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-            continue;
-          }
-
-          if (csvRows.length === 0) {
-            failCount++;
-            errors.push(`${displayName}: CSV에 데이터 없음 (모든 행 비어있음)`);
-            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-            continue;
-          }
-
-          const DATA_ROWS_PER_CHUNK_CSV = 200;
-          const chunks = chunkSheetRows(csvRows, DATA_ROWS_PER_CHUNK_CSV);
-          const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
-          let totalChunkOk = 0;
-          let totalChunkAttempt = 0;
-          let firstChunkRecommendedCat = "";
-
-          for (const chunk of chunks) {
-            totalChunkAttempt++;
-            const chunkLabel = chunk.totalChunks > 1
-              ? ` (${chunk.chunkIdx}/${chunk.totalChunks}, 행 ${chunk.startRow}~${chunk.endRow})`
-              : "";
-            setSyncProgress({
-              current: i + 1, total: allFiles.length,
-              currentFile: `${displayName}${chunkLabel} 분석 중...`,
-            });
-
-            const markdownTable = sheetRowsToMarkdownTable(chunk.rows);
-            const isFirstChunk = (firstChunkRecommendedCat === "");
-            const sys = isFirstChunk
-              ? `${roleInfo.label}(${role}) AI입니다. CSV 데이터 분석.${folderHint}
-파일: ${f.filename}${chunkLabel}
-
-표 데이터에서 학습 가치 있는 모든 정보(헤더·수치·항목명·단위·기준 등)를 빠짐없이 한국어로 정리하세요. 글자수 제한 없음 — 정보가 많으면 길게 쓰세요. **표의 모든 행과 열을 빠뜨리지 말고 학습 가치 있게 풀어쓰세요. 단순 나열이 아니라 의미 단위로 묶어 설명하세요.**
-
-다음 5블록 형식:
-[추출 텍스트] (CSV의 실제 내용. 헤더, 카테고리별 항목, 수치·단위·기준 등 구체값 빠뜨리지 말 것)
-[핵심 정보] (이 CSV가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (작성자, Rev, 작성일이 보이면 기재)
-[챕터/섹션] (이 CSV가 속하는 주제·섹션. 명확하지 않으면 빈 칸)
-[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나 (CSV 전체 카테고리)`
-              : `${roleInfo.label}(${role}) AI입니다. CSV 데이터 분석 (이어지는 청크).${folderHint}
-파일: ${f.filename}${chunkLabel}
-
-표 데이터에서 학습 가치 있는 모든 정보(헤더·수치·항목명·단위·기준 등)를 빠짐없이 한국어로 정리하세요. 글자수 제한 없음. **표의 모든 행과 열을 빠뜨리지 말고 학습 가치 있게 풀어쓰세요. 단순 나열이 아니라 의미 단위로 묶어 설명하세요.**
-
-다음 4블록 형식:
-[추출 텍스트] (CSV의 실제 내용. 헤더, 카테고리별 항목, 수치·단위·기준 등 구체값 빠뜨리지 말 것)
-[핵심 정보] (이 청크가 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (청크 범위 외 추가 메타가 있으면 기재)
-[챕터/섹션] (이 청크가 속하는 주제·섹션. 명확하지 않으면 빈 칸)`;
-
-            let analyzed = "";
-            try {
-              analyzed = await callClaude(sys, `다음 CSV 데이터에서 핵심을 추출하세요:\n\n${markdownTable}`);
-            } catch (cErr) {
-              console.error(`[Sync CSV] Claude 호출 실패 청크=${chunk.chunkIdx}/${chunk.totalChunks}:`, cErr);
-              continue;
-            }
-
-            if (isFirstChunk) {
-              const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
-              if (catMatch && ["공장정보","업무역할","판단기준","협업방식","교정사례"].includes(catMatch[1])) {
-                firstChunkRecommendedCat = catMatch[1];
-              } else {
-                firstChunkRecommendedCat = "판단기준";
-              }
-            }
-
-            const section = parseChapterFromAnalysis(analyzed);
-            const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
-            const content = `${sourceTag}${chunkLabel}\n${analyzed}`;
-            const sourceMeta = buildSourceMeta(
-              f.filename,
-              chunkLabel ? chunkLabel.trim().replace(/^\(/, "").replace(/\)$/, "") : "", // "1/3, 행 1~200" 형식 또는 빈 칸 (단일 청크)
-              section,
-              f.url || ""
-            );
-
-            try {
-              if (f.source === "common") {
-                await saveCommonKnowledge(firstChunkRecommendedCat, content, sourceMeta);
-              } else {
-                await saveToSheet(role, firstChunkRecommendedCat, content, sourceMeta);
-              }
-              totalChunkOk++;
-            } catch (saveErr) {
-              console.error(`[Sync CSV] 저장 실패 청크=${chunk.chunkIdx}:`, saveErr);
-            }
-          }
-
-          await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-          csvChunkCount += totalChunkAttempt;
-          if (totalChunkOk > 0) {
-            successCount++;
-          } else {
-            failCount++;
-            errors.push(`${displayName}: 모든 청크 저장 실패 (${totalChunkAttempt}개 시도)`);
-          }
-        } else if (isTextFile) {
-          // ─── TXT/MD 처리 (v23 → v30 청크 분할) ───
-          // v23까지: 12000자 truncate (앞부분만 학습) → 큰 txt는 뒤가 손실
-          // v30: 12000자 단위 청크 분할 → 청크별 callClaude (v29 자동 이어쓰기와 결합되어 응답 잘림도 자동 처리)
-          //   → 큰 txt도 손실 없이 전체 학습. handleFile (v28)과 동일 패턴.
-          const textContent = base64ToUtf8Text(fileData.base64);
-          if (!textContent || textContent.trim().length < 10) {
-            failCount++;
-            errors.push(`${displayName}: 텍스트 추출 실패 또는 내용 없음`);
-            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-            continue;
-          }
-
-          const folderHint = f.subPath ? `\n폴더 경로: ${f.subPath} (분류 힌트로 활용)` : "";
-          const sys = `${roleInfo.label}(${role}) AI입니다. 텍스트 파일 분석.${folderHint}
-파일: ${f.filename}
-
-원문에서 학습 가치 있는 구체 정보(수치·부품명·단계 등)는 빠뜨리지 마세요.
-구조가 있으면 살려서 정리하세요.
-
-다음 5블록 형식:
-[추출 텍스트] (원문에서 학습 가치 있는 내용. 1000자 이내 권장)
-[핵심 정보] (이 파일이 다루는 공정·설비·이슈 — 한 문장)
-[메타데이터] (문서 제목, Rev, 작성일이 보이면 기재)
-[챕터/섹션] (이 파일의 주요 챕터/섹션 제목. 보이지 않으면 빈 칸. "없음" 같은 단어 쓰지 말 것)
-[추천 카테고리] 공장정보|업무역할|판단기준|협업방식|교정사례 중 하나`;
-
-          // v30: 청크 분할
-          const TXT_CHUNK_SIZE = 12000;
-          const chunks = [];
-          for (let pos = 0; pos < textContent.length; pos += TXT_CHUNK_SIZE) {
-            chunks.push(textContent.slice(pos, pos + TXT_CHUNK_SIZE));
-          }
-          const totalChunks = chunks.length;
-
-          let analyzed = "";
-          try {
-            if (totalChunks === 1) {
-              // 작은 파일 — 기존 흐름과 동일
-              analyzed = await callClaude(sys, `다음 텍스트 내용에서 핵심을 추출하세요:\n\n${chunks[0]}`);
-            } else {
-              // 큰 파일 — 청크별 분석 후 결과 합치기
-              const chunkResults = [];
-              for (let cIdx = 0; cIdx < totalChunks; cIdx++) {
-                const chunkLabel = ` [청크 ${cIdx + 1}/${totalChunks}, 약 ${cIdx * TXT_CHUNK_SIZE + 1}~${Math.min((cIdx + 1) * TXT_CHUNK_SIZE, textContent.length)}자]`;
-                const chunkResult = await callClaude(
-                  sys,
-                  `다음 텍스트 내용에서 핵심을 추출하세요${chunkLabel}:\n\n${chunks[cIdx]}`
-                );
-                chunkResults.push(`━━━ 청크 ${cIdx + 1}/${totalChunks} ━━━\n${chunkResult}`);
-              }
-              analyzed = chunkResults.join("\n\n");
-            }
-          } catch (cErr) {
-            failCount++;
-            errors.push(`${displayName}: Claude 호출 실패 - ${cErr.message}`);
-            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-            continue;
-          }
-
-          const catMatch = analyzed.match(/\[추천 카테고리\]\s*([가-힣]+)/);
-          const recommendedCat = (catMatch && ["공장정보","업무역할","판단기준","협업방식","교정사례"].includes(catMatch[1]))
-            ? catMatch[1] : "판단기준";
-          const section = parseChapterFromAnalysis(analyzed);
-          const sourceTag = f.subPath ? `[자동학습-${f.subPath}/${f.filename}]` : `[자동학습-${f.filename}]`;
-          const content = `${sourceTag}\n${analyzed}`;
-          const sourceMeta = buildSourceMeta(f.filename, "", section, f.url || "");
-
-          try {
-            if (f.source === "common") {
-              await saveCommonKnowledge(recommendedCat, content, sourceMeta);
-            } else {
-              await saveToSheet(role, recommendedCat, content, sourceMeta);
-            }
-            await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-            textFileCount++;
-            successCount++;
-          } catch (saveErr) {
-            failCount++;
-            errors.push(`${displayName}: 저장 실패 - ${saveErr.message}`);
-          }
-        } else {
-          // 그 외 파일 (Word 등) - 미지원
-          failCount++;
-          errors.push(`${displayName}: 미지원 파일 형식 (${fileData.mimetype}) - PDF로 변환 권장`);
-          await markFileProcessed(f.source === "common" ? "_COMMON_" : role, f.fileId, f.filename);
-          continue;
-        }
-      } catch (e) {
-        failCount++;
-        errors.push(`${displayName}: ${e.message}`);
-      }
-    }
-
-    setSyncResult({ successCount, failCount, errors, pdfTextCount, pdfVisionCount, pptConvertedCount, xlsxSheetCount, xlsxChunkCount, csvChunkCount, textFileCount });
-    setSyncingFiles(false);
-    await doFolderScan();
-    await loadKB();
-  };
-
-  // role 없을 때 - 에이전트 선택 화면
-  if (!role) {
-    return (
-      <div style={{
-        minHeight:"100vh",
-        background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
-        fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif",
-        padding:"40px 16px",
-      }}>
-        <div style={{ maxWidth:660, margin:"0 auto" }}>
-          {/* 헤더 */}
-          <div style={{ textAlign:"center", marginBottom:32 }}>
-            <div style={{ fontSize:40, marginBottom:14 }}>🏭</div>
-            <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:6 }}>
-              Factory Engineer AI 학습
-            </div>
-            <div style={{ fontSize:13, color:"#64748b" }}>
-              역할을 선택해서 접속하세요
-            </div>
-          </div>
-
-          {/* 에이전트 선택 카드 */}
-          {["Cell","Elec","공통"].map(line => (
-            <div key={line} style={{ marginBottom:24 }}>
-              <div style={{ fontSize:12, color:"#64748b", fontWeight:800,
-                letterSpacing:2, marginBottom:12, textAlign:"center" }}>
-                {line === "공통" ? "공통" : `${line} 라인`}
-              </div>
-              <div style={{ display:"flex", gap:10, justifyContent:"center" }}>
-                {Object.entries(ROLE_CONFIG)
-                  .filter(([_, info]) => info.line === line)
-                  .map(([r, info]) => (
-                    <a key={r} href={`?role=${r}`} onClick={(e)=>{e.preventDefault();window.location.href=`?role=${r}`;}} style={{
-                      display:"block", padding:"14px 18px",
-                      background:info.bg, border:`1.5px solid ${info.color}40`,
-                      borderRadius:12, color:info.color,
-                      fontSize:13, fontWeight:800, textDecoration:"none",
-                      transition:"all 0.2s", textAlign:"center",
-                    }}>
-                      <div style={{ fontSize:24, marginBottom:5 }}>{info.icon}</div>
-                      <div>{r}</div>
-                      <div style={{ fontSize:10, color:"#475569", marginTop:2 }}>{info.label}</div>
-                    </a>
-                  ))
-                }
-              </div>
-            </div>
-          ))}
-
-          {/* 학습 현황 보기 토글 */}
-          <div style={{ marginTop:32, marginBottom:8 }}>
-            <button onClick={() => setShowDashboard(s => !s)} style={{
-              width:"100%", padding:"14px 20px",
-              background: showDashboard ? "rgba(167,139,250,0.12)" : "rgba(15,23,42,0.7)",
-              border: `1.5px solid ${showDashboard ? "rgba(167,139,250,0.4)" : "rgba(51,65,85,0.5)"}`,
-              borderRadius:12,
-              color: showDashboard ? "#a78bfa" : "#94a3b8",
-              fontSize:13, fontWeight:800, cursor:"pointer",
-              display:"flex", alignItems:"center", justifyContent:"space-between",
-              transition:"all 0.2s",
-            }}>
-              <span>📊 전체 학습 현황 보기</span>
-              <span style={{
-                fontSize:14,
-                transform: showDashboard ? "rotate(180deg)" : "rotate(0deg)",
-                transition:"transform 0.3s",
-              }}>▼</span>
-            </button>
-          </div>
-
-          {/* 토글 펼침 영역 */}
-          {showDashboard && (
-            <div style={{
-              marginTop:14,
-              padding:"18px 16px",
-              background:"rgba(8,14,26,0.6)",
-              border:"1px solid rgba(51,65,85,0.4)",
-              borderRadius:12,
-              animation:"fadeUp 0.3s ease both",
-            }}>
-              <HomeDashboard/>
-            </div>
-          )}
-        </div>
-
-        <style>{`
-          @keyframes spin{to{transform:rotate(360deg)}}
-          @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-          @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
-          *{box-sizing:border-box}
-          button:hover:not(:disabled){filter:brightness(1.1)}
-          a:hover{filter:brightness(1.1)}
-          ::-webkit-scrollbar{width:3px}
-          ::-webkit-scrollbar-thumb{background:rgba(59,130,246,0.2);border-radius:2px}
-        `}</style>
-      </div>
+  }
+  return null;
+}
+
+// ── ID 토큰 검증 (tokeninfo) ──────────────────────────────────────────
+/**
+ * Google ID 토큰을 oauth2.googleapis.com/tokeninfo로 검증.
+ * 성공: { ok:true, email, name, info }
+ * 실패: { ok:false, error }
+ */
+function verifyIdToken(idToken) {
+  if (!idToken) return { ok: false, error: "no_token" };
+  try {
+    const res = UrlFetchApp.fetch(
+      TOKENINFO_URL + "?id_token=" + encodeURIComponent(idToken),
+      { method: "get", muteHttpExceptions: true }
     );
+    if (res.getResponseCode() !== 200) {
+      return { ok: false, error: "tokeninfo_http_" + res.getResponseCode() };
+    }
+    const info = JSON.parse(res.getContentText());
+
+    // aud 검증 — 우리 Client ID가 발급 대상인지
+    if (info.aud !== OAUTH_CLIENT_ID) return { ok: false, error: "aud_mismatch" };
+    // iss 검증 — 구글 발급인지
+    if (info.iss !== "accounts.google.com" && info.iss !== "https://accounts.google.com") {
+      return { ok: false, error: "iss_mismatch" };
+    }
+    // exp 검증 — 만료
+    const now = Math.floor(Date.now() / 1000);
+    if (info.exp && parseInt(info.exp, 10) < now) return { ok: false, error: "expired" };
+
+    const email = String(info.email || "").toLowerCase().trim();
+    if (!email) return { ok: false, error: "no_email" };
+
+    return { ok: true, email: email, name: info.name || "", info: info };
+  } catch (e) {
+    return { ok: false, error: "verify_exception: " + e.message };
+  }
+}
+
+// ── 권한 판정 ─────────────────────────────────────────────────────────
+/**
+ * email + 필요권한레벨(+대상 agentRole)로 허용 여부 판정.
+ * 성공: { ok:true, role }
+ * 실패: { ok:false, reason }
+ */
+function checkUserPermission(email, requiredLevel, agentRole) {
+  const user = getUserRecord(email);
+  if (!user) return { ok: false, reason: "not_registered" };
+  if (String(user.active).toLowerCase() !== "true") return { ok: false, reason: "inactive" };
+
+  const role = user.role; // ISE | FSE | Manager
+
+  if (requiredLevel === "read") {
+    return { ok: true, role: role }; // 활성 등록자면 누구나 조회
   }
 
-  const panels = [
-    <TabChat role={role} roleInfo={roleInfo}/>,
-    <TabRules role={role} roleInfo={roleInfo}/>,
-    <TabCorrection role={role} roleInfo={roleInfo} knowledge={knowledge}/>,
-    <TabDocument role={role} roleInfo={roleInfo}/>,
-    <TabLibrary role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}/>,
-    <TabStatus role={role} roleInfo={roleInfo} knowledge={knowledge} onReload={loadKB} loading={loadingKB}
-      autoConflicts={autoConflicts}
-      autoCheckBusy={autoCheckBusy}
-      onResolveAutoConflict={markAutoConflictResolved}
-      onStartRelearn={() => setShowRelearnDialog(true)}
-      relearning={relearning}
-      relearnProgress={relearnProgress}/>,
+  if (requiredLevel === "manager") {
+    return role === "Manager"
+      ? { ok: true, role: role }
+      : { ok: false, reason: "manager_only" };
+  }
+
+  if (requiredLevel === "write") {
+    if (role === "Manager") return { ok: true, role: role };
+    if (role === "FSE") {
+      if (!agentRole) return { ok: true, role: role }; // 대상 agent 없는 쓰기(회의록 등)
+      const assigned = String(user.assigned_agents || "")
+        .split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+      if (assigned.indexOf(agentRole) >= 0) return { ok: true, role: role };
+      return { ok: false, reason: "agent_not_assigned" };
+    }
+    return { ok: false, reason: "ise_cannot_write" }; // ISE
+  }
+
+  return { ok: false, reason: "unknown_level" };
+}
+
+// ── 감사 로그 ─────────────────────────────────────────────────────────
+/** Audit_Log에 1행 기록. 실패해도 본 흐름을 막지 않음(로그만). */
+function logAudit(email, action, target, result, detail) {
+  try {
+    const sheet = ensureAuditLogSheet();
+    sheet.appendRow([
+      new Date().toISOString(),
+      email || "", action || "", target || "", result || "", detail || "",
+    ]);
+  } catch (e) {
+    Logger.log("[logAudit] 기록 실패: " + e.message);
+  }
+}
+
+// ── 통합 게이트 (Step 3에서 doPost가 호출. Step 2에서는 정의만, 호출 안 함) ──
+/**
+ * verify + permission을 한 번에. 거부 시 자동으로 감사 로그 기록.
+ * 성공: { ok:true, email, role }
+ * 실패: { ok:false, code:"unauthenticated"|"forbidden", reason, email? }
+ */
+function authorizeRequest(idToken, action, agentRole) {
+  const v = verifyIdToken(idToken);
+  if (!v.ok) {
+    logAudit("(unknown)", action, agentRole || "", "deny_auth", v.error);
+    return { ok: false, code: "unauthenticated", reason: v.error };
+  }
+  const level = ACTION_PERMISSIONS[action] || "manager"; // 미정의 액션은 보수적으로 Manager 전용
+  const p = checkUserPermission(v.email, level, agentRole);
+  if (!p.ok) {
+    logAudit(v.email, action, agentRole || "", "deny_perm", p.reason);
+    return { ok: false, code: "forbidden", reason: p.reason, email: v.email };
+  }
+  return { ok: true, email: v.email, role: p.role };
+}
+
+// ── Drive 우회 사진 처리 primitive (결정 Q5 — Drive 경로 일원화의 백엔드 쪽) ──
+//   Step 5(PLC Agent 연결) 때 백엔드 Vision 호출에 연결합니다.
+//   여기서는 다운로드/삭제 빌딩블록만 신설. (자동삭제 시점·고아 청소는 Step 5에서 흐름과 함께 확정)
+/** fileId 이미지를 백엔드에서 받아 base64로 반환. 성공:{ok,base64,mimeType,name,size} */
+function downloadDriveImageAsBase64(fileId) {
+  try {
+    if (!fileId) return { ok: false, error: "no_fileId" };
+    const file = DriveApp.getFileById(fileId);
+    const blob = file.getBlob();
+    return {
+      ok: true,
+      base64: Utilities.base64Encode(blob.getBytes()),
+      mimeType: blob.getContentType(),
+      name: file.getName(),
+      size: file.getSize(),
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 분석 성공 후 임시 사진 삭제 (결정 Q3). setTrashed — 30일 복구 가능. */
+function deleteDriveFile(fileId) {
+  try {
+    if (!fileId) return { ok: false, error: "no_fileId" };
+    DriveApp.getFileById(fileId).setTrashed(true);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ── ★1회 실행★ 초기 셋업 — 시트 2개 생성 + Manager 1행 등록 ───────────
+/**
+ * 에디터에서 직접 1회 실행. 외부 URL 호출 아니므로 배포와 무관.
+ * 재실행 안전: Manager가 이미 있으면 중복 추가 안 함.
+ */
+function setupPermissionsInitial() {
+  ensureUserPermissionsSheet();
+  ensureAuditLogSheet();
+
+  const existing = getUserRecord(INITIAL_MANAGER_EMAIL);
+  if (existing) {
+    Logger.log("⏭ 이미 등록됨: " + INITIAL_MANAGER_EMAIL + " (role: " + existing.role + ")");
+    return;
+  }
+
+  const sheet = ensureUserPermissionsSheet();
+  const now = new Date().toLocaleString("ko-KR");
+  sheet.appendRow([
+    INITIAL_MANAGER_EMAIL, // email
+    "김지호",               // name
+    "Manager",             // role
+    "",                    // assigned_agents (Manager는 전부 통과하므로 비움)
+    "true",                // active
+    now,                   // created_at
+    "system",              // created_by
+    "초기 Manager (Queue #14 Step 2)", // notes
+  ]);
+  logAudit(INITIAL_MANAGER_EMAIL, "setup_initial_manager", "User_Permissions", "ok", "Step 2 초기 셋업");
+  Logger.log("✅ 초기 Manager 등록 완료: " + INITIAL_MANAGER_EMAIL);
+}
+
+// ── 검증용 — 에디터에서 실행해 토큰 검증·권한 판정 확인 ─────────────────
+/** ID 토큰 문자열을 인자로 넣어 검증 흐름 확인 (프론트 콘솔에서 토큰 복사해 테스트). */
+function testVerifyToken(idToken) {
+  const v = verifyIdToken(idToken);
+  Logger.log("verifyIdToken: " + JSON.stringify(v));
+  if (v.ok) {
+    Logger.log("read 권한: " + JSON.stringify(checkUserPermission(v.email, "read", null)));
+    Logger.log("write(Cell_PLC): " + JSON.stringify(checkUserPermission(v.email, "write", "Cell_PLC")));
+    Logger.log("manager: " + JSON.stringify(checkUserPermission(v.email, "manager", null)));
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ★ v23 추가 블록 (Queue #14 Step 3a) — 세션 토큰 발급 (start_session / logout)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 📍 대상 프로젝트: Factory Agent KB (학습앱 백엔드)
+// 📍 전제: v22 블록(verifyIdToken / getUserRecord / logAudit)이 이미 들어가 있어야 함.
+//
+// 【무엇을 하나】
+//   프론트가 로그인 1회 시 Google ID 토큰을 보내면 → verifyIdToken으로 1회 검증 →
+//   User_Permissions 조회 → 등록·활성 사용자면 세션 토큰 발급(CacheService 6시간) → 반환.
+//   이후 요청은 매번 tokeninfo를 부르지 않고 이 세션 토큰으로 빠르게 확인 (3b에서 enforce).
+//   → '매 요청 tokeninfo 부담'과 'Google 토큰 1시간 만료' 문제를 동시에 해결.
+//
+// 【Step 3a는 enforce 없음】
+//   이 블록은 세션을 '발급'만 함. doPost/doGet에서 세션을 '검사(거부)'하는 건 Step 3b.
+//   따라서 적용·배포해도 기존 학습앱·논의앱·PLC Agent 동작 그대로. (로그인 기능만 추가)
+//
+// 【적용 순서】
+//   1) 이 블록 전체를 기존 코드 맨 끝에 붙여넣기 (기존 코드 삭제 금지)
+//   2) ★doPost 라우터에 2줄 삽입★ (아래 "doPost 수정" 참조) — 이것만 기존 코드 1곳 수정
+//   3) Ctrl+S → 배포 → 배포 관리 → 편집 → 새 버전 → 배포 (★재배포 필수: doPost가 바뀜)
+//
+// 【doPost 수정 — 단 한 곳, 2줄 삽입】
+//   기존 doPost 안 "학습앱 분기" 부분에서 아래를 찾으세요:
+//
+//       // 학습앱 분기
+//       const action = data.action;
+//       if (action === "save_minutes") saveMinutes(data);
+//
+//   "const action = data.action;" 바로 다음 줄에 아래 2줄을 끼워 넣으세요:
+//
+//       if (action === "start_session") return handleStartSession(data);
+//       if (action === "logout") return handleLogout(data);
+//
+//   결과는 이렇게 됩니다:
+//       // 학습앱 분기
+//       const action = data.action;
+//       if (action === "start_session") return handleStartSession(data);   // ← 추가
+//       if (action === "logout") return handleLogout(data);                // ← 추가
+//       if (action === "save_minutes") saveMinutes(data);
+//       ... (기존 그대로)
+
+// ── 세션 상수 ─────────────────────────────────────────────────────────
+const SESSION_CACHE_PREFIX = "sess_";
+const SESSION_TTL_SECONDS = 6 * 60 * 60; // 6시간 (CacheService ScriptCache 최대치)
+
+// ── 세션 발급/검증/삭제 (CacheService ScriptCache — 전 사용자 공용) ──────
+// 주의: CacheService는 메모리 압박 시 TTL 전이라도 항목이 사라질 수 있음.
+//       세션 store 용도엔 일반적으로 무방(만료 시 재로그인). 영구 저장 아님.
+function createSession(user) {
+  const token = Utilities.getUuid();
+  const payload = JSON.stringify({
+    email: user.email,
+    name: user.name || "",
+    role: user.role,                       // ISE | FSE | Manager
+    assigned_agents: user.assigned_agents || "",
+    created_at: Date.now(),
+  });
+  CacheService.getScriptCache().put(SESSION_CACHE_PREFIX + token, payload, SESSION_TTL_SECONDS);
+  return token;
+}
+
+/** 세션 토큰으로 사용자 정보 조회. 유효하면 객체, 없으면 null. (3b 게이트에서 사용) */
+function validateSession(token) {
+  if (!token) return null;
+  const raw = CacheService.getScriptCache().get(SESSION_CACHE_PREFIX + token);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+function deleteSession(token) {
+  if (!token) return;
+  try { CacheService.getScriptCache().remove(SESSION_CACHE_PREFIX + token); } catch (e) {}
+}
+
+// ── 로그인 핸들러 — ID 토큰 검증 → 세션 발급 ───────────────────────────
+/**
+ * 요청 body: { action:"start_session", id_token:"<Google ID 토큰(JWT)>" }
+ * 응답(성공): { success:true, status:"ok", session_token, email, name, role, assigned_agents }
+ * 응답(실패): { success:false, status:"auth_failed"|"not_registered"|"inactive", email?, name?, error? }
+ *   → 프론트는 status로 화면 분기 (등록 안 됨 / 비활성 / 인증 실패)
+ */
+function handleStartSession(data) {
+  const idToken = data.id_token || data.credential || "";
+  const v = verifyIdToken(idToken);   // v22 함수 (tokeninfo 1회 호출)
+  if (!v.ok) {
+    logAudit("(unknown)", "login", "", "deny_auth", v.error);
+    return makeResponse({ success: false, status: "auth_failed", error: v.error });
+  }
+
+  const user = getUserRecord(v.email); // v22 함수
+  if (!user) {
+    logAudit(v.email, "login", "", "deny_unregistered", "");
+    return makeResponse({ success: false, status: "not_registered", email: v.email, name: v.name });
+  }
+  if (String(user.active).toLowerCase() !== "true") {
+    logAudit(v.email, "login", "", "deny_inactive", "");
+    return makeResponse({ success: false, status: "inactive", email: v.email });
+  }
+
+  const token = createSession({
+    email: user.email, name: user.name, role: user.role, assigned_agents: user.assigned_agents,
+  });
+  logAudit(v.email, "login", "", "ok", "session issued");
+
+  return makeResponse({
+    success: true,
+    status: "ok",
+    session_token: token,
+    email: user.email,
+    name: user.name || "",
+    role: user.role,                       // ISE | FSE | Manager
+    assigned_agents: user.assigned_agents || "",
+  });
+}
+
+// ── 로그아웃 핸들러 — 세션 삭제 ────────────────────────────────────────
+/** 요청 body: { action:"logout", session_token } */
+function handleLogout(data) {
+  const s = validateSession(data.session_token);
+  if (s) logAudit(s.email, "logout", "", "ok", "");
+  deleteSession(data.session_token);
+  return makeResponse({ success: true });
+}
+
+// ── 검증용 (에디터에서 실행) — 세션 발급/검증/삭제 라운드트립 확인 ───────
+/** ID 토큰 없이 세션 store 자체만 확인 (가짜 사용자로 put→get→remove). */
+function testSessionRoundtrip() {
+  const token = createSession({ email: "test@example.com", name: "테스트", role: "ISE", assigned_agents: "" });
+  Logger.log("발급 토큰: " + token);
+  const got = validateSession(token);
+  Logger.log("검증 결과: " + JSON.stringify(got));
+  deleteSession(token);
+  Logger.log("삭제 후 재검증(null이어야 정상): " + JSON.stringify(validateSession(token)));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ★ v24 추가 블록 (Queue #14 Step 3b-①) — 권한 게이트 enforce ON
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 📍 대상 프로젝트: Factory Agent KB (학습앱 백엔드)
+// 📍 전제: v22(checkUserPermission/ACTION_PERMISSIONS/logAudit) + v23(validateSession) 적용돼 있어야 함.
+//
+// 【무엇을 하나】
+//   doPost/doGet의 학습앱 분기 진입부에서 세션 토큰을 검사하고, 액션별 권한(read/write/manager)을
+//   세션에 담긴 role·assigned_agents로 판정 → 거부 시 차단 + 감사 로그.
+//   ※ 권한 판정에 User_Permissions 시트를 매번 다시 읽지 않음(세션 캐시 사용) → 빠름.
+//
+// 【영향 범위】
+//   - 학습앱 action 호출만 게이트. start_session/logout은 게이트 앞이라 제외.
+//   - secret(Teams)·path:"query"(PLC)는 학습앱 분기에 도달 전 이미 return → 영향 없음.
+//   - 지금 등록자는 Manager(potato2509) 1명뿐 → Manager는 전부 통과. 정상 사용 영향 없음.
+//   - UI 분기는 아직 없음(Step 3b-②). 여기선 백엔드 차단만.
+//
+// ─────────────────────────────────────────────────────────────────────
+// 【★적용 전 필수 점검 — 락아웃 방지】
+//   게이트를 켜면 모든 학습앱 요청에 유효한 session_token이 있어야 통과합니다.
+//   Step 3a의 api.get/api.call 토큰 첨부가 실제로 동작하는지 먼저 1회 확인:
+//     1) 배포된 학습앱에 로그인된 상태로 접속
+//     2) 브라우저 F12 → Network 탭
+//     3) 아무 역할 진입(데이터 로드 발생) → 요청 하나 클릭
+//     4) 요청 URL(또는 Payload)에 session_token=... 값이 들어있으면 OK
+//   → session_token이 안 보이면 Step 3a의 api 수정이 누락된 것. 그 경우 게이트 켜지 말고 먼저 수정.
+//
+// 【적용 순서】
+//   1) 이 블록을 기존 코드 맨 끝에 붙여넣기
+//   2) ★doPost / doGet 두 곳에 게이트 삽입★ (아래 참조) — 기존 코드 수정 2곳
+//   3) Ctrl+S → 배포 → 배포 관리 → 편집 → 새 버전 → 배포 (★재배포 필수)
+//
+// 【롤백】 문제 시: 삽입한 게이트 2줄을 주석(//) 처리 후 재배포 → 즉시 enforce 해제(기존 동작).
+//
+// ─────────────────────────────────────────────────────────────────────
+// 【doPost 수정 — 게이트 2줄 삽입】
+//   v23에서 넣은 start_session/logout 줄 바로 다음에 삽입:
+//
+//       const action = data.action;
+//       if (action === "start_session") return handleStartSession(data);
+//       if (action === "logout") return handleLogout(data);
+//       // ↓↓↓ 아래 2줄 추가 ↓↓↓
+//       const _g = authorizeBySession(data.session_token, action, data.role);
+//       if (!_g.ok) return makeResponse({ success: false, error: _g.reason });
+//       // ↑↑↑ 여기까지 ↑↑↑
+//       if (action === "save_minutes") saveMinutes(data);
+//       ... (기존 그대로)
+//
+// 【doGet 수정 — 게이트 2줄 삽입】
+//   doGet에서 "const role = e.parameter.role;" 바로 다음에 삽입:
+//
+//       const role = e.parameter.role;
+//       // ↓↓↓ 아래 2줄 추가 ↓↓↓
+//       const _g = authorizeBySession(e.parameter.session_token, action, role);
+//       if (!_g.ok) return makeResponse({ success: false, error: _g.reason });
+//       // ↑↑↑ 여기까지 ↑↑↑
+//       if (action === "get_knowledge") return getKnowledge(role);
+//       ... (기존 그대로)
+//
+//   ※ doGet의 alive 체크(if (!action) ...)는 게이트 위에 있으므로 그대로 통과(헬스체크 유지).
+
+// ── 세션 기반 권한 판정 (시트 재조회 없음 — 세션 캐시의 role/assigned_agents 사용) ──
+function checkPermissionFromSession(session, level, agentRole) {
+  const role = session.role; // ISE | FSE | Manager
+  if (level === "read") return { ok: true };
+  if (level === "manager") {
+    return role === "Manager" ? { ok: true } : { ok: false, reason: "manager_only" };
+  }
+  if (level === "write") {
+    if (role === "Manager") return { ok: true };
+    if (role === "FSE") {
+      if (!agentRole) return { ok: true }; // 대상 agent 없는 쓰기(회의록 등)
+      const assigned = String(session.assigned_agents || "")
+        .split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+      return assigned.indexOf(agentRole) >= 0
+        ? { ok: true }
+        : { ok: false, reason: "agent_not_assigned" };
+    }
+    return { ok: false, reason: "ise_cannot_write" }; // ISE
+  }
+  return { ok: false, reason: "unknown_level" };
+}
+
+// ── 통합 게이트 — 세션 검증 + 권한 판정 ────────────────────────────────
+/**
+ * 성공: { ok:true, email, role }
+ * 실패: { ok:false, reason } — reason:
+ *   "session_invalid"  세션 없음/만료 → 프론트는 재로그인 유도
+ *   "forbidden"        로그인은 했으나 권한 없음(쓰기 등) → 감사 로그 기록됨
+ */
+function authorizeBySession(sessionToken, action, agentRole) {
+  const s = validateSession(sessionToken); // v23
+  if (!s) return { ok: false, reason: "session_invalid" };
+
+  const level = ACTION_PERMISSIONS[action] || "manager"; // v22 매핑, 미정의는 보수적으로 Manager
+  const p = checkPermissionFromSession(s, level, agentRole);
+  if (!p.ok) {
+    logAudit(s.email, action, agentRole || "", "deny_perm", p.reason); // v22
+    return { ok: false, reason: "forbidden", detail: p.reason, email: s.email };
+  }
+  return { ok: true, email: s.email, role: s.role };
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// 【v23 (2026-06-04) 추가 — 회로 역추적 통합】
+//   명세서: 학습앱_회로역추적_통합명세서.html
+//   PLC 프로그램 분석도구 V1 채팅방 산출 trace_signal.py를 Apps Script로 포팅.
+//   신호 의존 체인을 재귀 추적해 외부 입력 leaf까지 트리 구성.
+//   signal_graph + block_signals_index 둘 다 필요 (사전 구축에 block 사용).
+// ════════════════════════════════════════════════════════════════════════════
+
+const TRACE_KEYWORDS = { AND:1, OR:1, NOT:1, XOR:1, TRUE:1, FALSE:1, EMPTY:1, CYCLE:1, OPEN:1, UNCONNECTED:1 };
+const TRACE_SHORT_NOISE = {
+  IN:1, OUT:1, PT:1, ET:1, Q:1, EMO:1, NG:1, OK:1,
+  Alarm:1, Door:1, Run:1, Auto:1, Use:1, Reset:1, Step:1,
+  Eq:1, Ge:1, Gt:1, Lt:1, Le:1, Ne:1
+};
+
+function _isTraceWordChar(c) {
+  return /[a-zA-Z0-9_.]/.test(c);
+}
+
+/** 알려진 신호 사전 구축 (graph 키 + block_signals 안 all_signals + IEC_TIMER의 .Q/.ET). */
+function buildKnownSignalSet(graph, blocks) {
+  const set = {};
+  const gKeys = Object.keys(graph);
+  for (var i = 0; i < gKeys.length; i++) set[gKeys[i]] = true;
+  if (!blocks) return set;
+  const bKeys = Object.keys(blocks);
+  for (var bi = 0; bi < bKeys.length; bi++) {
+    const info = blocks[bKeys[bi]] || {};
+    const all = info.all_signals || [];
+    for (var ai = 0; ai < all.length; ai++) {
+      const item = all[ai];
+      const name = typeof item === 'string' ? item : (item && item.name) || '';
+      if (name) set[name] = true;
+    }
+    const byType = info.signals_by_type || {};
+    const timers = byType.IEC_TIMER || [];
+    for (var ti = 0; ti < timers.length; ti++) {
+      const t = timers[ti];
+      const name = typeof t === 'string' ? t : (t && t.name) || '';
+      if (name) {
+        set[name + ".Q"] = true;
+        set[name + ".ET"] = true;
+      }
+    }
+  }
+  return set;
+}
+
+/** 1차: 사전 매칭 (가장 긴 매칭 우선, 단어 경계 확인, 마스킹). */
+function extractByDict(condStr, sortedSignals) {
+  if (!condStr) return { found: [], remaining: condStr || "" };
+  const masked = condStr.split('');
+  const found = [];
+  for (var si = 0; si < sortedSignals.length; si++) {
+    const sig = sortedSignals[si];
+    if (!sig || sig.length < 3) continue;
+    var idx = 0;
+    while (idx < condStr.length) {
+      const pos = condStr.indexOf(sig, idx);
+      if (pos < 0) break;
+      const beforeOk = (pos === 0) || !_isTraceWordChar(condStr.charAt(pos - 1));
+      const afterPos = pos + sig.length;
+      const afterOk = (afterPos >= condStr.length) || !_isTraceWordChar(condStr.charAt(afterPos));
+      var alreadyMasked = false;
+      for (var mi = pos; mi < pos + sig.length; mi++) {
+        if (masked[mi] === '\0') { alreadyMasked = true; break; }
+      }
+      if (beforeOk && afterOk && !alreadyMasked) {
+        found.push(sig);
+        for (var mj = pos; mj < pos + sig.length; mj++) masked[mj] = '\0';
+      }
+      idx = pos + sig.length;
+    }
+  }
+  var remaining = "";
+  for (var ri = 0; ri < masked.length; ri++) {
+    remaining += (masked[ri] === '\0') ? ' ' : masked[ri];
+  }
+  return { found: found, remaining: remaining };
+}
+
+/** 2차: AND/OR/NOT 토큰 분리 (사전 없는 신호도 인식). */
+function extractByTokens(condStr) {
+  if (!condStr) return [];
+  const parts = condStr.split(/\b(?:AND|OR|NOT|XOR)\b|[(),]/);
+  const result = [];
+  for (var pi = 0; pi < parts.length; pi++) {
+    const p = parts[pi].trim();
+    if (!p || p.length < 3) continue;
+    if (TRACE_KEYWORDS[p.toUpperCase()]) continue;
+    if (TRACE_SHORT_NOISE[p]) continue;
+    if (p.charAt(0) === '#') continue;
+    if (p.charAt(0) === '<') continue;
+    if (p.indexOf('OTHER:') === 0) continue;
+    result.push(p);
+  }
+  return result;
+}
+
+/** 1차(사전) + 2차(토큰) 결합 — 중복 제거 순서 유지. */
+function extractSignals(condStr, sortedSignals) {
+  const dict = extractByDict(condStr, sortedSignals);
+  const tokens = extractByTokens(dict.remaining);
+  const seen = {};
+  const result = [];
+  for (var i = 0; i < dict.found.length; i++) {
+    if (!seen[dict.found[i]]) { seen[dict.found[i]] = true; result.push(dict.found[i]); }
+  }
+  for (var j = 0; j < tokens.length; j++) {
+    if (!seen[tokens[j]]) { seen[tokens[j]] = true; result.push(tokens[j]); }
+  }
+  return result;
+}
+
+/** 메인 재귀 트레이스. max_depth/cycle/external_input 처리. */
+function traceSignal(signal, graph, sortedSignals, maxDepth, maxLocs, depth, visited) {
+  depth = depth || 0;
+  maxLocs = maxLocs || 3;
+  visited = visited || {};
+  if (depth > maxDepth) return { signal: signal, reason: 'max_depth', children: [] };
+  if (visited[signal]) return { signal: signal, reason: 'cycle', children: [] };
+  const newVisited = {};
+  const vKeys = Object.keys(visited);
+  for (var vi = 0; vi < vKeys.length; vi++) newVisited[vKeys[vi]] = true;
+  newVisited[signal] = true;
+
+  const info = graph[signal];
+  if (!info || !info.set_locations || info.set_locations.length === 0) {
+    return { signal: signal, reason: 'external_input', children: [] };
+  }
+  const totalLocs = info.set_locations.length;
+  const locsToShow = info.set_locations.slice(0, maxLocs);
+  const omitted = Math.max(0, totalLocs - maxLocs);
+
+  const children = [];
+  for (var li = 0; li < locsToShow.length; li++) {
+    const loc = locsToShow[li];
+    const condStr = loc.condition_str || '';
+    const inputSignals = extractSignals(condStr, sortedSignals);
+    const subChildren = [];
+    for (var ii = 0; ii < inputSignals.length; ii++) {
+      subChildren.push(traceSignal(inputSignals[ii], graph, sortedSignals, maxDepth, maxLocs, depth + 1, newVisited));
+    }
+    children.push({
+      block: loc.block || '?',
+      network: loc.network_id || '?',
+      title: loc.network_title || '',
+      operator: loc.operator || '?',
+      mode: loc.mode || '',
+      condition_str: condStr,
+      children: subChildren,
+    });
+  }
+  return {
+    signal: signal, reason: 'traced',
+    set_locations: children,
+    omitted_locations: omitted,
+    total_locations: totalLocs,
+  };
+}
+
+/** 트리 → 들여쓰기 텍스트. */
+function treeToText(node, indent) {
+  indent = indent || 0;
+  const pad = new Array(indent + 1).join('  ');
+  const lines = [];
+  if (node.reason === 'external_input') {
+    lines.push(pad + '🔻 ' + node.signal + '  [외부 입력]');
+    return lines.join('\n');
+  }
+  if (node.reason === 'cycle') {
+    lines.push(pad + '🔄 ' + node.signal + '  [cycle - 이미 추적됨]');
+    return lines.join('\n');
+  }
+  if (node.reason === 'max_depth') {
+    lines.push(pad + '⏸  ' + node.signal + '  [깊이 제한]');
+    return lines.join('\n');
+  }
+  const total = node.total_locations || 0;
+  const suffix = total > 1 ? '  (전체 ' + total + '곳)' : '';
+  lines.push(pad + '● ' + node.signal + suffix);
+  const setLocs = node.set_locations || [];
+  for (var li = 0; li < setLocs.length; li++) {
+    const loc = setLocs[li];
+    const markers = { set:'⬆', reset:'⬇', normal:'→', timer:'⏱', rising_edge:'↗', falling_edge:'↘' };
+    const modeMarker = markers[loc.mode] || '→';
+    const titleStr = loc.title ? ' (' + loc.title + ')' : '';
+    lines.push(pad + '  ' + modeMarker + ' [' + loc.operator + '/' + loc.mode + '] '
+      + loc.block + ' N' + loc.network + titleStr);
+    const cond = loc.condition_str || '';
+    const condShow = cond.length <= 110 ? cond : cond.slice(0, 110) + '...';
+    lines.push(pad + '     조건: ' + condShow);
+    const subs = loc.children || [];
+    for (var ci = 0; ci < subs.length; ci++) {
+      lines.push(treeToText(subs[ci], indent + 2));
+    }
+  }
+  if (node.omitted_locations > 0) {
+    lines.push(pad + '  ⋯ 외 ' + node.omitted_locations + '곳 생략');
+  }
+  return lines.join('\n');
+}
+
+/** 트리에서 external_input leaf 신호 수집. */
+function collectExternals(node, externals) {
+  externals = externals || {};
+  if (node.reason === 'external_input') {
+    externals[node.signal] = true;
+  } else if (node.reason === 'traced') {
+    const setLocs = node.set_locations || [];
+    for (var li = 0; li < setLocs.length; li++) {
+      const subs = setLocs[li].children || [];
+      for (var ci = 0; ci < subs.length; ci++) {
+        collectExternals(subs[ci], externals);
+      }
+    }
+  }
+  return externals;
+}
+
+/** 트레이스 결과 → LLM 컨텍스트 텍스트 (명세서 §4 처리 룰 안내 포함). */
+function formatTraceContext(targetSignal, tree, depthRequested) {
+  if (!tree) return '';
+  const lines = [
+    "",
+    "## [회로 역추적 결과] (Signal Graph 재귀 추적, 깊이=" + depthRequested + ")",
+    "대상 신호: " + targetSignal,
+    "",
+    "### 추적 트리",
+    treeToText(tree),
+    "",
   ];
+  const ext = collectExternals(tree);
+  const extList = Object.keys(ext);
+  if (extList.length > 0) {
+    lines.push("### 최종 외부 입력 신호 (" + extList.length + "개) — 작업자가 실제로 점검할 신호");
+    extList.sort();
+    for (var i = 0; i < extList.length; i++) {
+      lines.push("  🔻 " + extList[i]);
+    }
+    lines.push("");
+  }
+  lines.push("**처리 룰 (반드시 따르세요):**");
+  lines.push("1. 트리를 그대로 답변에 복붙하지 말고 사용자 질문 의도에 맞춰 요약하세요.");
+  lines.push("   · '어디서 켜져?' → 1단계 위치 + 조건만");
+  lines.push("   · 'ON 되려면?' → 외부 입력 목록 + 핵심 체인");
+  lines.push("2. 외부 입력(🔻 leaf)은 답변 끝에 정리해서 작업자 점검 포인트로 명확히 안내.");
+  lines.push("3. NOT 패턴 자연어 해석: 'NOT(A AND B AND C)' → 'A, B, C 중 하나라도 OFF면 ON' 식으로 설명.");
+  lines.push("4. KB 사례 카드에 추적 신호 매칭되면 결합 안내 (예: safetyRelease 추적 시 FB 내부 변수 사례 연결).");
+  lines.push("5. answer 끝에 'ⓘ 출처: 회로 역추적 (Signal Graph 자동 추적)' 라벨을 붙이세요.");
+  lines.push("   KB 사례 결합 시: 'ⓘ 출처: 회로 역추적 + KB 사례'.");
+  return lines.join('\n');
+}
 
-  return (
-    <div style={{
-      minHeight:"100vh",
-      background:"linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
-      fontFamily:"'Noto Sans KR','Malgun Gothic',sans-serif",
-      color:"#e2e8f0",
-    }}>
-      {/* Header */}
-      <div style={{
-        background:"rgba(3,6,13,0.96)", backdropFilter:"blur(12px)",
-        borderBottom:`1px solid ${roleInfo.color}20`,
-        padding:"12px 20px", position:"sticky", top:0, zIndex:100,
-        display:"flex", alignItems:"center", gap:12,
-      }}>
-        <div style={{
-          width:34, height:34, borderRadius:8,
-          background:roleInfo.bg, border:`1.5px solid ${roleInfo.color}44`,
-          display:"flex", alignItems:"center", justifyContent:"center", fontSize:18,
-        }}>{roleInfo.icon}</div>
-        <div>
-          <div style={{ fontSize:13, fontWeight:800, color:"#f1f5f9" }}>
-            {roleInfo.label} AI 학습
-          </div>
-          <div style={{ fontSize:9, color:roleInfo.color, letterSpacing:2, fontWeight:700 }}>
-            {role} ENGINEER · TRAINING MODE
-          </div>
-        </div>
-        <div style={{ marginLeft:"auto", display:"flex", gap:8, alignItems:"center" }}>
-          <button onClick={() => { window.location.href = window.location.pathname; }} style={{
-            background:"rgba(51,65,85,0.4)", border:"1px solid rgba(71,85,105,0.5)",
-            color:"#94a3b8", borderRadius:6, padding:"5px 11px",
-            fontSize:11, fontWeight:700, cursor:"pointer",
-            display:"inline-flex", alignItems:"center", gap:4,
-          }} title="에이전트 선택 화면으로">
-            🏠 홈
-          </button>
-          <span style={{
-            background:roleInfo.bg, border:`1px solid ${roleInfo.color}40`,
-            color:roleInfo.color, borderRadius:6, padding:"3px 10px",
-            fontSize:11, fontWeight:800,
-          }}>{role}</span>
-        </div>
-      </div>
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * Fork C (2026-06-09) — detectTraceTrigger 기호 무관 신호 인식
+ *
+ * 📍 대상 프로젝트: Factory Agent KB (학습앱 백엔드)
+ *
+ * ▣ 문제
+ *   챗 탭(handleQuery)에서 "Door_Open_Error 왜 떠?"는 회로 답변되지만
+ *   "Door Open Error 왜 떠?"(공백)는 안 됨. 정규화가 공백만 제거하고 언더바는 남겨
+ *   "dooropenerror" vs "door_open_error" 불일치. phrase 매칭도 공백/언더바 차이로 실패.
+ *
+ * ▣ 해결 (규칙 기반, LLM 불필요)
+ *   - 정규화에서 공백·따옴표뿐 아니라 언더바(_)·하이픈(-)도 제거 → 기호 무관 일치
+ *     "Door Open Error" / "Door_Open_Error" / "door-open-error" / "DOOR OPEN ERROR"
+ *     모두 "dooropenerror" 로 통일 인식
+ *   - 다단어 phrase 도 후보에 포함(공백 신호명 대응) + 정규화 비교
+ *   - 부분 일치는 후보 6자+ 만 허용(짧은 단어 "error" 단독 오매칭 차단)
+ *   - "왜 떠/뜨/발생/그래" 류 트리거 패턴 명시 추가
+ *   - extractSignalCandidates 는 미수정(회귀 안전)
+ *
+ * ▣ 적용
+ *   기존 detectTraceTrigger 함수 전체를 아래로 교체. 다른 함수·라우터 무변경.
+ *   저장 → 배포 → 배포 관리 → 편집 → 새 버전 → 배포 (★재배포 필수: handleQuery가 호출)
+ *
+ * ▣ 의존 (이미 존재): extractSignalCandidates
+ * ═══════════════════════════════════════════════════════════════════════════════ */
 
-      {/* Tabs */}
-      <div style={{
-        display:"flex", borderBottom:"1px solid rgba(51,65,85,0.3)",
-        background:"rgba(3,6,13,0.85)", overflowX:"auto",
-      }}>
-        {TABS.map(t => (
-          <button key={t.id} onClick={() => setTab(t.id)} style={{
-            flex:"1 0 auto", padding:"11px 6px",
-            background:tab===t.id?`${roleInfo.color}0d`:"transparent",
-            border:"none",
-            borderBottom:`2px solid ${tab===t.id?roleInfo.color:"transparent"}`,
-            color:tab===t.id?roleInfo.color:"#374151",
-            fontSize:10, fontWeight:800, cursor:"pointer",
-            display:"flex", flexDirection:"column", alignItems:"center", gap:2,
-          }}>
-            <span style={{ fontSize:16 }}>{t.icon}</span>
-            <span>{t.label}</span>
-          </button>
-        ))}
-      </div>
+function detectTraceTrigger(question, graph) {
+  const q = String(question || '');
+  const patterns = [
+    { re: /인터락|안전\s*조건|safety\s*condition/i, depth: 5 },
+    { re: /왜\s*(?:ON|on)?\s*(?:안\s*돼|안\s*되|안된|문제|fail|장애)|원인\s*(?:찾|추적)/i, depth: 4 },
+    { re: /끝까지|깊이\s*추적|전체\s*체인|deep\s*trace|full\s*trace/i, depth: 5 },
+    { re: /회로\s*(?:분석|분해)|SET\s*조건|set\s*condition/i, depth: 2 },
+    { re: /(?:ON|on)\s*되려면|되려면\s*뭐|뭐가\s*필요/i, depth: 3 },
+    { re: /어디서\s*(?:켜져|set|SET|set돼|set되)|어디에서\s*켜/i, depth: 3 },
+    { re: /추적(?:해|하면|해줘)?|trace(?:\s+this)?/i, depth: 3 },
+    { re: /왜\s*(?:떠|뜨|뜨는|뜨나|발생|올라|나와|나오|생겨|생기)|왜\s*그래|왜\s*이래|why/i, depth: 4 },
+  ];
+  var matchedDepth = null;
+  for (var i = 0; i < patterns.length; i++) {
+    if (patterns[i].re.test(q)) { matchedDepth = patterns[i].depth; break; }
+  }
+  if (matchedDepth === null) return null;
+  if (!graph) return null;
 
-      <div style={{ maxWidth:660, margin:"0 auto", padding:"22px 16px 60px" }}>
-        {/* 학습자료 폴더 동기화 알림 카드 */}
-        {(folderScan.roleFiles.length > 0 || folderScan.commonFiles.length > 0) && (
-          <div style={{
-            background:`${roleInfo.color}08`,
-            border:`1.5px solid ${roleInfo.color}40`,
-            borderRadius:12, padding:"12px 16px", marginBottom:16,
-            display:"flex", alignItems:"center", gap:12,
-          }}>
-            <div style={{ fontSize:24 }}>📁</div>
-            <div style={{ flex:1 }}>
-              <div style={{ fontSize:13, fontWeight:700, color:roleInfo.color }}>
-                새 학습자료 {folderScan.roleFiles.length + folderScan.commonFiles.length}개 발견
-              </div>
-              <div style={{ fontSize:10.5, color:"#64748b", marginTop:2 }}>
-                {folderScan.roleFiles.length > 0 && `${role}: ${folderScan.roleFiles.length}개`}
-                {folderScan.roleFiles.length > 0 && folderScan.commonFiles.length > 0 && " · "}
-                {folderScan.commonFiles.length > 0 && `공통: ${folderScan.commonFiles.length}개`}
-              </div>
-            </div>
-            <button onClick={() => setShowSyncDialog(true)} style={{
-              padding:"7px 14px",
-              background:`${roleInfo.color}25`,
-              border:`1px solid ${roleInfo.color}60`,
-              borderRadius:7, color:roleInfo.color,
-              fontSize:11, fontWeight:700, cursor:"pointer",
-              whiteSpace:"nowrap",
-            }}>
-              📥 학습 시작
-            </button>
-          </div>
-        )}
+  // 기호(공백·따옴표·언더바·하이픈) 무시 정규화 — 기호 차이로 답이 갈리지 않게
+  const norm = function (s) { return String(s).replace(/[\s"'_\-]/g, "").toLowerCase(); };
+  const keys = Object.keys(graph);
 
-        {panels[tab]}
-      </div>
+  // 후보 수집: 개별 신호 후보 + 다단어 phrase(공백 신호명 대응)
+  const cands = extractSignalCandidates(q).slice();
+  const phrasePattern = /[A-Za-z][a-zA-Z0-9_]+(?:\s+[A-Za-z][a-zA-Z0-9_]+){1,5}/g;
+  const phrases = q.match(phrasePattern) || [];
+  for (var pi = 0; pi < phrases.length; pi++) {
+    if (phrases[pi].length >= 6) cands.push(phrases[pi]);
+  }
 
-      {/* 학습자료 동기화 모달 */}
-      {showSyncDialog && (
-        <div style={{
-          position:"fixed", top:0, left:0, right:0, bottom:0,
-          background:"rgba(0,0,0,0.7)", backdropFilter:"blur(4px)",
-          display:"flex", alignItems:"center", justifyContent:"center",
-          zIndex:1000, padding:"16px",
-        }}>
-          <div style={{
-            background:"#0f172a", border:`1.5px solid ${roleInfo.color}40`,
-            borderRadius:14, padding:"20px", maxWidth:540, width:"100%",
-            maxHeight:"90vh", overflowY:"auto",
-          }}>
-            {!syncingFiles && !syncResult && (
-              <>
-                <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:6 }}>
-                  📁 학습자료 일괄 학습
-                </div>
-                <div style={{ fontSize:11.5, color:"#94a3b8", marginBottom:16, lineHeight:1.6 }}>
-                  드라이브 학습자료 폴더에서 발견된 새 파일을 일괄 학습합니다.
-                  <br/>
-                  현재 <strong style={{ color:"#fbbf24" }}>이미지 파일만</strong> 자동 학습 지원됩니다.
-                  <br/>
-                  <span style={{ color:"#64748b", fontSize:10.5 }}>
-                    (PDF는 옵션 선택이 필요하므로 학습앱에서 직접 업로드, Word/Excel은 PDF 변환 후 업로드 권장)
-                  </span>
-                </div>
+  // 정규화 + 길이 내림차순 (정확/긴 후보 우선)
+  const nc = [];
+  for (var ci = 0; ci < cands.length; ci++) {
+    const n = norm(cands[ci]);
+    if (n.length >= 4) nc.push({ raw: cands[ci], n: n });
+  }
+  nc.sort(function (a, b) { return b.n.length - a.n.length; });
 
-                {/* role 폴더 파일 */}
-                {folderScan.roleFiles.length > 0 && (
-                  <div style={{ marginBottom:14 }}>
-                    <div style={{ fontSize:11, color:roleInfo.color, fontWeight:700, marginBottom:6 }}>
-                      📂 {role} 폴더 ({folderScan.roleFiles.length}개)
-                    </div>
-                    {folderScan.roleFiles.map((f, i) => (
-                      <div key={i} style={{
-                        background:"rgba(15,23,42,0.6)",
-                        border:"1px solid rgba(51,65,85,0.4)",
-                        borderRadius:6, padding:"6px 10px", marginBottom:4,
-                        fontSize:11, color:"#cbd5e1",
-                      }}>
-                        {f.subPath && (
-                          <span style={{
-                            fontSize:9.5, color:roleInfo.color,
-                            background:`${roleInfo.color}15`,
-                            padding:"1px 6px", borderRadius:3, marginRight:6,
-                            fontWeight:700,
-                          }}>📁 {f.subPath}</span>
-                        )}
-                        {f.filename}
-                        <span style={{ fontSize:9.5, color:"#64748b", marginLeft:6 }}>
-                          ({(f.size/1024).toFixed(0)}KB · {f.mimetype})
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
+  // 1) 정확(정규화) 일치 — 원본 키 우선
+  for (var a = 0; a < nc.length; a++) {
+    if (graph[nc[a].raw]) return { target: nc[a].raw, depth: matchedDepth };
+    for (var ki = 0; ki < keys.length; ki++) {
+      if (norm(keys[ki]) === nc[a].n) return { target: keys[ki], depth: matchedDepth };
+    }
+  }
+  // 2) 부분 일치 — 후보 6자+ 만(짧은 단어 오매칭 차단), 가장 짧은 키 선택
+  for (var b = 0; b < nc.length; b++) {
+    if (nc[b].n.length < 6) continue;
+    var bestKey = null, bestLen = Infinity;
+    for (var kj = 0; kj < keys.length; kj++) {
+      if (norm(keys[kj]).indexOf(nc[b].n) >= 0 && keys[kj].length < bestLen) {
+        bestKey = keys[kj]; bestLen = keys[kj].length;
+      }
+    }
+    if (bestKey) return { target: bestKey, depth: matchedDepth };
+  }
+  return null;
+}
 
-                {/* 공통 폴더 파일 */}
-                {folderScan.commonFiles.length > 0 && (
-                  <div style={{ marginBottom:14 }}>
-                    <div style={{ fontSize:11, color:"#34d399", fontWeight:700, marginBottom:6 }}>
-                      🌐 공통 폴더 ({folderScan.commonFiles.length}개)
-                    </div>
-                    <div style={{ fontSize:10, color:"#64748b", marginBottom:6 }}>
-                      모든 에이전트가 참조하는 공통 학습 데이터로 저장됩니다
-                    </div>
-                    {folderScan.commonFiles.map((f, i) => (
-                      <div key={i} style={{
-                        background:"rgba(15,23,42,0.6)",
-                        border:"1px solid rgba(52,211,153,0.25)",
-                        borderRadius:6, padding:"6px 10px", marginBottom:4,
-                        fontSize:11, color:"#cbd5e1",
-                      }}>
-                        {f.subPath && (
-                          <span style={{
-                            fontSize:9.5, color:"#34d399",
-                            background:"rgba(52,211,153,0.15)",
-                            padding:"1px 6px", borderRadius:3, marginRight:6,
-                            fontWeight:700,
-                          }}>📁 {f.subPath}</span>
-                        )}
-                        {f.filename}
-                        <span style={{ fontSize:9.5, color:"#64748b", marginLeft:6 }}>
-                          ({(f.size/1024).toFixed(0)}KB · {f.mimetype})
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
+/*** PLC 블록 JSON → KB 적재 (parsed_json 폴더 스캔, 덮어쓰기) ***/
+const PLC_PARSED_FOLDER_ID = '1oy3covfe3uYTjVdwfFrPTx-DObIRu7vv'; // STK_1A1/parsed_json
+const PLC_KB_SPREADSHEET_ID = '1Kc_aRh-MLJPJvgmkcqhU4Gw20n5MhEkfnsqoNf8QOLY'; // 학습앱 KB 시트
+const PLC_INDEX_SHEET = 'PLC_Block_Index';
+const PLC_CHUNK_SHEET = 'PLC_Block_JSON';
+const PLC_CHUNK_SIZE = 40000;
+const PLC_EQUIPMENT = 'STK_1A1';
 
-                <div style={{ display:"flex", gap:8 }}>
-                  <button onClick={requestSync} style={{
-                    flex:1, padding:"10px",
-                    background:`linear-gradient(135deg,${roleInfo.color},${roleInfo.color}cc)`,
-                    border:"none", borderRadius:8, color:"#fff",
-                    fontSize:13, fontWeight:700, cursor:"pointer",
-                  }}>
-                    📥 일괄 학습 시작
-                  </button>
-                  <button onClick={() => setShowSyncDialog(false)} style={{
-                    padding:"10px 16px",
-                    background:"rgba(51,65,85,0.4)",
-                    border:"1px solid rgba(71,85,105,0.5)",
-                    borderRadius:8, color:"#94a3b8",
-                    fontSize:13, fontWeight:700, cursor:"pointer",
-                  }}>
-                    취소
-                  </button>
-                </div>
-              </>
-            )}
+function ingestParsedJson() {
+  const ss = SpreadsheetApp.openById(PLC_KB_SPREADSHEET_ID);
+  const idx = plcGetOrCreateSheet_(ss, PLC_INDEX_SHEET,
+    ['equipment','block_name','block_number','language','output_signals','total_chunks','json_file_id','updated_at']);
+  const chk = plcGetOrCreateSheet_(ss, PLC_CHUNK_SHEET,
+    ['block_key','chunk_index','total_chunks','json_chunk']);
 
-            {syncingFiles && (
-              <>
-                <div style={{ fontSize:16, fontWeight:800, color:"#f1f5f9", marginBottom:12 }}>
-                  📥 학습 중...
-                </div>
-                <div style={{ fontSize:11, color:"#94a3b8", marginBottom:8 }}>
-                  {syncProgress.current}/{syncProgress.total} · {syncProgress.currentFile}
-                </div>
-                <div style={{ height:6, background:"rgba(51,65,85,0.5)", borderRadius:3, overflow:"hidden" }}>
-                  <div style={{
-                    height:"100%",
-                    width: syncProgress.total > 0 ? `${(syncProgress.current/syncProgress.total)*100}%` : "0%",
-                    background:`linear-gradient(90deg,${roleInfo.color},${roleInfo.color}99)`,
-                    transition:"width 0.3s",
-                  }}/>
-                </div>
-                <div style={{ fontSize:10, color:"#64748b", marginTop:14, textAlign:"center" }}>
-                  파일 분석 중입니다. 잠시만 기다려주세요...
-                </div>
-                {wakeLockUnsupported ? (
-                  <div style={{ fontSize:10, color:"#fbbf24", marginTop:8, textAlign:"center", lineHeight:1.5 }}>
-                    ⚠️ 이 브라우저는 화면 꺼짐 방지(Wake Lock)를 지원하지 않습니다.<br/>
-                    학습이 끝날 때까지 화면을 켜두세요. (다른 메뉴로 이동해도 학습은 계속됩니다)
-                  </div>
-                ) : (
-                  <div style={{ fontSize:10, color:"#64748b", marginTop:8, textAlign:"center", lineHeight:1.5 }}>
-                    🔒 화면이 꺼지지 않도록 설정됐습니다. 다른 메뉴로 이동해도 학습은 계속됩니다.<br/>
-                    탭을 닫지만 마세요.
-                  </div>
-                )}
-              </>
-            )}
+  const folder = DriveApp.getFolderById(PLC_PARSED_FOLDER_ID);
+  const files = folder.getFilesByType('application/json');
+  const today = Utilities.formatDate(new Date(), 'Asia/Jakarta', 'yyyy-MM-dd');
+  let count = 0;
 
-            {syncResult && (
-              <>
-                <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:12 }}>
-                  ✅ 학습 완료
-                </div>
-                <div style={{
-                  background:"rgba(15,23,42,0.6)", border:"1px solid rgba(51,65,85,0.4)",
-                  borderRadius:8, padding:"12px 14px", marginBottom:12,
-                }}>
-                  <div style={{ fontSize:12, color:"#34d399", fontWeight:700, marginBottom:4 }}>
-                    성공: {syncResult.successCount}개
-                  </div>
-                  {(syncResult.pdfTextCount > 0 || syncResult.pdfVisionCount > 0) && (
-                    <div style={{ fontSize:10, color:"#94a3b8", marginTop:4, marginBottom:4 }}>
-                      {syncResult.pdfTextCount > 0 && `📝 PDF 텍스트 추출: ${syncResult.pdfTextCount}개  `}
-                      {syncResult.pdfVisionCount > 0 && `🖼️ PDF 그림 분석: ${syncResult.pdfVisionCount}개`}
-                    </div>
-                  )}
-                  {syncResult.pptConvertedCount > 0 && (
-                    <div style={{ fontSize:10, color:"#fbbf24", marginTop:2, marginBottom:4 }}>
-                      📊 PPT → PDF 자동 변환: {syncResult.pptConvertedCount}개 (원본 PPT는 휴지통으로 이동)
-                    </div>
-                  )}
-                  {syncResult.xlsxSheetCount > 0 && (
-                    <div style={{ fontSize:10, color:"#22d3ee", marginTop:2, marginBottom:4 }}>
-                      📑 XLSX 시트 학습: {syncResult.xlsxSheetCount}개 시트 (청크 {syncResult.xlsxChunkCount}개, 200행 단위)
-                    </div>
-                  )}
-                  {syncResult.csvChunkCount > 0 && (
-                    <div style={{ fontSize:10, color:"#22d3ee", marginTop:2, marginBottom:4 }}>
-                      📊 CSV 학습: 청크 {syncResult.csvChunkCount}개 (200행 단위)
-                    </div>
-                  )}
-                  {syncResult.textFileCount > 0 && (
-                    <div style={{ fontSize:10, color:"#a3e635", marginTop:2, marginBottom:4 }}>
-                      📝 TXT/MD 학습: {syncResult.textFileCount}개 파일
-                    </div>
-                  )}
-                  {syncResult.failCount > 0 && (
-                    <div style={{ fontSize:12, color:"#f87171", fontWeight:700 }}>
-                      실패: {syncResult.failCount}개
-                    </div>
-                  )}
-                </div>
+  while (files.hasNext()) {
+    const file = files.next();
+    const raw = file.getBlob().getDataAsString('UTF-8');
+    let data;
+    try { data = JSON.parse(raw); }
+    catch (e) { Logger.log('SKIP (JSON 오류): ' + file.getName() + ' — ' + e); continue; }
 
-                {syncResult.errors.length > 0 && (
-                  <div style={{
-                    background:"rgba(239,68,68,0.05)", border:"1px solid rgba(239,68,68,0.2)",
-                    borderRadius:8, padding:"10px 12px", marginBottom:12,
-                    maxHeight:160, overflowY:"auto",
-                  }}>
-                    <div style={{ fontSize:10, color:"#f87171", fontWeight:700, marginBottom:6 }}>
-                      실패 상세
-                    </div>
-                    {syncResult.errors.map((err, i) => (
-                      <div key={i} style={{ fontSize:10, color:"#fca5a5", marginBottom:3 }}>
-                        • {err}
-                      </div>
-                    ))}
-                  </div>
-                )}
+    const name = (data.header && data.header.name) || file.getName().replace(/\.json$/i,'');
+    const number = (data.header && data.header.number) || '';
+    const lang = (data.header && data.header.language) || '';
+    const blockKey = number ? (name + ' (' + number + ')') : name;
+    const signals = plcCollectOutputSignals_(data);
+    const chunks = plcChunk_(raw, PLC_CHUNK_SIZE);
 
-                <button onClick={() => {
-                  setShowSyncDialog(false);
-                  setSyncResult(null);
-                }} style={{
-                  width:"100%", padding:"10px",
-                  background:`linear-gradient(135deg,${roleInfo.color},${roleInfo.color}cc)`,
-                  border:"none", borderRadius:8, color:"#fff",
-                  fontSize:13, fontWeight:700, cursor:"pointer",
-                }}>
-                  확인
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-      )}
+    // 덮어쓰기: 기존 행 제거
+    plcRemoveRows_(idx, function(r){ return r[1] === name && r[2] === number; });
+    plcRemoveRows_(chk, function(r){ return r[0] === blockKey; });
 
-      {/* ─── 빈약 데이터 재학습 모달 (Step 7-11) ─── */}
-      {showRelearnDialog && (() => {
-        const weakItems = knowledge.filter(k => isWeakAutoItem(k.content));
-        const fileNameSet = new Set();
-        weakItems.forEach(w => {
-          const c = w.content || "";
-          const m1 = c.match(/^\[파일:\s*([^\]]+?)\]/);
-          const m2 = c.match(/^\[PDF:\s*([^\]\s-]+\.pdf)/i);
-          const fname = m1 ? m1[1].trim() : (m2 ? m2[1].trim() : null);
-          if (fname) fileNameSet.add(fname);
+    // 인덱스 1행
+    idx.appendRow([PLC_EQUIPMENT, name, number, lang, signals.join(', '),
+                   chunks.length, file.getId(), today]);
+    // 청크 N행
+    for (let i = 0; i < chunks.length; i++) {
+      chk.appendRow([blockKey, i, chunks.length, chunks[i]]);
+    }
+    Logger.log('적재: ' + blockKey + ' — 신호 ' + signals.length + '개 / 청크 ' + chunks.length + '개');
+    count++;
+  }
+  Logger.log('=== 완료: ' + count + '개 블록 적재 ===');
+}
+
+function plcCollectOutputSignals_(data) {
+  const seen = {}, out = [];
+  const nets = data.logic_networks || [];
+  for (let n = 0; n < nets.length; n++) {
+    const outs = nets[n].outputs || [];
+    for (let o = 0; o < outs.length; o++) {
+      const s = outs[o].signal;
+      if (s && s !== '?' && !seen[s]) { seen[s] = 1; out.push(s); }
+    }
+  }
+  return out;
+}
+
+function plcChunk_(str, size) {
+  const arr = [];
+  for (let i = 0; i < str.length; i += size) arr.push(str.substring(i, i + size));
+  return arr.length ? arr : [''];
+}
+
+function plcGetOrCreateSheet_(ss, sheetName, header) {
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh) { sh = ss.insertSheet(sheetName); sh.appendRow(header); }
+  else if (sh.getLastRow() === 0) { sh.appendRow(header); }
+  return sh;
+}
+
+function plcRemoveRows_(sheet, matchFn) {
+  const vals = sheet.getDataRange().getValues();
+  if (vals.length <= 1) return;
+  const header = vals[0];
+  const kept = vals.slice(1).filter(function(r){ return !matchFn(r); });
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, header.length).setValues([header]);
+  if (kept.length) sheet.getRange(2, 1, kept.length, header.length).setValues([kept]);
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// ★ v26 추가 블록 — PLC 회로 역추적 4번 탭용 KB 읽기 API (plc_index / plc_block)
+//   별도 앱(PLC Agent)이 PLC_Block_Index / PLC_Block_JSON 시트를 읽기 위한 조회 전용 endpoint.
+//   인증: 기존 PLC_QUERY_TOKEN (query/trace와 동일). doPost path 분기에서 호출.
+//   기존 ingestParsedJson()이 적재한 두 시트를 그대로 읽음 (상수 PLC_KB_SPREADSHEET_ID 등 재사용).
+//   배포: doPost가 바뀌므로 ★재배포 필수★ (저장→배포→배포 관리→편집→새 버전→배포)
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * plc_index — PLC_Block_Index 시트 전체를 블록 목록으로 반환.
+ * 요청: { path:"plc_index", token }
+ * 응답: { status:"ok", blocks:[{equipment, block_name, block_number, language,
+ *          output_signals:[...], total_chunks, block_key, updated_at}] }
+ */
+function handlePlcIndex(data) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const expectedToken = props.getProperty("PLC_QUERY_TOKEN");
+    if (!expectedToken) return makeResponse({ status: "error", message: "PLC_QUERY_TOKEN not configured" });
+    if (data.token !== expectedToken) return makeResponse({ status: "error", message: "unauthorized" });
+
+    const ss = SpreadsheetApp.openById(PLC_KB_SPREADSHEET_ID);
+    const sh = ss.getSheetByName(PLC_INDEX_SHEET);
+    if (!sh || sh.getLastRow() < 2) {
+      return makeResponse({ status: "ok", blocks: [] });
+    }
+    // 헤더: equipment | block_name | block_number | language | output_signals | total_chunks | json_file_id | updated_at
+    const rows = sh.getRange(2, 1, sh.getLastRow() - 1, 8).getValues();
+    const blocks = rows.map(function (r) {
+      return {
+        equipment: r[0],
+        block_name: r[1],
+        block_number: r[2],
+        language: r[3],
+        output_signals: String(r[4] || "").split(",").map(function (s) { return s.trim(); }).filter(Boolean),
+        total_chunks: r[5],
+        block_key: r[2] ? (r[1] + " (" + r[2] + ")") : String(r[1]),
+        updated_at: r[7],
+      };
+    });
+    return makeResponse({ status: "ok", blocks: blocks });
+  } catch (err) {
+    return makeResponse({ status: "error", message: err.message });
+  }
+}
+
+/**
+ * plc_block — 한 블록의 청크를 순서대로 이어붙여 파싱본 JSON 반환.
+ * 요청: { path:"plc_block", token, data:{ block_key:"DAT_Door (FB200)" } }
+ * 응답: { status:"ok", block_key, json:{...} }  /  못 찾으면 status:"not_found"
+ */
+function handlePlcBlock(data) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const expectedToken = props.getProperty("PLC_QUERY_TOKEN");
+    if (!expectedToken) return makeResponse({ status: "error", message: "PLC_QUERY_TOKEN not configured" });
+    if (data.token !== expectedToken) return makeResponse({ status: "error", message: "unauthorized" });
+
+    const d = data.data || {};
+    const blockKey = String(d.block_key || "").trim();
+    if (!blockKey) return makeResponse({ status: "error", message: "block_key required" });
+
+    const ss = SpreadsheetApp.openById(PLC_KB_SPREADSHEET_ID);
+    const sh = ss.getSheetByName(PLC_CHUNK_SHEET);
+    if (!sh || sh.getLastRow() < 2) return makeResponse({ status: "not_found", block_key: blockKey });
+
+    // 헤더: block_key | chunk_index | total_chunks | json_chunk
+    const rows = sh.getRange(2, 1, sh.getLastRow() - 1, 4).getValues();
+    const mine = rows.filter(function (r) { return String(r[0]) === blockKey; });
+    if (mine.length === 0) return makeResponse({ status: "not_found", block_key: blockKey });
+
+    mine.sort(function (a, b) { return Number(a[1]) - Number(b[1]); }); // chunk_index 순
+    const raw = mine.map(function (r) { return r[3]; }).join("");
+
+    let json;
+    try { json = JSON.parse(raw); }
+    catch (e) { return makeResponse({ status: "error", message: "block JSON parse failed: " + e.message }); }
+
+    return makeResponse({ status: "ok", block_key: blockKey, json: json });
+  } catch (err) {
+    return makeResponse({ status: "error", message: err.message });
+  }
+}
+
+/** v26 검증용 — 에디터에서 직접 실행 (재배포 없이 동작 확인). */
+function testPlcIndex() {
+  const token = PropertiesService.getScriptProperties().getProperty("PLC_QUERY_TOKEN");
+  const r = handlePlcIndex({ path: "plc_index", token: token });
+  Logger.log(r.getContent());
+}
+function testPlcBlock() {
+  const token = PropertiesService.getScriptProperties().getProperty("PLC_QUERY_TOKEN");
+  const r = handlePlcBlock({ path: "plc_block", token: token, data: { block_key: "DAT_Door (FB200)" } });
+  Logger.log(r.getContent().slice(0, 300));
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// ★ v27 추가 블록 — 사진 OCR 백엔드 경유 (plc_ocr)
+//   배경: 별도 앱(PLC Agent)이 브라우저에서 api.anthropic.com을 직접 호출하면
+//         회사 방화벽/CORS로 "Failed to fetch" 발생. 학습앱 URL은 이미 통하므로
+//         OCR도 이 백엔드를 경유시켜 우회 + 프론트에 키 미보관(보안).
+//   인증: 기존 PLC_QUERY_TOKEN. 키: 스크립트 속성 ANTHROPIC_API_KEY (query와 동일).
+//   Vision: 기존 callClaudeAPI 재사용 (content에 이미지+텍스트 블록 배열 전달).
+//   배포: doPost 변경 → ★재배포 필수★
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * plc_ocr — HMI 알람 사진을 Vision OCR하여 {alarm_code, alarm_name, raw_text} 반환.
+ * 요청: { path:"plc_ocr", token, data:{ image_base64, media_type } }
+ *   image_base64 : data URL 접두사 없는 순수 base64 문자열
+ *   media_type   : "image/jpeg" 등 (없으면 image/jpeg)
+ * 응답: { status:"ok", ocr:{ alarm_code, alarm_name, raw_text } }
+ */
+function handlePlcOcr(data) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const expectedToken = props.getProperty("PLC_QUERY_TOKEN");
+    if (!expectedToken) return makeResponse({ status: "error", message: "PLC_QUERY_TOKEN not configured" });
+    if (data.token !== expectedToken) return makeResponse({ status: "error", message: "unauthorized" });
+    const apiKey = props.getProperty("ANTHROPIC_API_KEY");
+    if (!apiKey) return makeResponse({ status: "error", message: "ANTHROPIC_API_KEY not configured" });
+
+    const d = data.data || {};
+    const b64 = String(d.image_base64 || "").trim();
+    if (!b64) return makeResponse({ status: "error", message: "image_base64 required" });
+    const mediaType = d.media_type || "image/jpeg";
+
+    const systemPrompt =
+      "You are an OCR assistant for industrial HMI (PLC operator panel) alarm screens. " +
+      "Extract the alarm information from the image. " +
+      "Respond ONLY with a JSON object, no markdown, no explanation. " +
+      'Format: {"alarm_code":"...","alarm_name":"...","raw_text":"..."}. ' +
+      "alarm_code: the alarm code/number shown (e.g. E0234, A512). If none visible, use empty string. " +
+      "alarm_name: the alarm description/title text. " +
+      "raw_text: all readable text on the screen. " +
+      "Do NOT translate device codes or alarm names — keep original.";
+
+    const content = [
+      { type: "image", source: { type: "base64", media_type: mediaType, data: b64 } },
+      { type: "text", text: "Extract the alarm information as JSON." },
+    ];
+
+    // 기존 callClaudeAPI 재사용 (content 배열 그대로 전달 → Vision 호출, 재시도 포함)
+    const rawText = callClaudeAPI(apiKey, systemPrompt, content);
+    const parsed = extractJson(rawText);
+    const ocr = parsed
+      ? { alarm_code: parsed.alarm_code || "", alarm_name: parsed.alarm_name || "", raw_text: parsed.raw_text || "" }
+      : { alarm_code: "", alarm_name: "", raw_text: String(rawText || "") };
+
+    return makeResponse({ status: "ok", ocr: ocr });
+  } catch (err) {
+    return makeResponse({ status: "error", message: err.message });
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * v28 — PLC_Block_Ladder (통합 래더 SVG 저장·조회) + 하이브리드형 매칭 첨부
+ *
+ * 시트: PLC_Block_Ladder
+ *   헤더: block_key | chunk_index | total_chunks | ladder_html
+ *   - PLC_Block_JSON과 동일 패턴 (청크 분할 — 50K 셀 한계 대응)
+ *
+ * 흐름:
+ *   1) ingestDatDoorLadder() 1회 실행 — DAT_Door body를 청크 분할 저장
+ *   2) handleQuery — detectTraceTrigger의 target 신호 → findBlockByOutputSignal_ → 매칭
+ *                    매칭되면 getPlcLadder_로 ladder_html 받아 응답에 첨부
+ *   3) handlePlcLadder (path:'plc_ladder') — 4번 탭 "회로 역추적" 카탈로그용
+ *                      {block_key} 받아 단일 블록 ladder_html 반환
+ *
+ * 신규 블록 추가 패턴:
+ *   - parsed_json에 새 블록 적재 → ingestParsedJson(폴더ID) 실행 (v26~)
+ *   - 클로드가 그 블록 ladder body HTML 생성 → ingestPlcLadder_(ss, blockKey, body) 호출
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+const LADDER_CHUNK_SIZE = 40000; // 안전 마진 (셀 한계 50K)
+
+// PLC_Block_Index에서 output_signals 컬럼에 signal이 들어있는 첫 블록의 block_key 반환
+// signal: detectTraceTrigger의 target (graph 키 — TIA 신호명 그대로)
+function findBlockByOutputSignal_(ss, signal) {
+  if (!signal) return "";
+  const sh = ss.getSheetByName("PLC_Block_Index");
+  if (!sh || sh.getLastRow() < 2) return "";
+  const rng = sh.getRange(2, 1, sh.getLastRow() - 1, 5).getValues(); // equipment, block_name, block_number, language, output_signals
+  const sigLow = String(signal).toLowerCase().trim();
+  for (var i = 0; i < rng.length; i++) {
+    const outs = String(rng[i][4] || "").split(",").map(function(s){return s.trim().toLowerCase();}).filter(function(s){return s.length>0;});
+    for (var j = 0; j < outs.length; j++) {
+      // 정확 일치 or substring (예: 'moduleinterface.Monitorings.Error' 안에 'Error')
+      if (outs[j] === sigLow || outs[j].indexOf(sigLow) >= 0 || sigLow.indexOf(outs[j]) >= 0) {
+        return String(rng[i][1]) + " (" + String(rng[i][2]) + ")"; // "DAT_Door (FB200)"
+      }
+    }
+  }
+  return "";
+}
+
+// PLC_Block_Ladder에서 blockKey의 모든 청크를 합쳐 ladder_html 반환
+function getPlcLadder_(ss, blockKey) {
+  if (!blockKey) return "";
+  const sh = ss.getSheetByName("PLC_Block_Ladder");
+  if (!sh || sh.getLastRow() < 2) return "";
+  const rng = sh.getRange(2, 1, sh.getLastRow() - 1, 4).getValues();
+  const chunks = [];
+  for (var i = 0; i < rng.length; i++) {
+    if (String(rng[i][0]) === blockKey) {
+      chunks.push({ idx: Number(rng[i][1]) || 0, html: String(rng[i][3] || "") });
+    }
+  }
+  if (chunks.length === 0) return "";
+  chunks.sort(function(a, b){ return a.idx - b.idx; });
+  return chunks.map(function(c){ return c.html; }).join("");
+}
+
+// PLC_Block_Ladder에 blockKey의 ladder_html을 청크 분할 저장 (기존 같은 키 행 삭제 후 재저장)
+function ingestPlcLadder_(ss, blockKey, ladderHtml) {
+  if (!blockKey || !ladderHtml) throw new Error("ingestPlcLadder_: blockKey/ladderHtml 누락");
+  const sh = plcGetOrCreateSheet_(ss, "PLC_Block_Ladder", ["block_key","chunk_index","total_chunks","ladder_html"]);
+  // 기존 같은 key 행 삭제 (아래에서 위로 — 인덱스 안 깨짐)
+  if (sh.getLastRow() >= 2) {
+    const data = sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues();
+    for (var i = data.length - 1; i >= 0; i--) {
+      if (String(data[i][0]) === blockKey) sh.deleteRow(i + 2);
+    }
+  }
+  // 청크 분할 + append
+  const chunks = [];
+  for (var p = 0; p < ladderHtml.length; p += LADDER_CHUNK_SIZE) {
+    chunks.push(ladderHtml.substring(p, p + LADDER_CHUNK_SIZE));
+  }
+  const total = chunks.length;
+  const rows = chunks.map(function(c, idx){ return [blockKey, idx, total, c]; });
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, 4).setValues(rows);
+  Logger.log("[ingestPlcLadder_] " + blockKey + " → " + total + "청크, 총 " + ladderHtml.length + "자");
+  return { block_key: blockKey, total_chunks: total, total_chars: ladderHtml.length };
+}
+
+// 4번 탭(회로 역추적) 카탈로그용 path 핸들러
+// 요청: { secret, path:'plc_ladder', token, data:{ block_key:'DAT_Door (FB200)' } }
+// 응답: { status, block_key, ladder_html, total_chars }
+function handlePlcLadder(data) {
+  try {
+    // v29: 토큰 검증 + data.data 패턴 (다른 PLC 핸들러와 일관)
+    const props = PropertiesService.getScriptProperties();
+    const expectedToken = props.getProperty("PLC_QUERY_TOKEN");
+    if (!expectedToken) return makeResponse({ status: "error", message: "PLC_QUERY_TOKEN not configured" });
+    if (data.token !== expectedToken) return makeResponse({ status: "error", message: "unauthorized" });
+
+    const d = data.data || {};
+    const blockKey = String(d.block_key || "").trim();
+    if (!blockKey) return makeResponse({ status: "error", message: "block_key required" });
+
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const html = getPlcLadder_(ss, blockKey);
+    if (!html) return makeResponse({ status: "not_found", block_key: blockKey, ladder_html: "" });
+    return makeResponse({
+      status: "ok",
+      block_key: blockKey,
+      ladder_html: html,
+      total_chars: html.length,
+    });
+  } catch (err) {
+    return makeResponse({ status: "error", message: err.message });
+  }
+}
+
+function plcSearchTokens_(query) {
+  const KO_EN = {
+    "도어": "Door", "도아": "Door", "문": "Door",
+    "열림": "Open", "오픈": "Open", "열기": "Open", "열려": "Open",
+    "닫힘": "Close", "클로즈": "Close", "닫기": "Close", "닫혀": "Close",
+    "에러": "Error", "오류": "Error", "이상": "Error",
+    "센서": "Sensor",
+    "피드백": "Feedback", "되먹임": "Feedback",
+    "명령": "Command", "커맨드": "Command",
+    "출력": "Output", "아웃풋": "Output",
+    "타이머": "TMR", "지연": "TMR",
+    "모니터": "Monitor", "감시": "Monitor",
+    "리셋": "Reset",
+    "세트": "Set", "셋": "Set",
+  };
+  const rawTokens = String(query).split(/[\s,;\.]+/).filter(function (t) { return t.length > 0; });
+  const tokens = [];
+  for (var i = 0; i < rawTokens.length; i++) {
+    const t = rawTokens[i];
+    if (KO_EN[t]) tokens.push(KO_EN[t].toLowerCase());
+    else if (t.length >= 2) tokens.push(t.toLowerCase());
+  }
+  if (query.length >= 3 && tokens.indexOf(query.toLowerCase()) < 0) tokens.push(query.toLowerCase());
+  return tokens;
+}
+
+function searchSignalIndex_(rows, tokens, filterBlockKey) {
+  const seen = {};
+  const cands = [];
+  for (var r = 0; r < rows.length; r++) {
+    const sig = String(rows[r][0] || "");
+    if (!sig) continue;
+    const blockKey = String(rows[r][1] || "");
+    if (filterBlockKey && blockKey !== filterBlockKey) continue;
+    const dk = sig + "|" + blockKey;
+    if (seen[dk]) continue;
+    seen[dk] = 1;
+    const sigLow = sig.toLowerCase();
+    var score = 0;
+    for (var t = 0; t < tokens.length; t++) {
+      if (sigLow.indexOf(tokens[t]) >= 0) score++;
+    }
+    if (score > 0) {
+      cands.push({
+        signal_name: sig, block_key: blockKey,
+        network_id: rows[r][2], network_title: rows[r][3], match_score: score,
+      });
+    }
+  }
+  return cands;
+}
+
+function llmResolveKeywords_(query, apiKey) {
+  try {
+    const system = [
+      "You convert a Korean maintenance question about a Siemens PLC factory into English search keywords for a PLC signal-name index.",
+      'Output ONLY a JSON object: {"keywords":["Door","Close","Error"]}.',
+      "Rules:",
+      "- Keywords are short English PLC/automation terms likely to appear INSIDE signal names",
+      "  (e.g. Door, Open, Close, Error, Sensor, Cylinder, Servo, Feedback, Command, Output, Timer,",
+      "   Vacuum, Clamp, Up, Down, Forward, Backward, Home, Pusher, Stopper, Magazine, Heater, Press, Pump).",
+      "- Do NOT invent full signal names. Only short keywords or word-stems.",
+      "- 3 to 8 keywords. English only. No Korean. No explanation. JSON object only.",
+    ].join("\n");
+    const raw = callClaudeAPI(apiKey, system, "질문: " + String(query));
+    const parsed = extractJson(raw);
+    if (parsed && Array.isArray(parsed.keywords)) {
+      return parsed.keywords
+        .filter(function (k) { return /^[A-Za-z0-9_]+$/.test(String(k)); })
+        .slice(0, 8);
+    }
+  } catch (e) {
+    Logger.log("[llmResolveKeywords_] " + e.message);
+  }
+  return [];
+}
+
+/**
+ * plc_search (v29) — 4번 탭 자연어 신호 검색 (V1 4단계 합의: C 방식 매칭)
+ * 요청: { path:'plc_search', token, data:{ query:"도어 열림 에러", block_key?:"DAT_Door (FB200)" } }
+ *   - block_key 지정 시: 그 블록의 output_signals만 후보 풀
+ *   - block_key 없으면: 전체 PLC_Block_Index의 모든 신호가 후보 풀
+ * 응답: { status:"ok", candidates:[{block_key, block_name, block_number, signal_name, equipment, language, match_score}] }
+ *
+ * 매칭 원칙 (PLC Agent 규칙 — 추정 없음, 결정론적):
+ *   1) 신호명에 query의 토큰이 substring (대소문자 무시) — score = 매칭된 토큰 수
+ *   2) 영문 신호명 + 한글 query 매핑 (도어→Door, 열림→Open, 닫힘/닫힘→Close, 에러→Error, 센서→Sensor, 피드백→Feedback, 명령→Command, 출력→Output, 타이머→TMR/Timer)
+ *   3) 매칭 점수 내림차순 정렬, 상위 8개 반환
+ */
+function handlePlcSearch(data) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const expectedToken = props.getProperty("PLC_QUERY_TOKEN");
+    if (!expectedToken) return makeResponse({ status: "error", message: "PLC_QUERY_TOKEN not configured" });
+    if (data.token !== expectedToken) return makeResponse({ status: "error", message: "unauthorized" });
+
+    const d = data.data || {};
+    const query = String(d.query || "").trim();
+    if (!query) return makeResponse({ status: "ok", candidates: [] });
+    const filterBlockKey = String(d.block_key || "").trim();
+
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const sh = ss.getSheetByName(PLC_SIGIDX_SHEET);
+    if (!sh || sh.getLastRow() < 2) return makeResponse({ status: "ok", candidates: [] });
+    // PLC_Signal_Index: signal | block_key | network_id | network_title (검색엔 앞 4컬럼)
+    const rows = sh.getRange(2, 1, sh.getLastRow() - 1, 4).getValues();
+
+    // 1차: 고정사전 + 직접 토큰
+    const tokens = plcSearchTokens_(query);
+    var cands = tokens.length ? searchSignalIndex_(rows, tokens, filterBlockKey) : [];
+    var resolvedBy = "dict";
+    var llmKeywords = [];
+
+    // 2차(Fork B): 0건 + 한글 포함 + API 키 있을 때만 LLM 키워드 변환 후 재검색
+    if (cands.length === 0 && /[가-힣]/.test(query)) {
+      const apiKey = props.getProperty("ANTHROPIC_API_KEY");
+      if (apiKey) {
+        llmKeywords = llmResolveKeywords_(query, apiKey);
+        if (llmKeywords.length) {
+          const ltokens = llmKeywords
+            .map(function (k) { return String(k).toLowerCase(); })
+            .filter(function (k) { return k.length >= 2; });
+          if (ltokens.length) {
+            cands = searchSignalIndex_(rows, ltokens, filterBlockKey);
+            resolvedBy = "llm";
+          }
+        }
+      }
+    }
+
+    cands.sort(function (a, b) { return b.match_score - a.match_score; });
+    return makeResponse({
+      status: "ok",
+      query: query,
+      resolved_by: resolvedBy,
+      llm_keywords: llmKeywords,
+      candidates: cands.slice(0, 8),
+      total_matched: cands.length,
+    });
+  } catch (err) {
+    return makeResponse({ status: "error", message: err.message });
+  }
+}
+
+// 적재 검증용 — 시트 상태/적재된 블록 키 목록 반환 (Apps Script editor에서 직접 실행)
+function testPlcLadder() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = ss.getSheetByName("PLC_Block_Ladder");
+  if (!sh) { Logger.log("PLC_Block_Ladder 시트 없음 — ingestDatDoorLadder() 먼저 실행하세요"); return; }
+  const lr = sh.getLastRow();
+  Logger.log("PLC_Block_Ladder: 총 " + (lr - 1) + "행");
+  if (lr < 2) return;
+  const rng = sh.getRange(2, 1, lr - 1, 4).getValues();
+  const byKey = {};
+  for (var i = 0; i < rng.length; i++) {
+    const k = String(rng[i][0]);
+    if (!byKey[k]) byKey[k] = { chunks: 0, chars: 0 };
+    byKey[k].chunks++;
+    byKey[k].chars += String(rng[i][3] || "").length;
+  }
+  Object.keys(byKey).forEach(function(k){
+    Logger.log("  - " + k + ": " + byKey[k].chunks + "청크, " + byKey[k].chars + "자");
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * DAT_Door 통합 래더 body (1회 적재용)
+ *   - V1 HTML의 <body> 내용에서 외피 <style> 제외, 정보 부분(헤더+범례+SVG×4)만 추출
+ *   - 적재 후 PLC_Block_Ladder 시트에 영구 저장됨 → 이후 const 제거 가능
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+const DAT_DOOR_LADDER_BODY = `<h1>DAT_Door — 네트워크별 통합 역추적 래더</h1>
+<div class="sub">FB200 · LAD · TIA Openness SimaticML 자동 복원 · 신호 18 / 네트워크 4 · 공통 접점은 한 번만 그리고 실제 분기점에서 갈라짐</div>
+<div class="legend">
+ <b>─┤ ├─</b> a접점(NO·파랑) &nbsp; <b>─┤/├─</b> b접점(NC·노랑) &nbsp; <b>┌TON┐</b> 타이머(보라) &nbsp;
+ <b>[NOT]</b> 반전(분홍) &nbsp; <b>( )</b> 코일(초록 · S세트 / R리셋) <br>
+ 가로직렬 = AND · 세로분기(수직버스) = 같은 노드에서 갈라지는 실제 분기 · 세로병렬(OR블록) = OR · 접점 위 = 변수 풀네임
+</div>
+<h2>Network 1 — Door Feedback <span class="cnt">출력 2</span></h2>
+<div class="net"><svg viewBox="0 0 832 240" width="832" height="240"><line x1="20" y1="6" x2="20" y2="234" class="rail"/><line x1="20" y1="120" x2="34" y2="120" class="w"/><line x1="808" y1="6" x2="808" y2="234" class="rail"/><line x1="34" y1="68" x2="50" y2="68" class="w"/><line x1="70" y1="42" x2="276" y2="42" class="w"/><line x1="294" y1="42" x2="501" y2="42" class="w"/><line x1="276" y1="26.0" x2="276" y2="58.0" class="bar"/><line x1="294" y1="26.0" x2="294" y2="58.0" class="bar"/><text x="286" y="20.0" class="lbl" text-anchor="middle">Door_Open_Feeback</text><line x1="50" y1="42" x2="70" y2="42" class="w"/><line x1="501" y1="42" x2="521" y2="42" class="w"/><line x1="70" y1="94" x2="134" y2="94" class="w"/><line x1="152" y1="94" x2="216" y2="94" class="w"/><line x1="134" y1="78.0" x2="134" y2="110.0" class="bar"/><line x1="152" y1="78.0" x2="152" y2="110.0" class="bar"/><text x="143" y="72.0" class="lbl" text-anchor="middle">Door_Open_Output</text><line x1="216" y1="94" x2="288" y2="94" class="w"/><line x1="306" y1="94" x2="377" y2="94" class="w"/><line x1="288" y1="78.0" x2="288" y2="110.0" class="bar nc"/><line x1="306" y1="78.0" x2="306" y2="110.0" class="bar nc"/><line x1="288" y1="110.0" x2="306" y2="78.0" class="slash"/><text x="296" y="72.0" class="lbl" text-anchor="middle">Door_Open_Feeback</text><line x1="377" y1="94" x2="430" y2="94" class="w"/><line x1="448" y1="94" x2="501" y2="94" class="w"/><line x1="430" y1="78.0" x2="430" y2="110.0" class="bar"/><line x1="448" y1="78.0" x2="448" y2="110.0" class="bar"/><text x="439" y="72.0" class="lbl" text-anchor="middle">Clock_0.625Hz</text><line x1="50" y1="94" x2="70" y2="94" class="w"/><line x1="501" y1="94" x2="521" y2="94" class="w"/><line x1="50" y1="42" x2="50" y2="94" class="w"/><line x1="521" y1="42" x2="521" y2="94" class="w"/><line x1="50" y1="68" x2="50" y2="68" class="w"/><line x1="521" y1="68" x2="589" y2="68" class="w"/><path d="M 600 68.0 A 15 15 0 0 1 615 53.0" class="coil"/><path d="M 600 68.0 A 15 15 0 0 0 615 83.0" class="coil"/><path d="M 630 68.0 A 15 15 0 0 0 615 53.0" class="coil"/><path d="M 630 68.0 A 15 15 0 0 1 615 83.0" class="coil"/><text x="615" y="47.0" class="lbl out" text-anchor="middle">moduleinterface.Monitorings.Feedback_Open</text><line x1="34" y1="172" x2="50" y2="172" class="w"/><line x1="70" y1="146" x2="288" y2="146" class="w"/><line x1="306" y1="146" x2="523" y2="146" class="w"/><line x1="288" y1="130.0" x2="288" y2="162.0" class="bar"/><line x1="306" y1="130.0" x2="306" y2="162.0" class="bar"/><text x="296" y="124.0" class="lbl" text-anchor="middle">Door_Close_Feedback</text><line x1="50" y1="146" x2="70" y2="146" class="w"/><line x1="523" y1="146" x2="543" y2="146" class="w"/><line x1="70" y1="198" x2="138" y2="198" class="w"/><line x1="156" y1="198" x2="223" y2="198" class="w"/><line x1="138" y1="182.0" x2="138" y2="214.0" class="bar"/><line x1="156" y1="182.0" x2="156" y2="214.0" class="bar"/><text x="146" y="176.0" class="lbl" text-anchor="middle">Door_Close_Output</text><line x1="223" y1="198" x2="302" y2="198" class="w"/><line x1="320" y1="198" x2="399" y2="198" class="w"/><line x1="302" y1="182.0" x2="302" y2="214.0" class="bar nc"/><line x1="320" y1="182.0" x2="320" y2="214.0" class="bar nc"/><line x1="302" y1="214.0" x2="320" y2="182.0" class="slash"/><text x="311" y="176.0" class="lbl" text-anchor="middle">Door_Close_Feedback</text><line x1="399" y1="198" x2="452" y2="198" class="w"/><line x1="470" y1="198" x2="523" y2="198" class="w"/><line x1="452" y1="182.0" x2="452" y2="214.0" class="bar"/><line x1="470" y1="182.0" x2="470" y2="214.0" class="bar"/><text x="461" y="176.0" class="lbl" text-anchor="middle">Clock_0.625Hz</text><line x1="50" y1="198" x2="70" y2="198" class="w"/><line x1="523" y1="198" x2="543" y2="198" class="w"/><line x1="50" y1="146" x2="50" y2="198" class="w"/><line x1="543" y1="146" x2="543" y2="198" class="w"/><line x1="50" y1="172" x2="50" y2="172" class="w"/><line x1="543" y1="172" x2="589" y2="172" class="w"/><path d="M 600 172.0 A 15 15 0 0 1 615 157.0" class="coil"/><path d="M 600 172.0 A 15 15 0 0 0 615 187.0" class="coil"/><path d="M 630 172.0 A 15 15 0 0 0 615 157.0" class="coil"/><path d="M 630 172.0 A 15 15 0 0 1 615 187.0" class="coil"/><text x="615" y="151.0" class="lbl out" text-anchor="middle">moduleinterface.Monitorings.Feedback_Close</text><line x1="34" y1="68" x2="34" y2="172" class="w"/></svg></div>
+<h2>Network 2 — Door Commands <span class="cnt">출력 2</span></h2>
+<div class="net"><svg viewBox="0 0 942 188" width="942" height="188"><line x1="20" y1="6" x2="20" y2="182" class="rail"/><line x1="20" y1="94" x2="34" y2="94" class="w"/><line x1="918" y1="6" x2="918" y2="182" class="rail"/><line x1="34" y1="42" x2="50" y2="42" class="w"/><line x1="50" y1="42" x2="77" y2="42" class="w"/><line x1="95" y1="42" x2="122" y2="42" class="w"/><line x1="77" y1="26.0" x2="77" y2="58.0" class="bar"/><line x1="95" y1="26.0" x2="95" y2="58.0" class="bar"/><text x="86" y="20.0" class="lbl" text-anchor="middle">Enable</text><line x1="122" y1="42" x2="204" y2="42" class="w"/><line x1="222" y1="42" x2="305" y2="42" class="w"/><line x1="204" y1="26.0" x2="204" y2="58.0" class="bar"/><line x1="222" y1="26.0" x2="222" y2="58.0" class="bar"/><text x="214" y="20.0" class="lbl" text-anchor="middle">enableModuleInterface</text><line x1="305" y1="42" x2="417" y2="42" class="w"/><line x1="435" y1="42" x2="547" y2="42" class="w"/><line x1="417" y1="26.0" x2="417" y2="58.0" class="bar"/><line x1="435" y1="26.0" x2="435" y2="58.0" class="bar"/><text x="426" y="20.0" class="lbl" text-anchor="middle">moduleinterface.Commands.Open</text><line x1="547" y1="42" x2="787" y2="42" class="w"/><path d="M 798 42.0 A 15 15 0 0 1 813 27.0" class="coil"/><path d="M 798 42.0 A 15 15 0 0 0 813 57.0" class="coil"/><path d="M 828 42.0 A 15 15 0 0 0 813 27.0" class="coil"/><path d="M 828 42.0 A 15 15 0 0 1 813 57.0" class="coil"/><text x="813" y="21.0" class="lbl out" text-anchor="middle">Door_Open_Command</text><line x1="34" y1="120" x2="50" y2="120" class="w"/><line x1="70" y1="94" x2="97" y2="94" class="w"/><line x1="115" y1="94" x2="142" y2="94" class="w"/><line x1="97" y1="78.0" x2="97" y2="110.0" class="bar"/><line x1="115" y1="78.0" x2="115" y2="110.0" class="bar"/><text x="106" y="72.0" class="lbl" text-anchor="middle">Enable</text><line x1="142" y1="94" x2="224" y2="94" class="w"/><line x1="242" y1="94" x2="325" y2="94" class="w"/><line x1="224" y1="78.0" x2="224" y2="110.0" class="bar"/><line x1="242" y1="78.0" x2="242" y2="110.0" class="bar"/><text x="234" y="72.0" class="lbl" text-anchor="middle">enableModuleInterface</text><line x1="325" y1="94" x2="441" y2="94" class="w"/><line x1="459" y1="94" x2="575" y2="94" class="w"/><line x1="441" y1="78.0" x2="441" y2="110.0" class="bar"/><line x1="459" y1="78.0" x2="459" y2="110.0" class="bar"/><text x="450" y="72.0" class="lbl" text-anchor="middle">moduleinterface.Commands.Close</text><line x1="50" y1="94" x2="70" y2="94" class="w"/><line x1="575" y1="94" x2="595" y2="94" class="w"/><line x1="70" y1="146" x2="97" y2="146" class="w"/><line x1="115" y1="146" x2="142" y2="146" class="w"/><line x1="97" y1="130.0" x2="97" y2="162.0" class="bar"/><line x1="115" y1="130.0" x2="115" y2="162.0" class="bar"/><text x="106" y="124.0" class="lbl" text-anchor="middle">Enable</text><line x1="142" y1="146" x2="228" y2="146" class="w"/><line x1="246" y1="146" x2="332" y2="146" class="w"/><line x1="228" y1="130.0" x2="228" y2="162.0" class="bar nc"/><line x1="246" y1="130.0" x2="246" y2="162.0" class="bar nc"/><line x1="228" y1="162.0" x2="246" y2="130.0" class="slash"/><text x="237" y="124.0" class="lbl" text-anchor="middle">enableModuleInterface</text><line x1="332" y1="146" x2="575" y2="146" class="w"/><line x1="50" y1="146" x2="70" y2="146" class="w"/><line x1="575" y1="146" x2="595" y2="146" class="w"/><line x1="50" y1="94" x2="50" y2="146" class="w"/><line x1="595" y1="94" x2="595" y2="146" class="w"/><line x1="50" y1="120" x2="50" y2="120" class="w"/><line x1="595" y1="120" x2="659" y2="120" class="w"/><line x1="677" y1="120" x2="741" y2="120" class="w"/><line x1="659" y1="104.0" x2="659" y2="136.0" class="bar nc"/><line x1="677" y1="104.0" x2="677" y2="136.0" class="bar nc"/><line x1="659" y1="136.0" x2="677" y2="104.0" class="slash"/><text x="668" y="98.0" class="lbl" text-anchor="middle">Door_Open_Check</text><line x1="741" y1="120" x2="787" y2="120" class="w"/><path d="M 798 120.0 A 15 15 0 0 1 813 105.0" class="coil"/><path d="M 798 120.0 A 15 15 0 0 0 813 135.0" class="coil"/><path d="M 828 120.0 A 15 15 0 0 0 813 105.0" class="coil"/><path d="M 828 120.0 A 15 15 0 0 1 813 135.0" class="coil"/><text x="813" y="99.0" class="lbl out" text-anchor="middle">Door_Close_Command</text><line x1="34" y1="42" x2="34" y2="120" class="w"/></svg></div>
+<h2>Network 3 — Door Output <span class="cnt">출력 4</span></h2>
+<div class="net"><svg viewBox="0 0 480 240" width="480" height="240"><line x1="20" y1="6" x2="20" y2="234" class="rail"/><line x1="20" y1="120" x2="34" y2="120" class="w"/><line x1="456" y1="6" x2="456" y2="234" class="rail"/><line x1="34" y1="120" x2="61" y2="120" class="w"/><line x1="79" y1="120" x2="106" y2="120" class="w"/><line x1="61" y1="104.0" x2="61" y2="136.0" class="bar"/><line x1="79" y1="104.0" x2="79" y2="136.0" class="bar"/><text x="70" y="98.0" class="lbl" text-anchor="middle">Enable</text><line x1="106" y1="68" x2="122" y2="68" class="w"/><line x1="122" y1="68" x2="190" y2="68" class="w"/><line x1="208" y1="68" x2="275" y2="68" class="w"/><line x1="190" y1="52.0" x2="190" y2="84.0" class="bar"/><line x1="208" y1="52.0" x2="208" y2="84.0" class="bar"/><text x="198" y="46.0" class="lbl" text-anchor="middle">Door_Open_Command</text><line x1="275" y1="42" x2="291" y2="42" class="w"/><line x1="291" y1="42" x2="329" y2="42" class="w"/><path d="M 340 42.0 A 15 15 0 0 1 355 27.0" class="coil"/><path d="M 340 42.0 A 15 15 0 0 0 355 57.0" class="coil"/><path d="M 370 42.0 A 15 15 0 0 0 355 27.0" class="coil"/><path d="M 370 42.0 A 15 15 0 0 1 355 57.0" class="coil"/><text x="355" y="47.0" class="coilsym" text-anchor="middle">R</text><text x="355" y="21.0" class="lbl out" text-anchor="middle">Door_Close_Output</text><line x1="275" y1="94" x2="291" y2="94" class="w"/><line x1="291" y1="94" x2="329" y2="94" class="w"/><path d="M 340 94.0 A 15 15 0 0 1 355 79.0" class="coil"/><path d="M 340 94.0 A 15 15 0 0 0 355 109.0" class="coil"/><path d="M 370 94.0 A 15 15 0 0 0 355 79.0" class="coil"/><path d="M 370 94.0 A 15 15 0 0 1 355 109.0" class="coil"/><text x="355" y="99.0" class="coilsym" text-anchor="middle">S</text><text x="355" y="73.0" class="lbl out" text-anchor="middle">Door_Open_Output</text><line x1="275" y1="42" x2="275" y2="94" class="w"/><line x1="106" y1="172" x2="122" y2="172" class="w"/><line x1="122" y1="172" x2="194" y2="172" class="w"/><line x1="212" y1="172" x2="283" y2="172" class="w"/><line x1="194" y1="156.0" x2="194" y2="188.0" class="bar"/><line x1="212" y1="156.0" x2="212" y2="188.0" class="bar"/><text x="202" y="150.0" class="lbl" text-anchor="middle">Door_Close_Command</text><line x1="283" y1="146" x2="299" y2="146" class="w"/><line x1="299" y1="146" x2="329" y2="146" class="w"/><path d="M 340 146.0 A 15 15 0 0 1 355 131.0" class="coil"/><path d="M 340 146.0 A 15 15 0 0 0 355 161.0" class="coil"/><path d="M 370 146.0 A 15 15 0 0 0 355 131.0" class="coil"/><path d="M 370 146.0 A 15 15 0 0 1 355 161.0" class="coil"/><text x="355" y="151.0" class="coilsym" text-anchor="middle">R</text><text x="355" y="125.0" class="lbl out" text-anchor="middle">Door_Open_Output</text><line x1="283" y1="198" x2="299" y2="198" class="w"/><line x1="299" y1="198" x2="329" y2="198" class="w"/><path d="M 340 198.0 A 15 15 0 0 1 355 183.0" class="coil"/><path d="M 340 198.0 A 15 15 0 0 0 355 213.0" class="coil"/><path d="M 370 198.0 A 15 15 0 0 0 355 183.0" class="coil"/><path d="M 370 198.0 A 15 15 0 0 1 355 213.0" class="coil"/><text x="355" y="203.0" class="coilsym" text-anchor="middle">S</text><text x="355" y="177.0" class="lbl out" text-anchor="middle">Door_Close_Output</text><line x1="283" y1="146" x2="283" y2="198" class="w"/><line x1="106" y1="68" x2="106" y2="172" class="w"/></svg></div>
+<h2>Network 4 — (제목 없음) <span class="cnt">출력 10</span></h2>
+<div class="net"><svg viewBox="0 0 1298 552" width="1298" height="552"><line x1="20" y1="6" x2="20" y2="546" class="rail"/><line x1="20" y1="276" x2="34" y2="276" class="w"/><line x1="1274" y1="6" x2="1274" y2="546" class="rail"/><line x1="34" y1="250" x2="50" y2="250" class="w"/><line x1="50" y1="250" x2="114" y2="250" class="w"/><line x1="132" y1="250" x2="196" y2="250" class="w"/><line x1="114" y1="234.0" x2="114" y2="266.0" class="bar"/><line x1="132" y1="234.0" x2="132" y2="266.0" class="bar"/><text x="123" y="228.0" class="lbl" text-anchor="middle">Door_Open_Output</text><line x1="196" y1="68" x2="212" y2="68" class="w"/><line x1="212" y1="68" x2="339" y2="68" class="w"/><line x1="357" y1="68" x2="484" y2="68" class="w"/><line x1="339" y1="52.0" x2="339" y2="84.0" class="bar"/><line x1="357" y1="52.0" x2="357" y2="84.0" class="bar"/><text x="348" y="46.0" class="lbl" text-anchor="middle">moduleinterface.Monitorings.Error</text><line x1="484" y1="68" x2="556" y2="68" class="w"/><line x1="574" y1="68" x2="645" y2="68" class="w"/><line x1="556" y1="52.0" x2="556" y2="84.0" class="bar nc"/><line x1="574" y1="52.0" x2="574" y2="84.0" class="bar nc"/><line x1="556" y1="84.0" x2="574" y2="52.0" class="slash"/><text x="564" y="46.0" class="lbl" text-anchor="middle">Door_Close_Output</text><line x1="645" y1="68" x2="716" y2="68" class="w"/><line x1="734" y1="68" x2="806" y2="68" class="w"/><line x1="716" y1="52.0" x2="716" y2="84.0" class="bar nc"/><line x1="734" y1="52.0" x2="734" y2="84.0" class="bar nc"/><line x1="716" y1="84.0" x2="734" y2="52.0" class="slash"/><text x="726" y="46.0" class="lbl" text-anchor="middle">Door_Open_Feeback</text><line x1="806" y1="42" x2="822" y2="42" class="w"/><line x1="822" y1="42" x2="904" y2="42" class="w"/><line x1="922" y1="42" x2="1005" y2="42" class="w"/><line x1="904" y1="26.0" x2="904" y2="58.0" class="bar"/><line x1="922" y1="26.0" x2="922" y2="58.0" class="bar"/><text x="914" y="20.0" class="lbl" text-anchor="middle">Door_Open_Error_TMR.Q</text><line x1="1005" y1="42" x2="1088" y2="42" class="w"/><path d="M 1099 42.0 A 15 15 0 0 1 1114 27.0" class="coil"/><path d="M 1099 42.0 A 15 15 0 0 0 1114 57.0" class="coil"/><path d="M 1129 42.0 A 15 15 0 0 0 1114 27.0" class="coil"/><path d="M 1129 42.0 A 15 15 0 0 1 1114 57.0" class="coil"/><text x="1114" y="47.0" class="coilsym" text-anchor="middle">S</text><text x="1114" y="21.0" class="lbl out" text-anchor="middle">Door_Open_Error</text><line x1="806" y1="94" x2="822" y2="94" class="w"/><line x1="822" y1="94" x2="1088" y2="94" class="w"/><rect x="1088" y="72" width="150" height="44" rx="5" class="box"/><text x="1163" y="88" class="boxt" text-anchor="middle">TON   t#3s</text><text x="1163" y="103" class="boxs" text-anchor="middle">Door_Open_Error_TMR</text><text x="1163" y="114" class="boxs2" text-anchor="middle">PT=t#3s</text><line x1="806" y1="42" x2="806" y2="94" class="w"/><line x1="196" y1="172" x2="212" y2="172" class="w"/><line x1="212" y1="172" x2="280" y2="172" class="w"/><line x1="298" y1="172" x2="365" y2="172" class="w"/><line x1="280" y1="156.0" x2="280" y2="188.0" class="bar"/><line x1="298" y1="156.0" x2="298" y2="188.0" class="bar"/><text x="288" y="150.0" class="lbl" text-anchor="middle">Door_Close_Output</text><line x1="365" y1="172" x2="444" y2="172" class="w"/><line x1="462" y1="172" x2="541" y2="172" class="w"/><line x1="444" y1="156.0" x2="444" y2="188.0" class="bar nc"/><line x1="462" y1="156.0" x2="462" y2="188.0" class="bar nc"/><line x1="444" y1="188.0" x2="462" y2="156.0" class="slash"/><text x="453" y="150.0" class="lbl" text-anchor="middle">Door_Close_Feedback</text><line x1="541" y1="172" x2="672" y2="172" class="w"/><line x1="690" y1="172" x2="820" y2="172" class="w"/><line x1="672" y1="156.0" x2="672" y2="188.0" class="bar nc"/><line x1="690" y1="156.0" x2="690" y2="188.0" class="bar nc"/><line x1="672" y1="188.0" x2="690" y2="156.0" class="slash"/><text x="680" y="150.0" class="lbl" text-anchor="middle">moduleinterface.Monitorings.Error</text><line x1="820" y1="146" x2="836" y2="146" class="w"/><line x1="836" y1="146" x2="922" y2="146" class="w"/><line x1="940" y1="146" x2="1026" y2="146" class="w"/><line x1="922" y1="130.0" x2="922" y2="162.0" class="bar"/><line x1="940" y1="130.0" x2="940" y2="162.0" class="bar"/><text x="931" y="124.0" class="lbl" text-anchor="middle">Door_Close_Error_TMR.Q</text><line x1="1026" y1="146" x2="1088" y2="146" class="w"/><path d="M 1099 146.0 A 15 15 0 0 1 1114 131.0" class="coil"/><path d="M 1099 146.0 A 15 15 0 0 0 1114 161.0" class="coil"/><path d="M 1129 146.0 A 15 15 0 0 0 1114 131.0" class="coil"/><path d="M 1129 146.0 A 15 15 0 0 1 1114 161.0" class="coil"/><text x="1114" y="151.0" class="coilsym" text-anchor="middle">S</text><text x="1114" y="125.0" class="lbl out" text-anchor="middle">Door_Close_Error</text><line x1="820" y1="198" x2="836" y2="198" class="w"/><line x1="836" y1="198" x2="1088" y2="198" class="w"/><rect x="1088" y="176" width="150" height="44" rx="5" class="box"/><text x="1163" y="192" class="boxt" text-anchor="middle">TON   t#3s</text><text x="1163" y="207" class="boxs" text-anchor="middle">Door_Close_Error_TMR</text><text x="1163" y="218" class="boxs2" text-anchor="middle">PT=t#3s</text><line x1="820" y1="146" x2="820" y2="198" class="w"/><line x1="196" y1="276" x2="212" y2="276" class="w"/><line x1="212" y1="276" x2="284" y2="276" class="w"/><line x1="302" y1="276" x2="373" y2="276" class="w"/><line x1="284" y1="260.0" x2="284" y2="292.0" class="bar nc"/><line x1="302" y1="260.0" x2="302" y2="292.0" class="bar nc"/><line x1="284" y1="292.0" x2="302" y2="260.0" class="slash"/><text x="292" y="254.0" class="lbl" text-anchor="middle">Door_Open_Feeback</text><line x1="373" y1="276" x2="452" y2="276" class="w"/><line x1="470" y1="276" x2="549" y2="276" class="w"/><line x1="452" y1="260.0" x2="452" y2="292.0" class="bar nc"/><line x1="470" y1="260.0" x2="470" y2="292.0" class="bar nc"/><line x1="452" y1="292.0" x2="470" y2="260.0" class="slash"/><text x="461" y="254.0" class="lbl" text-anchor="middle">Door_Close_Feedback</text><line x1="549" y1="276" x2="680" y2="276" class="w"/><line x1="698" y1="276" x2="828" y2="276" class="w"/><line x1="680" y1="260.0" x2="680" y2="292.0" class="bar nc"/><line x1="698" y1="260.0" x2="698" y2="292.0" class="bar nc"/><line x1="680" y1="292.0" x2="698" y2="260.0" class="slash"/><text x="688" y="254.0" class="lbl" text-anchor="middle">moduleinterface.Monitorings.Error</text><line x1="828" y1="250" x2="844" y2="250" class="w"/><line x1="844" y1="250" x2="934" y2="250" class="w"/><line x1="952" y1="250" x2="1042" y2="250" class="w"/><line x1="934" y1="234.0" x2="934" y2="266.0" class="bar"/><line x1="952" y1="234.0" x2="952" y2="266.0" class="bar"/><text x="943" y="228.0" class="lbl" text-anchor="middle">Door_Sensor_Error_TMR.Q</text><line x1="1042" y1="250" x2="1088" y2="250" class="w"/><path d="M 1099 250.0 A 15 15 0 0 1 1114 235.0" class="coil"/><path d="M 1099 250.0 A 15 15 0 0 0 1114 265.0" class="coil"/><path d="M 1129 250.0 A 15 15 0 0 0 1114 235.0" class="coil"/><path d="M 1129 250.0 A 15 15 0 0 1 1114 265.0" class="coil"/><text x="1114" y="255.0" class="coilsym" text-anchor="middle">S</text><text x="1114" y="229.0" class="lbl out" text-anchor="middle">Door_Sensor_Error</text><line x1="828" y1="302" x2="844" y2="302" class="w"/><line x1="844" y1="302" x2="1088" y2="302" class="w"/><rect x="1088" y="280" width="150" height="44" rx="5" class="box"/><text x="1163" y="296" class="boxt" text-anchor="middle">TON   t#3s</text><text x="1163" y="311" class="boxs" text-anchor="middle">Door_Sensor_Error_TMR</text><text x="1163" y="322" class="boxs2" text-anchor="middle">PT=t#3s</text><line x1="828" y1="250" x2="828" y2="302" class="w"/><line x1="196" y1="406" x2="212" y2="406" class="w"/><line x1="212" y1="406" x2="294" y2="406" class="w"/><line x1="312" y1="406" x2="395" y2="406" class="w"/><line x1="294" y1="390.0" x2="294" y2="422.0" class="bar"/><line x1="312" y1="390.0" x2="312" y2="422.0" class="bar"/><text x="304" y="384.0" class="lbl" text-anchor="middle">enableModuleInterface</text><line x1="395" y1="406" x2="440" y2="406" class="w"/><line x1="458" y1="406" x2="504" y2="406" class="w"/><line x1="440" y1="390.0" x2="440" y2="422.0" class="bar"/><line x1="458" y1="390.0" x2="458" y2="422.0" class="bar"/><text x="450" y="384.0" class="lbl" text-anchor="middle">acknowledge</text><line x1="504" y1="354" x2="520" y2="354" class="w"/><line x1="520" y1="354" x2="1088" y2="354" class="w"/><path d="M 1099 354.0 A 15 15 0 0 1 1114 339.0" class="coil"/><path d="M 1099 354.0 A 15 15 0 0 0 1114 369.0" class="coil"/><path d="M 1129 354.0 A 15 15 0 0 0 1114 339.0" class="coil"/><path d="M 1129 354.0 A 15 15 0 0 1 1114 369.0" class="coil"/><text x="1114" y="359.0" class="coilsym" text-anchor="middle">R</text><text x="1114" y="333.0" class="lbl out" text-anchor="middle">Door_Open_Error</text><line x1="504" y1="406" x2="520" y2="406" class="w"/><line x1="520" y1="406" x2="1088" y2="406" class="w"/><path d="M 1099 406.0 A 15 15 0 0 1 1114 391.0" class="coil"/><path d="M 1099 406.0 A 15 15 0 0 0 1114 421.0" class="coil"/><path d="M 1129 406.0 A 15 15 0 0 0 1114 391.0" class="coil"/><path d="M 1129 406.0 A 15 15 0 0 1 1114 421.0" class="coil"/><text x="1114" y="411.0" class="coilsym" text-anchor="middle">R</text><text x="1114" y="385.0" class="lbl out" text-anchor="middle">Door_Close_Error</text><line x1="504" y1="458" x2="520" y2="458" class="w"/><line x1="520" y1="458" x2="1088" y2="458" class="w"/><path d="M 1099 458.0 A 15 15 0 0 1 1114 443.0" class="coil"/><path d="M 1099 458.0 A 15 15 0 0 0 1114 473.0" class="coil"/><path d="M 1129 458.0 A 15 15 0 0 0 1114 443.0" class="coil"/><path d="M 1129 458.0 A 15 15 0 0 1 1114 473.0" class="coil"/><text x="1114" y="463.0" class="coilsym" text-anchor="middle">R</text><text x="1114" y="437.0" class="lbl out" text-anchor="middle">Door_Sensor_Error</text><line x1="504" y1="354" x2="504" y2="458" class="w"/><line x1="196" y1="68" x2="196" y2="406" class="w"/><line x1="34" y1="510" x2="50" y2="510" class="w"/><line x1="50" y1="510" x2="114" y2="510" class="w"/><line x1="132" y1="510" x2="196" y2="510" class="w"/><line x1="114" y1="494.0" x2="114" y2="526.0" class="bar nc"/><line x1="132" y1="494.0" x2="132" y2="526.0" class="bar nc"/><line x1="114" y1="526.0" x2="132" y2="494.0" class="slash"/><text x="123" y="488.0" class="lbl" text-anchor="middle">Door_Open_Error</text><line x1="196" y1="510" x2="264" y2="510" class="w"/><line x1="282" y1="510" x2="349" y2="510" class="w"/><line x1="264" y1="494.0" x2="264" y2="526.0" class="bar nc"/><line x1="282" y1="494.0" x2="282" y2="526.0" class="bar nc"/><line x1="264" y1="526.0" x2="282" y2="494.0" class="slash"/><text x="272" y="488.0" class="lbl" text-anchor="middle">Door_Close_Error</text><line x1="349" y1="510" x2="420" y2="510" class="w"/><line x1="438" y1="510" x2="510" y2="510" class="w"/><line x1="420" y1="494.0" x2="420" y2="526.0" class="bar nc"/><line x1="438" y1="494.0" x2="438" y2="526.0" class="bar nc"/><line x1="420" y1="526.0" x2="438" y2="494.0" class="slash"/><text x="430" y="488.0" class="lbl" text-anchor="middle">Door_Sensor_Error</text><line x1="510" y1="510" x2="518" y2="510" class="w"/><rect x="518" y="497" width="30" height="26" rx="4" class="notbox"/><text x="533" y="514" class="nott" text-anchor="middle">NOT</text><line x1="548" y1="510" x2="562" y2="510" class="w"/><line x1="562" y1="510" x2="1088" y2="510" class="w"/><path d="M 1099 510.0 A 15 15 0 0 1 1114 495.0" class="coil"/><path d="M 1099 510.0 A 15 15 0 0 0 1114 525.0" class="coil"/><path d="M 1129 510.0 A 15 15 0 0 0 1114 495.0" class="coil"/><path d="M 1129 510.0 A 15 15 0 0 1 1114 525.0" class="coil"/><text x="1114" y="489.0" class="lbl out" text-anchor="middle">moduleinterface.Monitorings.Error</text><line x1="34" y1="250" x2="34" y2="510" class="w"/></svg></div>`;
+
+// 1회 실행 — DAT_Door 래더를 시트에 적재. Apps Script editor에서 직접 호출.
+function ingestDatDoorLadder() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const result = ingestPlcLadder_(ss, "DAT_Door (FB200)", DAT_DOOR_LADDER_BODY);
+  Logger.log("[ingestDatDoorLadder] 완료: " + JSON.stringify(result));
+  testPlcLadder();
+  return result;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * v30 추가분 — 회로 역추적 확장 (신호 역추적 코어 + 알람 진입)
+ *   ※ 파일 ID 기입 완료본 (2026-06-08) — 즉시 적재 가능
+ *
+ * ▣ 적용 방법 (Factory Agent KB 프로젝트)
+ *   1) 아래 전체를 v29 .gs 파일 끝에 붙여넣기 (기존 함수 수정 없음, 순수 추가)
+ *   2) doPost 라우터에 아래 2줄 추가 (기존 plc_search 줄 바로 아래):
+ *        if (data.path === "plc_signal_trace") return handlePlcSignalTrace(data); // v30
+ *        if (data.path === "plc_alarm")        return handlePlcAlarmSearch(data); // v30
+ *   3) 데이터 적재 (1회, Apps Script 에디터에서 직접 실행 — 배포 불필요):
+ *        ingestPlcBlockIndex() → ingestPlcSignalIndex() → ingestPlcAlarmBridge()
+ *        → ingestPlcAllLadders(0) … ingestPlcAllLadders(8)  (샤드별 1회씩)
+ *   4) 신호/알람 조회 endpoint는 즉시 동작 (조회는 배포 영향 없음).
+ *      ※ doPost 라우터 2줄은 코드 변경이므로 반드시 배포 시퀀스 필요:
+ *        저장 → 배포 → 배포 관리 → 편집(연필) → 새 버전 → 배포
+ *
+ * ▣ 새 시트 (plcGetOrCreateSheet_ 가 자동 생성)
+ *   PLC_Signal_Index : signal | block_key | network_id | network_title | mode | condition_str
+ *   PLC_Alarm_Bridge : member | source_signal | call_name | block_key
+ *
+ * ▣ 인증: 기존 PLC_QUERY_TOKEN (다른 PLC 핸들러와 동일)
+ * ▣ 원칙: KB 확정 사실만. 매칭 약하면 후보를 낮은 score로 표시하되 추정 단정 없음.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+const PLC_SIGIDX_SHEET = 'PLC_Signal_Index';
+const PLC_ALARM_SHEET  = 'PLC_Alarm_Bridge';
+
+// 스테이징 파일 ID (2026-06-08 기입 완료 — Drive 04_PLC_회로역추적/source)
+const SIGIDX_FILE_ID  = '1tRY1ZRHLFqOMhWD6OBLDE8vY84mBjYL3';   // signal_index_v3.json
+const ALARM_FILE_ID   = '1h9FJTKISf-LygU4J3NUed9qvsuIsqrFs';   // alarm_bridge.json
+const LADDER_FILE_IDS = [                                       // ladders_1..9.json (샤딩, 순서 중요)
+  '1WPNQ6EVIMBP6Yk_S2QezHlvClviAiu1b',  // ladders_1.json
+  '148IoeCqI7IP_VS9gjn1-4P3VKfOtTjog',  // ladders_2.json
+  '1fO36oHzGIikclXLyv9FReIDhXqCti2Ni',  // ladders_3.json
+  '1iHOCiV9ChtRf5hNNesfscQJyN0tj5viE',  // ladders_4.json
+  '1purTsjXnouj9Na0cGkCHO0w3nZLiWXsx',  // ladders_5.json
+  '17a9eMf-EIAu8tGDu42rLka_s4X_-tUCa',  // ladders_6.json
+  '1lby1f4sg740OCa10NQlvB627AYLL7LiG',  // ladders_7.json
+  '1hzvAMhEqzTo4Qavm0bgDoAE8ZpacQ5fa',  // ladders_8.json
+  '13YJd2I1c88OmPIdGAYNTJcidvhQlw4yI',  // ladders_9.json
+];
+
+/* ── 신호 역추적: 신호명 → 설정 룽 + 래더 + 입력신호(재귀 후보) ───────────────── */
+function handlePlcSignalTrace(data) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const expectedToken = props.getProperty("PLC_QUERY_TOKEN");
+    if (!expectedToken) return makeResponse({ status: "error", message: "PLC_QUERY_TOKEN not configured" });
+    if (data.token !== expectedToken) return makeResponse({ status: "error", message: "unauthorized" });
+
+    const d = data.data || {};
+    const signal = String(d.signal || "").trim();
+    if (!signal) return makeResponse({ status: "error", message: "signal required" });
+    const wantLadder = d.with_ladder !== false; // 기본 true
+
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const sh = ss.getSheetByName(PLC_SIGIDX_SHEET);
+    if (!sh || sh.getLastRow() < 2) return makeResponse({ status: "not_found", signal: signal, locations: [] });
+
+    // signal | block_key | network_id | network_title | mode | condition_str
+    const rows = sh.getRange(2, 1, sh.getLastRow() - 1, 6).getValues();
+    const sigLow = signal.toLowerCase();
+    const exact = [], partial = [];
+    for (var r = 0; r < rows.length; r++) {
+      const s = String(rows[r][0]);
+      if (s === signal) exact.push(rows[r]);
+      else if (s.toLowerCase().indexOf(sigLow) >= 0 || sigLow.indexOf(s.toLowerCase()) >= 0) partial.push(rows[r]);
+    }
+    const hit = exact.length ? exact : partial.slice(0, 12);
+    if (!hit.length) return makeResponse({ status: "not_found", signal: signal, locations: [] });
+
+    const locations = [];
+    const ladderCache = {};
+    for (var i = 0; i < hit.length; i++) {
+      const row = hit[i];
+      const blockKey = String(row[1]);
+      const loc = {
+        block_key: blockKey,
+        network_id: row[2],
+        network_title: row[3],
+        mode: row[4],
+        condition_str: String(row[5] || ""),
+        input_signals: extractSignalTokens_(String(row[5] || "")),
+      };
+      if (wantLadder && !(blockKey in ladderCache)) {
+        ladderCache[blockKey] = getPlcLadder_(ss, blockKey) || "";
+      }
+      locations.push(loc);
+    }
+    return makeResponse({
+      status: "ok",
+      signal: signal,
+      match: exact.length ? "exact" : "partial",
+      locations: locations,
+      ladders: wantLadder ? ladderCache : undefined,
+    });
+  } catch (err) {
+    return makeResponse({ status: "error", message: err.message });
+  }
+}
+
+/* ── 알람 진입: 알람텍스트 → 알람멤버 매칭 → 원인신호 (→ 신호 역추적 연계) ──────── */
+function handlePlcAlarmSearch(data) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const expectedToken = props.getProperty("PLC_QUERY_TOKEN");
+    if (!expectedToken) return makeResponse({ status: "error", message: "PLC_QUERY_TOKEN not configured" });
+    if (data.token !== expectedToken) return makeResponse({ status: "error", message: "unauthorized" });
+
+    const d = data.data || {};
+    const query = String(d.query || "").trim();
+    if (!query) return makeResponse({ status: "ok", candidates: [] });
+
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const sh = ss.getSheetByName(PLC_ALARM_SHEET);
+    if (!sh || sh.getLastRow() < 2) return makeResponse({ status: "ok", candidates: [] });
+
+    const qtok = alarmNormTokens_(query);
+    const qset = {}; qtok.forEach(function (t) { qset[t] = 1; });
+    const qIds = (query.match(/\b\d{4,5}\b/g) || []);
+
+    const rows = sh.getRange(2, 1, sh.getLastRow() - 1, 6).getValues();
+    const cands = [];
+    for (var r = 0; r < rows.length; r++) {
+      const member = String(rows[r][0]);
+      const alarmIds = String(rows[r][4] || "").split(",")
+                          .map(function (s) { return s.trim(); }).filter(Boolean);
+      const alarmTexts = String(rows[r][5] || "").split(" | ")
+                          .map(function (s) { return s.trim(); }).filter(Boolean);
+
+      var best = 0, via = "member", matchedId = "", matchedText = "";
+
+      if (qIds.length) {
+        for (var qi = 0; qi < qIds.length; qi++) {
+          if (alarmIds.indexOf(qIds[qi]) >= 0) { best = 1.0; via = "id"; matchedId = qIds[qi]; break; }
+        }
+      }
+      if (via !== "id" && qtok.length) {
+        const ls = jaccardScore_(qset, qtok, alarmNormTokens_(member.split(".").pop()));
+        if (ls > best) { best = ls; via = "member"; }
+      }
+      if (via !== "id" && qtok.length) {
+        for (var ti = 0; ti < alarmTexts.length; ti++) {
+          const ts = jaccardScore_(qset, qtok, alarmNormTokens_(alarmTexts[ti]));
+          if (ts > best) { best = ts; via = "text"; matchedText = alarmTexts[ti]; }
+        }
+      }
+
+      if (via === "id" || best >= 0.5) {
+        cands.push({
+          alarm_member: member,
+          source_signal: String(rows[r][1] || ""),
+          via_call: String(rows[r][2] || ""),
+          alarm_block: String(rows[r][3] || ""),
+          match_score: Math.round(best * 100) / 100,
+          match_via: via,
+          matched_alarm_id: matchedId,
+          matched_alarm_text: matchedText,
         });
-        const uniqueFiles = fileNameSet.size;
-        const costEst = (weakItems.length * 0.003).toFixed(3); // 대략 항목당 $0.003
+      }
+    }
+    cands.sort(function (a, b) { return b.match_score - a.match_score; });
+    return makeResponse({
+      status: "ok",
+      query: query,
+      candidates: cands.slice(0, 8),
+      total_matched: cands.length,
+      note: cands.length ? "" : "매칭되는 알람 없음 — 신호명으로 직접 역추적(plc_signal_trace)을 사용하세요.",
+    });
+  } catch (err) {
+    return makeResponse({ status: "error", message: err.message });
+  }
+}
 
-        return (
-          <div style={{
-            position:"fixed", top:0, left:0, right:0, bottom:0,
-            background:"rgba(0,0,0,0.7)", backdropFilter:"blur(4px)",
-            display:"flex", alignItems:"center", justifyContent:"center",
-            zIndex:1000, padding:"16px",
-          }}>
-            <div style={{
-              background:"#0f172a", border:`1.5px solid ${roleInfo.color}40`,
-              borderRadius:14, padding:"20px", maxWidth:540, width:"100%",
-              maxHeight:"90vh", overflowY:"auto",
-            }}>
-              {!relearning && !relearnResult && (
-                <>
-                  <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:6 }}>
-                    🔄 빈약 학습 데이터 재학습
-                  </div>
-                  <div style={{ fontSize:12, color:"#94a3b8", marginBottom:14, lineHeight:1.6 }}>
-                    빈약하게 학습된 항목을 Drive 폴더의 원본 파일로 다시 분석합니다.
-                    새 v10 프롬프트 (글자수 제한 없음 + 3블록 형식) + 청크 분할 자동 적용.
-                  </div>
+/* ── 헬퍼: condition_str 에서 입력신호 토큰 추출 (재귀 역추적 후보) ─────────────── */
+function extractSignalTokens_(cond) {
+  if (!cond) return [];
+  // 연산자/키워드/숫자상수 제거 후 신호 식별자만
+  const KW = { "AND": 1, "OR": 1, "NOT": 1, "XOR": 1, "TRUE": 1 };
+  // 괄호/공백으로 분리하되 점(.)·언더스코어·괄호없는 식별자 보존
+  const raw = cond.replace(/[()]/g, " ").split(/\s+/);
+  const seen = {}, out = [];
+  for (var i = 0; i < raw.length; i++) {
+    var t = raw[i].trim();
+    if (!t || KW[t] || t.charAt(0) === "#") continue;
+    if (/^[=≠><≥≤]$/.test(t)) continue;
+    // 비교/타이머 표기 정리
+    t = t.replace(/^NOT/, "").replace(/^\.+|\.+$/g, "");
+    if (t.length < 2 || KW[t]) continue;
+    if (!seen[t]) { seen[t] = 1; out.push(t); }
+  }
+  return out.slice(0, 30);
+}
 
-                  <div style={{
-                    background:"rgba(15,23,42,0.6)", borderRadius:8,
-                    padding:"12px 14px", marginBottom:14,
-                  }}>
-                    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
-                      <span style={{ fontSize:11, color:"#64748b" }}>대상 항목</span>
-                      <span style={{ fontSize:12, color:"#cbd5e1", fontWeight:700 }}>{weakItems.length}건</span>
-                    </div>
-                    <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
-                      <span style={{ fontSize:11, color:"#64748b" }}>고유 파일 수</span>
-                      <span style={{ fontSize:12, color:"#cbd5e1", fontWeight:700 }}>{uniqueFiles}개</span>
-                    </div>
-                    <div style={{ display:"flex", justifyContent:"space-between" }}>
-                      <span style={{ fontSize:11, color:"#64748b" }}>예상 비용</span>
-                      <span style={{ fontSize:12, color:"#a5b4fc", fontWeight:700 }}>약 ${costEst}</span>
-                    </div>
-                  </div>
+/* ── 헬퍼: 알람 텍스트 정규화 토큰 (한/영, (+)(-) prefix, 비트번호, 주소 suffix 제거) ── */
+function alarmNormTokens_(s) {
+  s = String(s).toLowerCase();
+  s = s.replace(/^\s*\([-+]\)\s*/, "");
+  s = s.replace(/^\d+\s+/, "");
+  s = s.replace(/_\(.*?\)$/, "");
+  s = s.replace(/[^a-z0-9 ]/g, " ");
+  return s.split(/\s+/).filter(function (t) { return t.length >= 2; });
+}
 
-                  <div style={{
-                    fontSize:10.5, color:"#fbbf24",
-                    background:"rgba(245,158,11,0.08)",
-                    border:"1px solid rgba(245,158,11,0.2)",
-                    borderRadius:6, padding:"8px 10px", marginBottom:14, lineHeight:1.6,
-                  }}>
-                    ⚠️ Drive 학습자료 폴더에 원본 파일이 있어야 합니다.
-                    파일이 없는 항목은 자동 스킵되고 결과에 보고됩니다.
-                    기존 빈약 항목은 새 학습 성공 시 자동 삭제됩니다.
-                  </div>
+/* ── 적재: signal_index_v3.json → PLC_Signal_Index ──────────────────────────────
+ *   JSON 형식: { "<signal>": [ {block, block_key, network_id, network_title, mode, condition_str}, ... ], ... }
+ *   대용량(수천 행) — setValues 배치로 1회 기록. */
+function ingestPlcSignalIndex() {
+  if (!SIGIDX_FILE_ID) { Logger.log("SIGIDX_FILE_ID 미설정"); return; }
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = plcGetOrCreateSheet_(ss, PLC_SIGIDX_SHEET,
+    ["signal", "block_key", "network_id", "network_title", "mode", "condition_str"]);
+  if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, 6).clearContent();
+  const json = JSON.parse(DriveApp.getFileById(SIGIDX_FILE_ID).getBlob().getDataAsString());
+  const out = [];
+  Object.keys(json).forEach(function (sig) {
+    json[sig].forEach(function (loc) {
+      out.push([sig, loc.block_key || loc.block || "", loc.network_id || "",
+                loc.network_title || "", loc.mode || "", String(loc.condition_str || "").slice(0, 5000)]);
+    });
+  });
+  // 배치 기록 (5000행 단위)
+  for (var i = 0; i < out.length; i += 5000) {
+    const batch = out.slice(i, i + 5000);
+    sh.getRange(2 + i, 1, batch.length, 6).setValues(batch);
+  }
+  Logger.log("[ingestPlcSignalIndex] " + out.length + "행 적재");
+}
 
-                  <div style={{ display:"flex", gap:8 }}>
-                    <button
-                      onClick={() => setShowRelearnDialog(false)}
-                      style={{
-                        flex:1, padding:"10px",
-                        background:"rgba(51,65,85,0.4)",
-                        border:"1px solid rgba(51,65,85,0.5)",
-                        borderRadius:6, color:"#94a3b8",
-                        fontSize:12, fontWeight:600, cursor:"pointer",
-                      }}
-                    >취소</button>
-                    <button
-                      onClick={() => startRelearn(weakItems)}
-                      style={{
-                        flex:2, padding:"10px",
-                        background:"rgba(99,102,241,0.2)",
-                        border:"1px solid rgba(99,102,241,0.5)",
-                        borderRadius:6, color:"#a5b4fc",
-                        fontSize:12, fontWeight:700, cursor:"pointer",
-                      }}
-                    >📥 재학습 시작</button>
-                  </div>
-                </>
-              )}
+/* ── 적재: alarm_bridge.json → PLC_Alarm_Bridge ─────────────────────────────────
+ *   JSON 형식: { "<member>": {source, call, block}, ... } */
+function ingestPlcAlarmBridge() {
+  if (!ALARM_FILE_ID) { Logger.log("ALARM_FILE_ID 미설정"); return; }
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const HEADER = ["member", "source_signal", "call_name", "block_key", "alarm_ids", "alarm_texts"];
+  const sh = plcGetOrCreateSheet_(ss, PLC_ALARM_SHEET, HEADER);
+  sh.getRange(1, 1, 1, HEADER.length).setValues([HEADER]);
+  if (sh.getLastRow() > 1) {
+    const wipeCols = Math.max(sh.getLastColumn(), HEADER.length);
+    sh.getRange(2, 1, sh.getLastRow() - 1, wipeCols).clearContent();
+  }
+  const json = JSON.parse(DriveApp.getFileById(ALARM_FILE_ID).getBlob().getDataAsString());
+  const out = [];
+  Object.keys(json).forEach(function (m) {
+    const v = json[m] || {};
+    const alarms = Array.isArray(v.alarms) ? v.alarms : [];
+    const ids = alarms.map(function (a) { return a && a.id; })
+                      .filter(function (x) { return x; }).join(",");
+    var texts = alarms.map(function (a) { return a && a.text; })
+                      .filter(function (x) { return x; }).join(" | ");
+    if (texts.length > 20000) texts = texts.slice(0, 20000);
+    out.push([m, v.source || "", v.call || "", v.block || "", ids, texts]);
+  });
+  for (var i = 0; i < out.length; i += 5000) {
+    const batch = out.slice(i, i + 5000);
+    sh.getRange(2 + i, 1, batch.length, 6).setValues(batch);
+  }
+  const withAlarms = out.filter(function (r) { return r[4]; }).length;
+  Logger.log("[ingestPlcAlarmBridge] " + out.length + "행 적재 (알람 붙은 멤버 " + withAlarms + ")");
+}
 
-              {relearning && (
-                <>
-                  <div style={{ fontSize:16, fontWeight:800, color:"#f1f5f9", marginBottom:14 }}>
-                    🔄 재학습 진행 중
-                  </div>
-                  <div style={{ fontSize:11, color:"#cbd5e1", marginBottom:8 }}>
-                    {relearnProgress.current}/{relearnProgress.total} — {relearnProgress.currentFile || "준비 중..."}
-                  </div>
-                  <div style={{
-                    height:8, background:"rgba(51,65,85,0.4)", borderRadius:4, overflow:"hidden",
-                    marginBottom:14,
-                  }}>
-                    <div style={{
-                      width: relearnProgress.total > 0
-                        ? `${(relearnProgress.current / relearnProgress.total) * 100}%` : "0%",
-                      height:"100%", background:"#a5b4fc",
-                      transition:"width 0.3s ease",
-                    }}/>
-                  </div>
-                  <button
-                    onClick={cancelRelearn}
-                    style={{
-                      width:"100%", padding:"8px",
-                      background:"rgba(239,68,68,0.1)",
-                      border:"1px solid rgba(239,68,68,0.3)",
-                      borderRadius:6, color:"#f87171",
-                      fontSize:11, fontWeight:600, cursor:"pointer",
-                    }}
-                  >⏹ 중단</button>
-                </>
-              )}
+/* ── 적재: ladders_*.json 샤드들 → PLC_Block_Ladder (기존 ingestPlcLadder_ 재사용)
+ *   각 샤드 JSON 형식: { "<block_key>": "<ladder_html>", ... }
+ *   ※ 샤드별로 따로 실행 권장(6분 한계). LADDER_FILE_IDS 의 인덱스를 인자로 받음. */
+function ingestPlcAllLadders(shardIndex) {
+  if (!LADDER_FILE_IDS.length) { Logger.log("LADDER_FILE_IDS 미설정"); return; }
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const start = (typeof shardIndex === "number") ? shardIndex : 0;
+  const end = (typeof shardIndex === "number") ? shardIndex + 1 : LADDER_FILE_IDS.length;
+  var total = 0;
+  for (var s = start; s < end; s++) {
+    const json = JSON.parse(DriveApp.getFileById(LADDER_FILE_IDS[s]).getBlob().getDataAsString());
+    Object.keys(json).forEach(function (blockKey) {
+      ingestPlcLadder_(ss, blockKey, json[blockKey]);
+      total++;
+    });
+    Logger.log("[ingestPlcAllLadders] 샤드 " + s + " 완료");
+  }
+  Logger.log("[ingestPlcAllLadders] 총 " + total + "블록 적재 (샤드 " + start + "~" + (end - 1) + ")");
+}
 
-              {relearnResult && (
-                <>
-                  <div style={{ fontSize:16, fontWeight:800, color:"#f1f5f9", marginBottom:14 }}>
-                    {relearnResult.cancelled ? "⏹ 재학습 중단됨" : "✅ 재학습 완료"}
-                  </div>
-                  <div style={{
-                    background:"rgba(15,23,42,0.6)", borderRadius:8,
-                    padding:"12px 14px", marginBottom:14, fontSize:11.5,
-                  }}>
-                    <div style={{ marginBottom:6, color:"#34d399" }}>
-                      ✓ 성공: <b>{relearnResult.success}</b>건
-                    </div>
-                    {relearnResult.failed > 0 && (
-                      <div style={{ marginBottom:6, color:"#f87171" }}>
-                        ✗ 실패: <b>{relearnResult.failed}</b>건
-                      </div>
-                    )}
-                    {relearnResult.notFound.length > 0 && (
-                      <div style={{ color:"#fbbf24" }}>
-                        ⚠ Drive 파일 없음: <b>{relearnResult.notFound.length}</b>건
-                      </div>
-                    )}
-                  </div>
+/* ── 검증용 (에디터에서 직접 실행) ─────────────────────────────────────────────── */
+function testPlcSignalTrace() {
+  const token = PropertiesService.getScriptProperties().getProperty("PLC_QUERY_TOKEN");
+  const r = handlePlcSignalTrace({ path: "plc_signal_trace", token: token,
+    data: { signal: "Door_Open_Error", with_ladder: false } });
+  Logger.log(r.getContent());
+}
+function testPlcAlarmSearch() {
+  const token = PropertiesService.getScriptProperties().getProperty("PLC_QUERY_TOKEN");
+  const r = handlePlcAlarmSearch({ path: "plc_alarm", token: token,
+    data: { query: "Press PnP Y Servo Total Fault" } });
+  Logger.log(r.getContent());
+}
 
-                  {relearnResult.notFound.length > 0 && (
-                    <div style={{
-                      fontSize:10.5, color:"#fbbf24",
-                      background:"rgba(245,158,11,0.08)",
-                      border:"1px solid rgba(245,158,11,0.2)",
-                      borderRadius:6, padding:"8px 10px", marginBottom:10, lineHeight:1.6,
-                    }}>
-                      💡 Drive 파일 없음 항목은 학습앱 자동학습이 아닌 다른 경로로 들어온 데이터입니다.
-                      (외부 도구 학습, 임시 업로드, 채팅 학습 등) 학습앱은 이 파일들의 원본을 찾을 수 없어 재학습할 수 없습니다.
-                    </div>
-                  )}
+/* ── 적재: block_index.json → PLC_Block_Index (카탈로그/드롭다운용 메타데이터) ─────
+ *   JSON 형식: [ {equipment, block_name, block_number, language, n_outputs}, ... ]
+ *   ※ output_signals 컬럼은 비움(신호검색은 plc_signal_trace 사용 — 50K 셀 한계 회피).
+ *   헤더는 v29 plc_search 와 호환: equipment|block_name|block_number|language|output_signals|total_chunks|json_file_id|updated_at */
+const BLOCKIDX_FILE_ID = '1_jogfbameMtjJqGpIw4L6sk4gjGXvTMU';   // block_index.json
 
-                  {(relearnResult.errors.length > 0 || relearnResult.notFound.length > 0) && (
-                    <div style={{
-                      maxHeight:200, overflowY:"auto",
-                      background:"rgba(15,23,42,0.5)", borderRadius:6,
-                      padding:"8px 10px", marginBottom:14, fontSize:10.5,
-                      color:"#94a3b8", lineHeight:1.6,
-                    }}>
-                      {relearnResult.errors.map((e, i) => (
-                        <div key={`err-${i}`} style={{ color:"#fca5a5" }}>· {e}</div>
-                      ))}
-                      {relearnResult.notFound.map((n, i) => (
-                        <div key={`nf-${i}`} style={{ color:"#fbbf24" }}>
-                          · {n.reason}: {(n.item.content || "").slice(0, 50)}...
-                        </div>
-                      ))}
-                    </div>
-                  )}
+function ingestPlcBlockIndex() {
+  if (!BLOCKIDX_FILE_ID) { Logger.log("BLOCKIDX_FILE_ID 미설정"); return; }
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = plcGetOrCreateSheet_(ss, PLC_INDEX_SHEET,
+    ["equipment","block_name","block_number","language","output_signals","total_chunks","json_file_id","updated_at"]);
+  if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, 8).clearContent();
+  const json = JSON.parse(DriveApp.getFileById(BLOCKIDX_FILE_ID).getBlob().getDataAsString());
+  const now = new Date().toISOString();
+  const out = json.map(function (r) {
+    return [r.equipment || "", r.block_name || "", r.block_number || "", r.language || "",
+            "", r.n_outputs || "", "", now];
+  });
+  for (var i = 0; i < out.length; i += 5000) {
+    const batch = out.slice(i, i + 5000);
+    sh.getRange(2 + i, 1, batch.length, 8).setValues(batch);
+  }
+  Logger.log("[ingestPlcBlockIndex] " + out.length + "행 적재");
+}
 
-                  <button
-                    onClick={() => { setShowRelearnDialog(false); setRelearnResult(null); }}
-                    style={{
-                      width:"100%", padding:"10px",
-                      background:"rgba(99,102,241,0.15)",
-                      border:"1px solid rgba(99,102,241,0.4)",
-                      borderRadius:6, color:"#a5b4fc",
-                      fontSize:12, fontWeight:700, cursor:"pointer",
-                    }}
-                  >확인</button>
-                </>
-              )}
-            </div>
-          </div>
-        );
-      })()}
+function jaccardScore_(qset, qtok, mtok) {
+  if (!mtok || !mtok.length || !qtok || !qtok.length) return 0;
+  var inter = 0, uni = {};
+  for (var i = 0; i < qtok.length; i++) uni[qtok[i]] = 1;
+  for (var j = 0; j < mtok.length; j++) {
+    if (qset[mtok[j]]) inter++;
+    uni[mtok[j]] = 1;
+  }
+  return inter / Object.keys(uni).length;
+}
 
-      {/* PDF 처리 방식 선택 모달 (Step 5-C 보강) */}
-      {showPdfModeDialog && (() => {
-        // PDF 파일 통계 계산
-        const allFiles = [...folderScan.roleFiles, ...folderScan.commonFiles];
-        const pdfFiles = allFiles.filter(f =>
-          (f.mimetype || "").includes("pdf") || (f.filename || "").toLowerCase().endsWith(".pdf")
-        );
-        const pdfCount = pdfFiles.length;
-
-        return (
-          <div style={{
-            position:"fixed", top:0, left:0, right:0, bottom:0,
-            background:"rgba(0,0,0,0.75)", backdropFilter:"blur(4px)",
-            display:"flex", alignItems:"center", justifyContent:"center",
-            zIndex:1100, padding:"16px",
-          }}>
-            <div style={{
-              background:"#0f172a", border:`1.5px solid ${roleInfo.color}40`,
-              borderRadius:14, padding:"20px", maxWidth:520, width:"100%",
-            }}>
-              <div style={{ fontSize:18, fontWeight:800, color:"#f1f5f9", marginBottom:6 }}>
-                📄 PDF 처리 방식 선택
-              </div>
-              <div style={{ fontSize:11.5, color:"#94a3b8", marginBottom:14, lineHeight:1.6 }}>
-                발견된 PDF {pdfCount}개의 처리 방식을 선택하세요.
-                <br/>
-                <span style={{ color:"#64748b", fontSize:10.5 }}>
-                  (이미지 파일은 이 설정과 무관하게 정상 처리됩니다)
-                </span>
-              </div>
-
-              {/* 텍스트 추출 우선 */}
-              <div onClick={() => setSyncPdfMode("auto")} style={{
-                padding:"12px 14px", cursor:"pointer", marginBottom:8,
-                background: syncPdfMode === "auto" ? `${roleInfo.color}15` : "rgba(8,14,26,0.7)",
-                border: `1.5px solid ${syncPdfMode === "auto" ? roleInfo.color : "rgba(51,65,85,0.5)"}`,
-                borderRadius:8,
-              }}>
-                <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:6 }}>
-                  <div style={{
-                    width:14, height:14, borderRadius:"50%",
-                    border:`2px solid ${syncPdfMode === "auto" ? roleInfo.color : "#475569"}`,
-                    background: syncPdfMode === "auto" ? roleInfo.color : "transparent",
-                  }}/>
-                  <span style={{ fontSize:13, fontWeight:700,
-                    color: syncPdfMode === "auto" ? roleInfo.color : "#cbd5e1" }}>
-                    📝 텍스트 추출 우선 (자동 폴백) ⭐
-                  </span>
-                </div>
-                <div style={{ fontSize:10.5, color:"#94a3b8", lineHeight:1.6, paddingLeft:20 }}>
-                  • 텍스트 PDF: 빠르고 저렴하게 처리 (페이지당 약 $0.0005)
-                  <br/>
-                  • 스캔 PDF: 자동으로 그림 분석으로 전환 (페이지당 $0.02)
-                  <br/>
-                  <span style={{ color:"#34d399" }}>✓ 작업 표준서, 규정, 매뉴얼에 적합</span>
-                </div>
-              </div>
-
-              {/* 모두 그림 분석 */}
-              <div onClick={() => setSyncPdfMode("vision")} style={{
-                padding:"12px 14px", cursor:"pointer", marginBottom:14,
-                background: syncPdfMode === "vision" ? `${roleInfo.color}15` : "rgba(8,14,26,0.7)",
-                border: `1.5px solid ${syncPdfMode === "vision" ? roleInfo.color : "rgba(51,65,85,0.5)"}`,
-                borderRadius:8,
-              }}>
-                <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:6 }}>
-                  <div style={{
-                    width:14, height:14, borderRadius:"50%",
-                    border:`2px solid ${syncPdfMode === "vision" ? roleInfo.color : "#475569"}`,
-                    background: syncPdfMode === "vision" ? roleInfo.color : "transparent",
-                  }}/>
-                  <span style={{ fontSize:13, fontWeight:700,
-                    color: syncPdfMode === "vision" ? roleInfo.color : "#cbd5e1" }}>
-                    🖼️ 모두 그림 분석
-                  </span>
-                </div>
-                <div style={{ fontSize:10.5, color:"#94a3b8", lineHeight:1.6, paddingLeft:20 }}>
-                  • 모든 PDF의 모든 페이지를 Vision API로 분석 (페이지당 $0.02)
-                  <br/>
-                  • 페이지별 이미지를 드라이브에 자동 저장
-                  <br/>
-                  <span style={{ color:"#34d399" }}>✓ 시각 정보 중요한 자료(검사기준서, 도면, 다이어그램)에 적합</span>
-                  <br/>
-                  <span style={{ color:"#fbbf24" }}>⚠️ 비용 ↑, 처리 시간 ↑</span>
-                </div>
-              </div>
-
-              <div style={{ display:"flex", gap:8 }}>
-                <button onClick={startSync} style={{
-                  flex:1, padding:"10px",
-                  background:`linear-gradient(135deg,${roleInfo.color},${roleInfo.color}cc)`,
-                  border:"none", borderRadius:8, color:"#fff",
-                  fontSize:13, fontWeight:700, cursor:"pointer",
-                }}>
-                  📥 학습 시작
-                </button>
-                <button onClick={() => setShowPdfModeDialog(false)} style={{
-                  padding:"10px 16px",
-                  background:"rgba(51,65,85,0.4)",
-                  border:"1px solid rgba(71,85,105,0.5)",
-                  borderRadius:8, color:"#94a3b8",
-                  fontSize:13, fontWeight:700, cursor:"pointer",
-                }}>
-                  취소
-                </button>
-              </div>
-            </div>
-          </div>
-        );
-      })()}
-
-      <style>{`
-        @keyframes spin{to{transform:rotate(360deg)}}
-        @keyframes fadeUp{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
-        @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
-        *{box-sizing:border-box}
-        textarea:focus,input:focus{border-color:rgba(59,130,246,0.5)!important}
-        button:hover:not(:disabled){filter:brightness(1.1)}
-        a:hover{filter:brightness(1.1)}
-        ::-webkit-scrollbar{width:3px}
-        ::-webkit-scrollbar-thumb{background:rgba(59,130,246,0.2);border-radius:2px}
-      `}</style>
-    </div>
-  );
+function testForkB(){
+  const token=PropertiesService.getScriptProperties().getProperty("PLC_QUERY_TOKEN");
+  Logger.log(handlePlcSearch({token:token,data:{query:"문이 안 닫혀요"}}).getContent());
 }
