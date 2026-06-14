@@ -122,6 +122,49 @@ const API_BASE_URL = "https://script.google.com/macros/s/AKfycbwE9ZyopUTxEEXpt3U
 // LLM 호출 base (Phase 3에서 FastAPI /llm 경로로 통합 예정)
 const LLM_BASE_URL = "/.netlify/functions";
 
+// ─── OAuth / 세션 (V3 §10 Step 3a) ─────────────────────────────────────────────
+// 항목 2: 백엔드 verifyIdToken의 aud 검증값과 반드시 동일해야 함 (1111.gs line 2956)
+const OAUTH_CLIENT_ID = "830951335500-mr71tivgr98at2ovvqcv16rdd8gvbi9n.apps.googleusercontent.com";
+
+// 항목 5: sessionStorage 키 5종 (Console에서 'session_token' 키로 확인 — 이름 고정)
+function getSessionToken() {
+  try { return sessionStorage.getItem("session_token") || ""; } catch { return ""; }
+}
+function readSession() {
+  const t = getSessionToken();
+  if (!t) return null;
+  return {
+    token: t,
+    email: sessionStorage.getItem("session_email") || "",
+    name: sessionStorage.getItem("session_name") || "",
+    permTier: sessionStorage.getItem("session_role") || "",          // ISE | FSE | Manager (권한 등급)
+    assignedAgents: (sessionStorage.getItem("session_assigned_agents") || "")
+      .split(",").map(s => s.trim()).filter(Boolean),
+  };
+}
+function clearSessionAndRelogin() {
+  // 항목 7: session_invalid 응답 → 세션 전체 클리어 + 로그인 화면 복귀 (reload가 가장 확실)
+  try { sessionStorage.clear(); } catch {}
+  window.location.reload();
+}
+
+// 항목 8: 권한 분기 — permTier는 ISE/FSE/Manager (기존 persona 'role'과 별개 변수)
+//   ISE      → 모든 곳 읽기 전용
+//   FSE      → 담당(assigned) 페르소나에서만 편집
+//   Manager  → 전체 편집
+// App 렌더 시 SESSION_AUTH를 채워, 자식 컴포넌트/저장 헬퍼가 prop 없이 참조한다.
+let SESSION_AUTH = { permTier: null, assignedAgents: [], persona: null };
+function canEditAgent(persona) {
+  const t = SESSION_AUTH.permTier;
+  if (t === "Manager") return true;
+  if (t === "FSE") return SESSION_AUTH.assignedAgents.includes(persona || SESSION_AUTH.persona);
+  return false; // ISE 또는 미인증
+}
+// 쓰기성 액션 판별 (api.call 중앙 가드용) — 백엔드도 authorizeBySession으로 재검증함
+function isWriteAction(action) {
+  return /^(save_|replace_|delete_|upload_|mark_)/.test(action);
+}
+
 const ROLE_CONFIG = {
   Cell_PE: { label: "생산 엔지니어", line: "Cell", color: "#3b82f6", bg: "rgba(59,130,246,0.12)", icon: "🔵",
     focus: "Cell 라인 생산 목표 달성, 납기, 공정 안정화, OEE 관리" },
@@ -201,11 +244,17 @@ const api = {
   // 참고: data.data 가 없으면 전체 JSON을 data로 노출 (scan_learning_folder_all 처럼 응답 shape이 다른 액션 대응)
   async get(action, params = {}) {
     try {
-      const qs = new URLSearchParams({ action, ...params }).toString();
+      // 항목 6: session_token 자동 첨부 (GET 쿼리스트링)
+      const merged = { action, ...params };
+      const _tok = getSessionToken();
+      if (_tok) merged.session_token = _tok;
+      const qs = new URLSearchParams(merged).toString();
       const res = await fetch(`${API_BASE_URL}?${qs}`);
       if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
       const data = await res.json();
       if (data.success) return { ok: true, data: data.data !== undefined ? data.data : data };
+      // 항목 7: 세션 만료 감지 → 자동 로그아웃 + 로그인 화면
+      if (data.error === "session_invalid") { clearSessionAndRelogin(); return { ok: false, error: "session_invalid" }; }
       return { ok: false, error: data.error || "응답 success=false" };
     } catch (e) {
       return { ok: false, error: `네트워크 오류: ${e.message}` };
@@ -216,7 +265,21 @@ const api = {
   // 기본: no-cors fire-and-forget (응답 본문 못 받음, boolean 반환)
   // opts.needResponse=true: cors 모드, 응답 받음 ({ ok, data, error } 반환)
   async call(action, payload = {}, opts = {}) {
-    const body = JSON.stringify({ action, ...payload });
+    // 항목 8: 쓰기성 액션 중앙 가드 — ISE/미담당 FSE는 클라이언트에서 차단
+    //   (버튼이 일부 보이더라도 모든 저장 경로가 여기를 지나므로 일괄 차단 + 백엔드 재검증)
+    if (action !== "start_session" && action !== "logout" && isWriteAction(action)) {
+      const _persona = payload.role || SESSION_AUTH.persona;
+      if (!canEditAgent(_persona)) {
+        return opts.needResponse ? { ok: false, error: "permission_denied" } : false;
+      }
+    }
+    // 항목 6: session_token 자동 첨부 (start_session 제외 — 토큰 발급 전)
+    const _full = { action, ...payload };
+    if (action !== "start_session") {
+      const _tok = getSessionToken();
+      if (_tok) _full.session_token = _tok;
+    }
+    const body = JSON.stringify(_full);
     if (opts.needResponse) {
       try {
         const res = await fetch(API_BASE_URL, {
@@ -228,6 +291,7 @@ const api = {
         if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
         const data = await res.json();
         if (data.success) return { ok: true, data: data.data !== undefined ? data.data : data };
+        if (data.error === "session_invalid") { clearSessionAndRelogin(); return { ok: false, error: "session_invalid" }; }
         return { ok: false, error: data.error || "응답 success=false" };
       } catch (e) {
         return { ok: false, error: `네트워크 오류: ${e.message}` };
@@ -5320,9 +5384,139 @@ const TABS = [
   { id:5, icon:"🧠", label:"학습 현황" },
 ];
 
-export default function App() {
+// ─── LoginScreen (V3 §10 Step 3a 항목 1·3·4·5) ─────────────────────────────────
+// 미인증(session_token 없음) 시 메인 앱 대신 이 화면을 표시한다.
+// 항목 1: GIS 스크립트를 이 컴포넌트 마운트 시 동적 로드 (index.html 미수정)
+// 항목 4: Google ID 토큰 → 백엔드 start_session → session_token 교환
+// 항목 5: sessionStorage 5종 저장 후 onLogin 콜백
+function LoginScreen({ onLogin }) {
+  const btnRef = useRef(null);
+  const [status, setStatus] = useState("idle");   // idle | exchanging | not_registered | inactive | auth_failed
+  const [info, setInfo] = useState({ email: "", name: "" });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    // 항목 4: Google 로그인 콜백 — credential(JWT) → start_session 교환
+    async function handleCredential(resp) {
+      if (!resp || !resp.credential) { setStatus("auth_failed"); return; }
+      setStatus("exchanging");
+      try {
+        const res = await fetch(API_BASE_URL, {
+          method: "POST", mode: "cors",
+          headers: { "Content-Type": "text/plain" },
+          body: JSON.stringify({ action: "start_session", id_token: resp.credential }),
+        });
+        const data = await res.json();
+        if (data.success) {
+          // 항목 5: sessionStorage 5종 (키 이름 고정)
+          sessionStorage.setItem("session_token", data.session_token || "");
+          sessionStorage.setItem("session_email", data.email || "");
+          sessionStorage.setItem("session_name", data.name || "");
+          sessionStorage.setItem("session_role", data.role || "");
+          sessionStorage.setItem("session_assigned_agents", data.assigned_agents || "");
+          onLogin(readSession());
+        } else {
+          setInfo({ email: data.email || "", name: data.name || "" });
+          setStatus(data.status || "auth_failed");   // not_registered | inactive | auth_failed
+        }
+      } catch (e) {
+        setStatus("auth_failed");
+      }
+    }
+
+    function initGsi() {
+      const g = window.google;
+      if (!g || !g.accounts || !g.accounts.id) return;
+      g.accounts.id.initialize({ client_id: OAUTH_CLIENT_ID, callback: handleCredential });
+      if (btnRef.current) {
+        btnRef.current.innerHTML = "";
+        g.accounts.id.renderButton(btnRef.current, {
+          theme: "filled_blue", size: "large", text: "signin_with", shape: "pill", width: 260,
+        });
+      }
+    }
+
+    // 항목 1: GIS 스크립트 동적 로드
+    if (window.google && window.google.accounts && window.google.accounts.id) { initGsi(); return () => { cancelled = true; }; }
+    const SRC = "https://accounts.google.com/gsi/client";
+    const existing = document.querySelector(`script[src="${SRC}"]`);
+    if (existing) {
+      existing.addEventListener("load", () => { if (!cancelled) initGsi(); });
+    } else {
+      const s = document.createElement("script");
+      s.src = SRC; s.async = true; s.defer = true;
+      s.onload = () => { if (!cancelled) initGsi(); };
+      document.head.appendChild(s);
+    }
+    return () => { cancelled = true; };
+  }, []);
+
+  // 항목 3: 상태별 안내 메시지
+  const notice = {
+    not_registered: { color: "#fbbf24", title: "권한 없음", msg: `${info.email || "이 계정"}은 아직 등록되지 않았습니다. Manager(potato2509@gmail.com)에게 등록을 요청하세요.` },
+    inactive:       { color: "#f97316", title: "계정 비활성", msg: `${info.email || "이 계정"}은 비활성 상태입니다. Manager에게 활성화를 요청하세요.` },
+    auth_failed:    { color: "#ef4444", title: "인증 실패", msg: "Google 인증에 실패했습니다. 다시 시도해 주세요." },
+  }[status];
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "linear-gradient(150deg,#03060d,#060d1c 55%,#040810)",
+      fontFamily: "'Noto Sans KR','Malgun Gothic',sans-serif",
+      color: "#e2e8f0", display: "flex", alignItems: "center", justifyContent: "center",
+      padding: "40px 16px",
+    }}>
+      <div style={{
+        width: "100%", maxWidth: 380, textAlign: "center",
+        background: "rgba(8,14,28,0.7)", border: "1px solid rgba(59,130,246,0.18)",
+        borderRadius: 16, padding: "40px 28px",
+      }}>
+        <div style={{ fontSize: 44, marginBottom: 14 }}>🏭</div>
+        <div style={{ fontSize: 19, fontWeight: 800, color: "#f1f5f9", marginBottom: 6 }}>
+          Factory Engineer AI 학습
+        </div>
+        <div style={{ fontSize: 12.5, color: "#64748b", marginBottom: 28, lineHeight: 1.6 }}>
+          AZS 공장 AI 학습 시스템<br/>Google 계정으로 로그인하세요
+        </div>
+
+        {/* GIS 버튼 마운트 지점 */}
+        <div style={{ display: "flex", justifyContent: "center", minHeight: 44 }}>
+          <div ref={btnRef} />
+        </div>
+
+        {status === "exchanging" && (
+          <div style={{ marginTop: 18, fontSize: 12.5, color: "#38bdf8" }}>인증 처리 중…</div>
+        )}
+
+        {notice && (
+          <div style={{
+            marginTop: 22, padding: "14px 16px", textAlign: "left",
+            background: `${notice.color}12`, border: `1px solid ${notice.color}55`,
+            borderRadius: 10,
+          }}>
+            <div style={{ fontSize: 13, fontWeight: 800, color: notice.color, marginBottom: 5 }}>{notice.title}</div>
+            <div style={{ fontSize: 11.5, color: "#cbd5e1", lineHeight: 1.6 }}>{notice.msg}</div>
+          </div>
+        )}
+
+        <div style={{ marginTop: 26, fontSize: 9.5, color: "#475569", letterSpacing: 1 }}>
+          AZS BATTERY · SECURE ACCESS
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 본체 — 세션 인증을 통과한 경우에만 마운트된다 (훅 규칙 보존을 위해 게이트와 분리)
+function MainApp({ session, onLogout }) {
   const role = getRole();
   const roleInfo = role ? ROLE_CONFIG[role] : null;
+  // 항목 8: 권한 컨텍스트 — permTier(ISE/FSE/Manager)는 persona 'role'과 별개
+  const permTier = session.permTier;
+  const assignedAgents = session.assignedAgents;
+  SESSION_AUTH = { permTier, assignedAgents, persona: role };   // 자식·저장헬퍼가 참조
+  const canEdit = canEditAgent(role);                           // 현재 선택 persona 편집 가능 여부
   const [tab, setTab] = useState(0);
   const [knowledge, setKnowledge] = useState([]);
   const [loadingKB, setLoadingKB] = useState(false);
@@ -6656,6 +6850,24 @@ export default function App() {
             color:roleInfo.color, borderRadius:6, padding:"3px 10px",
             fontSize:11, fontWeight:800,
           }}>{role}</span>
+          {/* 항목 8: 권한 등급 배지 */}
+          {permTier && (
+            <span style={{
+              background: permTier === "Manager" ? "rgba(34,197,94,0.15)" : permTier === "FSE" ? "rgba(59,130,246,0.15)" : "rgba(100,116,139,0.15)",
+              border: `1px solid ${permTier === "Manager" ? "#22c55e55" : permTier === "FSE" ? "#3b82f655" : "#64748b55"}`,
+              color: permTier === "Manager" ? "#4ade80" : permTier === "FSE" ? "#60a5fa" : "#94a3b8",
+              borderRadius:6, padding:"3px 9px", fontSize:10, fontWeight:800,
+            }} title={session.email}>{permTier}</span>
+          )}
+          {/* 항목 9: 로그아웃 */}
+          <button onClick={onLogout} style={{
+            background:"rgba(127,29,29,0.35)", border:"1px solid rgba(220,38,38,0.45)",
+            color:"#fca5a5", borderRadius:6, padding:"5px 11px",
+            fontSize:11, fontWeight:700, cursor:"pointer",
+            display:"inline-flex", alignItems:"center", gap:4,
+          }} title={`${session.name || session.email} 로그아웃`}>
+            🚪 로그아웃
+          </button>
         </div>
       </div>
 
@@ -6681,8 +6893,18 @@ export default function App() {
       </div>
 
       <div style={{ maxWidth:660, margin:"0 auto", padding:"22px 16px 60px" }}>
-        {/* 학습자료 폴더 동기화 알림 카드 */}
-        {(folderScan.roleFiles.length > 0 || folderScan.commonFiles.length > 0) && (
+        {/* 항목 8: 편집 권한 없는 사용자(ISE/미담당 FSE) 읽기 전용 안내 */}
+        {!canEdit && (
+          <div style={{
+            background:"rgba(100,116,139,0.12)", border:"1px solid rgba(100,116,139,0.4)",
+            borderRadius:10, padding:"10px 14px", marginBottom:16,
+            fontSize:11.5, color:"#94a3b8", display:"flex", alignItems:"center", gap:8,
+          }}>
+            👁️ 읽기 전용 모드 — {permTier === "FSE" ? "담당 에이전트가 아니어서" : "권한 등급(ISE)상"} 조회만 가능합니다.
+          </div>
+        )}
+        {/* 학습자료 폴더 동기화 알림 카드 (편집 권한자만) */}
+        {canEdit && (folderScan.roleFiles.length > 0 || folderScan.commonFiles.length > 0) && (
           <div style={{
             background:`${roleInfo.color}08`,
             border:`1.5px solid ${roleInfo.color}40`,
@@ -7258,4 +7480,21 @@ export default function App() {
       `}</style>
     </div>
   );
+}
+
+// ─── 로그인 게이트 (default export) ─────────────────────────────────────────────
+// 훅 규칙 보존: 이 컴포넌트는 useState 1개만 호출하고, 인증 후에만 MainApp을 마운트한다.
+export default function App() {
+  const [session, setSession] = useState(() => readSession());
+  if (!session) return <LoginScreen onLogin={setSession} />;
+
+  // 항목 9: 로그아웃 — 백엔드 세션 삭제 + sessionStorage 클리어 + 자유채팅 세션 종료(reload)
+  const handleLogout = async () => {
+    try { await api.call("logout", {}, { needResponse: true }); } catch {}
+    try { sessionStorage.clear(); } catch {}
+    setSession(null);
+    window.location.reload();   // V3 §11: 자유채팅 state까지 완전 초기화
+  };
+
+  return <MainApp session={session} onLogout={handleLogout} />;
 }
